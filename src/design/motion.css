@@ -170,49 +170,68 @@
 }
 
 /* ------------------------------------------------------------------
-   Running-agent snake-wave loader cell.
+   Running-agent perimeter-wave loader cell.
 
-   The Loader primitive renders a 3×3 grid of `<span class="gli-loader-cell">`.
-   Each cell carries a `--gli-loader-snake-pos` custom property (0..8)
-   giving its position along the inward-clockwise spiral, and the
-   keyframe walks the full palette over 1.35s with a negative
-   `animation-delay` per cell so each one sits at its own phase.
+   The Loader primitive renders a 3×3 grid where 8 perimeter cells
+   carry `<span class="gli-loader-cell">` and the center cell carries
+   `<span class="gli-loader-cell-center">`. Each perimeter cell sets
+   `--gli-loader-snake-pos` (0..7) giving its clockwise position
+   around the ring; the keyframe walks the palette over 1.2s with a
+   per-cell negative `animation-delay` so each cell sits at its own
+   phase and the crest reads as one continuous rotation.
 
-   This used to be React state with setInterval(150ms). Under load —
-   20+ agents streaming, tab-switch storms, big diffs in flight — the
-   React commit could be starved for a frame and the animation stalled
-   or vanished. Moving the entire cycle to CSS keyframes runs the
-   animation on the compositor thread; the loader is now visually
-   continuous regardless of how busy React is.
+   Why an 8-cell perimeter cycle (and not the 9-cell snake we had
+   before): a 3×3 grid has no rook-adjacent Hamiltonian cycle, so the
+   old 9-cell snake had to teleport diagonally from a corner to the
+   center on wrap — a visible "hop" each loop. Dropping the center
+   from the cycle gives a closed ring with every step rook-adjacent,
+   so the wave loops without any jump. The center sits at a calm
+   mid-brightness as a static anchor.
 
-   Scope: only `.gli-loader-cell` carries this animation. Nothing else
-   in the codebase uses this class name, and the prior class
-   (`.rli-loader`) is intentionally NOT defined anywhere so the legacy
-   double-animate hazard called out in tokens.css doesn't return.
+   Driven by CSS keyframes on the compositor thread, so React load
+   (20+ agents streaming, tab-switch storms, big diffs in flight)
+   cannot stall it.
+
+   Scope: only `.gli-loader-cell` and `.gli-loader-cell-center` are
+   styled here. The legacy class (`.rli-loader`) is intentionally NOT
+   defined anywhere so the double-animate hazard called out in
+   tokens.css doesn't return.
    ------------------------------------------------------------------ */
 
 @keyframes gli-loader-snake-wave {
-  0%      { background-color: oklch(36% 0.003 250); }
-  11.111% { background-color: oklch(54% 0.003 250); }
-  22.222% { background-color: oklch(72% 0.003 250); }
-  33.333% { background-color: oklch(86% 0.003 250); }
-  44.444% { background-color: oklch(96% 0.003 250); }
-  55.555% { background-color: oklch(86% 0.003 250); }
-  66.666% { background-color: oklch(72% 0.003 250); }
-  77.777% { background-color: oklch(54% 0.003 250); }
-  88.888% { background-color: oklch(36% 0.003 250); }
-  100%    { background-color: oklch(36% 0.003 250); }
+  /* True bell curve. With only three stops (valley → peak → valley)
+     and `ease-in-out` between them, the velocity tapers to zero at
+     every stop — including at the 0%/100% wrap. That eliminates the
+     slope-flip "twitch" the previous multi-stop linear keyframe had
+     at each phase boundary, including the visible kink at wrap. */
+  0%, 100% { opacity: 0; }
+  50%      { opacity: 1; }
 }
 
 .gli-loader-cell {
-  background-color: oklch(36% 0.003 250);
-  animation: gli-loader-snake-wave 1.35s linear infinite;
-  /* `--gli-loader-snake-pos` is 0..8 set inline per cell. A negative
-     delay equal to (pos / 9 of the cycle) starts each cell at its
-     own phase, so the wave reads as one continuous crest across the
-     grid even though every cell runs the same animation. */
+  /* Always the bright stop. The dim state is produced by fading
+     opacity toward the loader container's dark base color, not by
+     animating background-color. Opacity is GPU-composited, so the
+     wave keeps a steady cadence even when the main thread is busy
+     (20+ agents streaming, big diffs in flight, tab-switch storms).
+     `background-color` interpolation is paint-only and was the real
+     source of the perceptible micro-stutters. */
+  background-color: oklch(96% 0.003 250);
+  opacity: 0;
+  animation: gli-loader-snake-wave 1.2s ease-in-out infinite;
+  /* `--gli-loader-snake-pos` is 0..7 set inline per cell. A negative
+     delay equal to (pos / 8 of the 1.2s cycle = 150ms) starts each
+     cell at its own phase, so the wave reads as one continuous crest
+     rotating around the perimeter. */
   animation-delay: calc(var(--gli-loader-snake-pos, 0) * -150ms);
-  will-change: background-color;
+  will-change: opacity;
+}
+
+.gli-loader-cell-center {
+  /* Static anchor at calm mid-brightness. Sits between the crest's
+     dark and lightest stops so it never competes with the moving
+     wave but always reads as "this loader is on". */
+  background-color: oklch(54% 0.003 250);
 }
 
 /* ------------------------------------------------------------------
@@ -232,8 +251,15 @@
   }
   .gli-loader-cell {
     animation: none;
-    /* freeze at the brightest mid-palette stop — reads as "still
-       active" without motion. */
+    /* Freeze at a calm mid-opacity — over the loader container's
+       dark base this composites to roughly the same mid-brightness
+       the perimeter cells averaged during the wave, so the indicator
+       still reads as "still active" without any motion. */
+    opacity: 0.5;
+  }
+  .gli-loader-cell-center {
+    /* Match the frozen perimeter brightness so the static state reads
+       as one cohesive shape rather than a dim core inside a ring. */
     background-color: oklch(72% 0.003 250);
   }
   .gli-press:active {

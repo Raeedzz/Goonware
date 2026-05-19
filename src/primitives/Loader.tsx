@@ -1,39 +1,39 @@
 import type { CSSProperties } from "react";
 
 /**
- * "Agent running" snake-wave — a 3×3 grid of small squares with a
- * muted-white crest that walks a clockwise spiral inward, looping
- * indefinitely. Replaces the previous scaleout pulse with a steadier,
- * more textural indicator: the wave is always visible, never zeroed
- * out, so the eye never wonders whether the loader is still on.
+ * "Agent running" perimeter-wave — a 3×3 grid of small squares with a
+ * muted-white crest that rotates clockwise around the outer ring,
+ * looping indefinitely. The center cell sits at a calm mid-brightness
+ * as a static anchor, so the loader always reads as "active" even
+ * between crest passes.
  *
  * Visual contract:
  *   - Square slot sized via the `size` prop (defaults to 14). The
  *     grid takes `floor(size / 3) * 3`, so 18 ⇒ 18px, 16 ⇒ 15px, etc.
- *   - 9 cells in a row-major 3×3 grid, snake-ordered for the wave:
+ *   - 8 perimeter cells form a closed clockwise cycle:
  *
- *         0 1 2          0 → 1 → 2
- *         3 4 5    →             ↓
- *         6 7 8          3 ← 4   5
- *                        ↑     ↓
- *                        6 ← 7   8 (inward spiral ending at center)
+ *         0 1 2          7 → 0 → 1
+ *         3 4 5    →     ↑   *   ↓     (* = static center)
+ *         6 7 8          6 ← 5 ← 4
  *
- *   - 5-stop muted palette in OKLCH, mirrored to 9 positions so the
- *     crest reads as a smooth rise-and-fall instead of a hard wrap.
+ *     The cycle closes on itself with every step being rook-adjacent,
+ *     so the crest never has to jump diagonally — eliminating the
+ *     visible "hop" the previous 9-cell snake had where it teleported
+ *     from a corner to the center.
+ *   - 5-stop muted palette in OKLCH, mirrored across 8 phases so the
+ *     crest reads as a smooth rise-and-fall and 0% / 100% land on the
+ *     same dark stop (seamless wrap).
  *
  * Motion:
- *   - Pure CSS keyframes. Each cell carries `--gli-loader-snake-pos`
- *     (its 0..8 position along the spiral); the `.gli-loader-cell`
- *     class runs a 1.35s keyframe walk through the palette with a
- *     negative `animation-delay` derived from that position, so each
- *     cell sits at its own phase and the wave reads as a single crest
- *     drifting across the grid.
+ *   - Pure CSS keyframes. Perimeter cells carry `--gli-loader-snake-pos`
+ *     (their 0..7 position along the cycle); `.gli-loader-cell` runs a
+ *     1.2s walk through the palette with a negative `animation-delay`
+ *     derived from that position, so each cell sits at its own phase
+ *     and the wave reads as a single crest drifting around the ring.
  *   - The animation runs on the compositor thread, NOT the React
  *     main thread. Under load (20+ agents streaming, tab-switch
  *     storms, big diffs in flight) the loader stays visually
- *     continuous — the previous React-state implementation could
- *     stall for a frame whenever the commit queue backed up, which
- *     read as "the spinner just stopped" to the user.
+ *     continuous.
  *
  * Hardening:
  *   - No setInterval, no React state, no document.querySelector. Each
@@ -48,18 +48,20 @@ import type { CSSProperties } from "react";
  * toast. One implementation, one motion grammar.
  */
 
-// Snake order: each entry is a 0..8 grid index, ordered along the
-// inward clockwise spiral. SNAKE_POS_BY_GRID[i] = "where in the snake
-// path does grid cell i sit?" — flipped form, pre-computed so we
-// don't search per cell on every render.
-const SNAKE_ORDER = [0, 1, 2, 5, 8, 7, 6, 3, 4];
-const SNAKE_POS_BY_GRID = SNAKE_ORDER.reduce<number[]>(
-  (acc, gridIdx, snakePos) => {
-    acc[gridIdx] = snakePos;
-    return acc;
-  },
-  new Array(9),
-);
+// Perimeter cycle: each entry is a 0..8 grid index, ordered clockwise
+// around the ring starting from top-mid. Every step is rook-adjacent
+// AND the last entry (top-left) is rook-adjacent to the first entry
+// (top-mid), so the crest loops smoothly without any diagonal jump.
+// Grid index 4 (center) is intentionally NOT on the cycle.
+const PERIMETER_CYCLE = [1, 2, 5, 8, 7, 6, 3, 0];
+const CENTER_GRID_INDEX = 4;
+
+// SNAKE_POS_BY_GRID[i] = "where in the perimeter cycle does grid cell
+// i sit?" — null for the center (it gets a different class).
+const SNAKE_POS_BY_GRID: (number | null)[] = new Array(9).fill(null);
+PERIMETER_CYCLE.forEach((gridIdx, snakePos) => {
+  SNAKE_POS_BY_GRID[gridIdx] = snakePos;
+});
 
 export function Loader({
   size = 14,
@@ -82,10 +84,19 @@ export function Loader({
         width: gridWidth,
         height: gridWidth,
         flexShrink: 0,
+        // Dark base under the perimeter cells. The cells themselves
+        // are a fixed bright color whose opacity animates, so when a
+        // cell dims it fades into this base — giving us a smooth,
+        // GPU-accelerated wave that's not vulnerable to main-thread
+        // paint stalls the way `background-color` interpolation is.
+        backgroundColor: "oklch(36% 0.003 250)",
       }}
       aria-hidden
     >
       {Array.from({ length: 9 }).map((_, gridIndex) => {
+        if (gridIndex === CENTER_GRID_INDEX) {
+          return <span key={gridIndex} className="gli-loader-cell-center" />;
+        }
         const snakePos = SNAKE_POS_BY_GRID[gridIndex];
         return (
           <span
