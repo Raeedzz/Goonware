@@ -34,11 +34,19 @@ function digitKey(e: KeyboardEvent): number | null {
  *   ⌘W           — close active tab
  *   ⌘1..9        — switch to nth worktree in sidebar order (flat across projects)
  *   ⌘⇧1..9       — switch to nth project
- *   ⌘⌥1..9       — same as ⌘⇧, kept for muscle memory
+ *   ⌘⌥1..9       — switch to nth main-column tab (shell/editor/diff/markdown)
  *   ⌘B           — toggle sidebar
  *   ⌘\           — toggle right panel
  *   ⌘⇧F          — search overlay (alias)
+ *   ⌘⌥F          — open Files in the right panel
+ *   ⌘⌥G          — open Changes (git) in the right panel
+ *   ⌘⌥B          — open Browser in the right panel
+ *   ⌘⌥P          — auto-draft a PR for the active worktree
  *   Esc          — close overlays
+ *
+ * When ⌥ (Option) is held on macOS the produced `e.key` is a glyph
+ * (⌘⌥F → "ƒ", ⌘⌥G → "©", ⌘⌥B → "∫", ⌘⌥P → "π"), so the ⌘⌥ branch
+ * reads physical key codes (e.code) instead.
  */
 export function useKeyboardShortcuts() {
   const dispatch = useAppDispatch();
@@ -52,10 +60,48 @@ export function useKeyboardShortcuts() {
       const cmd = e.metaKey || e.ctrlKey;
       const shift = e.shiftKey;
 
-      if (cmd && !shift && (e.key.toLowerCase() === "k" || e.key.toLowerCase() === "f")) {
+      if (cmd && !shift && !e.altKey && (e.key.toLowerCase() === "k" || e.key.toLowerCase() === "f")) {
         e.preventDefault();
         dispatch({ type: "set-search", open: true });
         return;
+      }
+
+      // ⌘⌥F / ⌘⌥G / ⌘⌥B — flip the right panel to a specific tab and
+      // make sure it's visible. Using e.code dodges Option's glyph
+      // substitution (⌘⌥F arrives as e.key === "ƒ" on US layouts).
+      if (cmd && e.altKey && !shift && worktree) {
+        const code = e.code;
+        const panel =
+          code === "KeyF"
+            ? "files"
+            : code === "KeyG"
+              ? "changes"
+              : code === "KeyB"
+                ? "browser"
+                : null;
+        if (panel) {
+          e.preventDefault();
+          dispatch({
+            type: "set-right-panel",
+            worktreeId: worktree.id,
+            panel,
+          });
+          if (state.rightPanelCollapsed) {
+            dispatch({ type: "toggle-right-panel" });
+          }
+          return;
+        }
+        // ⌘⌥P — open the Create PR dialog and let it auto-draft via
+        // the worktree's helper-CLI agent. Skips the manual form.
+        if (code === "KeyP") {
+          e.preventDefault();
+          dispatch({
+            type: "set-pr-dialog",
+            worktreeId: worktree.id,
+            mode: "auto",
+          });
+          return;
+        }
       }
 
       // ⌘, opens settings (macOS-standard).
@@ -65,25 +111,25 @@ export function useKeyboardShortcuts() {
         return;
       }
 
-      if (cmd && shift && e.key.toLowerCase() === "f") {
+      if (cmd && shift && !e.altKey && e.key.toLowerCase() === "f") {
         e.preventDefault();
         dispatch({ type: "toggle-search" });
         return;
       }
 
-      if (cmd && !shift && e.key.toLowerCase() === "b") {
+      if (cmd && !shift && !e.altKey && e.key.toLowerCase() === "b") {
         e.preventDefault();
         dispatch({ type: "toggle-sidebar" });
         return;
       }
 
-      if (cmd && !shift && e.key === "\\") {
+      if (cmd && !shift && !e.altKey && e.key === "\\") {
         e.preventDefault();
         dispatch({ type: "toggle-right-panel" });
         return;
       }
 
-      if (cmd && !shift && e.key.toLowerCase() === "o") {
+      if (cmd && !shift && !e.altKey && e.key.toLowerCase() === "o") {
         e.preventDefault();
         void openProjectDialog(dispatch);
         return;
@@ -95,7 +141,7 @@ export function useKeyboardShortcuts() {
       // ⌘T presses in the same millisecond would otherwise mint the
       // same tab id and the second one would overwrite the first in
       // the reducer's tabs map.
-      if (cmd && !shift && e.key.toLowerCase() === "t" && worktree) {
+      if (cmd && !shift && !e.altKey && e.key.toLowerCase() === "t" && worktree) {
         e.preventDefault();
         const stamp = Date.now().toString(36);
         const rand = Math.random().toString(36).slice(2, 8);
@@ -120,7 +166,7 @@ export function useKeyboardShortcuts() {
 
       // ⌘N — auto-create a new worktree in the active project. No
       // prompt: the branch is named via the random landmark pool.
-      if (cmd && !shift && e.key.toLowerCase() === "n" && project) {
+      if (cmd && !shift && !e.altKey && e.key.toLowerCase() === "n" && project) {
         e.preventDefault();
         const base = nextAutoBranch(project.id, state);
         const branch = applyBranchPrefix(
@@ -153,14 +199,34 @@ export function useKeyboardShortcuts() {
         return;
       }
 
-      if (cmd && !shift && e.key.toLowerCase() === "w" && worktree?.activeTabId) {
+      if (cmd && !shift && !e.altKey && e.key.toLowerCase() === "w" && worktree?.activeTabId) {
         e.preventDefault();
         dispatch({ type: "close-tab", id: worktree.activeTabId });
         return;
       }
 
-      // Project switch: ⌘⇧1..9 or ⌘⌥1..9
-      if (cmd && (shift || e.altKey)) {
+      // ⌘⌥1..9 — switch to the Nth main-column tab (shell / editor /
+      // diff / markdown) in the active worktree. Worktree tab order
+      // is the same as the visible strip — w.tabIds is append-on-open
+      // and the reducer never reorders it.
+      if (cmd && e.altKey && !shift && worktree) {
+        const n = digitKey(e);
+        if (n !== null) {
+          e.preventDefault();
+          const targetTabId = worktree.tabIds[n - 1];
+          if (targetTabId) {
+            dispatch({
+              type: "select-tab",
+              worktreeId: worktree.id,
+              id: targetTabId,
+            });
+          }
+          return;
+        }
+      }
+
+      // Project switch: ⌘⇧1..9 (⌘⌥1..9 is now tab-switching above)
+      if (cmd && shift && !e.altKey) {
         const n = digitKey(e);
         if (n !== null) {
           e.preventDefault();
