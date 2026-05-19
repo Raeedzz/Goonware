@@ -243,8 +243,107 @@ pub(crate) async fn prepare_branch_for_pr(
         vec!["push", "-u", "origin", branch.as_str()]
     };
 
-    run_git_push(cwd, &push_args).await?;
+    push_with_https_fallback(cwd, &push_args).await?;
     Ok(())
+}
+
+/// Run a `git push`, and if it fails with `Permission denied (publickey)`
+/// retry through HTTPS using `gh`'s credential helper.
+///
+/// Why: GLI inherits SSH_AUTH_SOCK from the login shell at startup, but
+/// users who keep their key in a graphical agent (1Password, Secretive,
+/// macOS keychain unlocked on-demand) sometimes have a socket path
+/// their login shell can't see — the SSH push then fails even though
+/// `gh` is already authenticated for HTTPS. Rather than make them
+/// reconfigure their agent, we transparently push via HTTPS.
+///
+/// We do NOT mutate `remote.origin.url`. The retry passes
+/// `-c remote.origin.pushurl=<https>` so the override is scoped to
+/// this one process. Future SSH pushes still use the user's URL.
+async fn push_with_https_fallback(cwd: &str, push_args: &[&str]) -> Result<(), String> {
+    match run_git_push(cwd, push_args).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.contains("Permission denied (publickey)") => {
+            let Some(https) = ssh_remote_to_https(cwd, "origin").await else {
+                return Err(explain_push_error(&err));
+            };
+            // Make sure `gh` is registered as a credential helper for
+            // the remote host. Idempotent — safe to run every time.
+            let _ = Command::new("gh")
+                .args(["auth", "setup-git"])
+                .current_dir(cwd)
+                .output()
+                .await;
+            eprintln!("[pr] SSH push failed; retrying via HTTPS using gh credentials");
+            let pushurl_cfg = format!("remote.origin.pushurl={https}");
+            let mut retry: Vec<String> = vec!["-c".into(), pushurl_cfg];
+            for a in push_args {
+                retry.push((*a).to_string());
+            }
+            let retry_refs: Vec<&str> = retry.iter().map(String::as_str).collect();
+            match run_git_push(cwd, &retry_refs).await {
+                Ok(()) => Ok(()),
+                Err(retry_err) => Err(format!(
+                    "{}\n\nHTTPS fallback also failed: {}",
+                    explain_push_error(&err),
+                    retry_err.trim()
+                )),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Translate a git SSH remote URL into its HTTPS form. Returns None for
+/// any URL that isn't a recognized SSH shape — including URLs that are
+/// already HTTPS (no conversion needed).
+///
+/// Forms handled:
+///   git@github.com:user/repo(.git)         → https://github.com/user/repo(.git)
+///   ssh://git@github.com/user/repo(.git)   → https://github.com/user/repo(.git)
+///   ssh://git@github.com:22/user/repo.git  → https://github.com/user/repo.git
+pub(crate) fn ssh_url_to_https(url: &str) -> Option<String> {
+    let url = url.trim();
+    if let Some(rest) = url.strip_prefix("ssh://git@") {
+        // Strip optional port.
+        let cleaned = match rest.split_once('/') {
+            Some((host_with_port, path)) => {
+                let host = host_with_port.split(':').next().unwrap_or(host_with_port);
+                format!("{host}/{path}")
+            }
+            None => rest.to_string(),
+        };
+        return Some(format!("https://{cleaned}"));
+    }
+    if let Some(rest) = url.strip_prefix("git@") {
+        // git@host:path
+        let (host, path) = rest.split_once(':')?;
+        if host.is_empty() || path.is_empty() {
+            return None;
+        }
+        return Some(format!("https://{host}/{path}"));
+    }
+    None
+}
+
+async fn ssh_remote_to_https(cwd: &str, remote: &str) -> Option<String> {
+    let raw = run_git(cwd, &["remote", "get-url", remote]).await.ok()?;
+    ssh_url_to_https(raw.trim())
+}
+
+fn explain_push_error(err: &str) -> String {
+    let trimmed = err.trim();
+    if err.contains("Permission denied (publickey)") {
+        format!(
+            "git rejected your SSH key.\n\nTo fix:\n\
+             • Make sure your key is loaded — run `ssh-add ~/.ssh/id_ed25519` (or your key path) from a terminal.\n\
+             • Or relaunch GLI from a terminal so it inherits your SSH_AUTH_SOCK.\n\
+             • Or switch the remote to HTTPS: `gh auth setup-git && git remote set-url origin <https-url>`.\n\n\
+             Original: {trimmed}"
+        )
+    } else {
+        format!("git push failed: {trimmed}")
+    }
 }
 
 /// Env vars that keep network-touching git from blocking on credential
@@ -718,6 +817,79 @@ mod tests {
         );
         assert!(ok && stdout.trim() == "brand_new.txt",
             "brand_new.txt should be tracked in HEAD; got ok={ok} stdout={stdout:?}");
+    }
+
+    // ---- ssh_url_to_https ----------------------------------------------
+
+    #[test]
+    fn ssh_url_git_at_form_with_dot_git() {
+        assert_eq!(
+            ssh_url_to_https("git@github.com:foo/bar.git").as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+    }
+
+    #[test]
+    fn ssh_url_git_at_form_no_dot_git() {
+        assert_eq!(
+            ssh_url_to_https("git@github.com:foo/bar").as_deref(),
+            Some("https://github.com/foo/bar")
+        );
+    }
+
+    #[test]
+    fn ssh_url_ssh_scheme_form() {
+        assert_eq!(
+            ssh_url_to_https("ssh://git@github.com/foo/bar.git").as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+    }
+
+    #[test]
+    fn ssh_url_ssh_scheme_with_port_strips_port() {
+        assert_eq!(
+            ssh_url_to_https("ssh://git@github.com:22/foo/bar.git").as_deref(),
+            Some("https://github.com/foo/bar.git")
+        );
+    }
+
+    #[test]
+    fn ssh_url_https_passthrough_returns_none() {
+        // Already HTTPS — there's nothing to convert.
+        assert_eq!(
+            ssh_url_to_https("https://github.com/foo/bar.git"),
+            None
+        );
+    }
+
+    #[test]
+    fn ssh_url_non_github_host_also_converts() {
+        assert_eq!(
+            ssh_url_to_https("git@gitlab.example.com:team/repo.git").as_deref(),
+            Some("https://gitlab.example.com/team/repo.git")
+        );
+    }
+
+    #[test]
+    fn ssh_url_malformed_returns_none() {
+        assert_eq!(ssh_url_to_https("not-a-url"), None);
+        assert_eq!(ssh_url_to_https("git@:foo/bar"), None);
+        assert_eq!(ssh_url_to_https("git@github.com:"), None);
+    }
+
+    // ---- explain_push_error --------------------------------------------
+
+    #[test]
+    fn explain_publickey_includes_actionable_hints() {
+        let msg = explain_push_error("git@github.com: Permission denied (publickey).");
+        assert!(msg.contains("ssh-add"), "missing ssh-add hint: {msg}");
+        assert!(msg.contains("HTTPS") || msg.contains("https"));
+    }
+
+    #[test]
+    fn explain_other_error_passes_through() {
+        let msg = explain_push_error("Could not resolve host: github.com");
+        assert!(msg.contains("Could not resolve host"));
     }
 
     #[tokio::test]
