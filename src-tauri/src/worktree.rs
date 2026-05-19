@@ -115,6 +115,48 @@ fn worktrees_root(project_path: &str, project_id: &str) -> Result<PathBuf, Strin
     Ok(dir)
 }
 
+/// Sanitize a worktree label into a filesystem-safe directory segment.
+/// Lowercases, maps non-alphanumeric runs to single dashes, and trims
+/// dashes from the ends. Empty results fall back to a uuid stub so we
+/// never hand `git worktree add` an empty path.
+fn safe_dir_name(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut prev_dash = true;
+    for c in label.trim().to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        format!("w-{}", Uuid::new_v4().simple())
+    } else {
+        out
+    }
+}
+
+/// Pick a directory name under `root` that doesn't collide with an
+/// existing entry. Tries `base`, then `base-2`, `base-3`, … with a
+/// hard ceiling that falls back to a uuid suffix.
+fn pick_unique_dir(root: &Path, base: &str) -> String {
+    if !root.join(base).exists() {
+        return base.to_string();
+    }
+    for n in 2u32..=9999 {
+        let candidate = format!("{base}-{n}");
+        if !root.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    format!("{base}-{}", Uuid::new_v4().simple())
+}
+
 fn archive_dir(app: &AppHandle, project_id: &str) -> Result<PathBuf, String> {
     let base = app
         .path()
@@ -207,7 +249,12 @@ pub async fn worktree_create(
 ) -> Result<WorktreeRow, String> {
     let id = format!("w_{}", Uuid::new_v4().simple());
     let root = worktrees_root(&project_path, &project_id)?;
-    let path = root.join(&id);
+    // On-disk directory is named after the friendly label (e.g.
+    // `niagara`) so the user sees recognizable folders, not opaque
+    // `w_<uuid>`. The internal `id` stays uuid-based — it's keyed
+    // off in app state and must stay stable across renames.
+    let dir_name = pick_unique_dir(&root, &safe_dir_name(&label));
+    let path = root.join(&dir_name);
     let path_str = path.to_string_lossy().into_owned();
     // `app` is only kept for the archive flow below — silence unused
     // warning when the function compiles without referencing it.
@@ -473,7 +520,11 @@ pub async fn worktree_restore(
     // off the worktree id, so a clean uuid is what we want here.
     let new_id = format!("w_{}", Uuid::new_v4().simple());
     let restored_path = match Path::new(&record.original_path).parent() {
-        Some(parent) => parent.join(&new_id).to_string_lossy().to_string(),
+        Some(parent) => {
+            let _ = fs::create_dir_all(parent);
+            let dir_name = pick_unique_dir(parent, &safe_dir_name(&record.name));
+            parent.join(&dir_name).to_string_lossy().to_string()
+        }
         None => record.original_path.clone(),
     };
     if let Some(parent) = Path::new(&restored_path).parent() {
