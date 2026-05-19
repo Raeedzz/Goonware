@@ -582,7 +582,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
           hydratedRef.current = true;
         });
       })
-      .catch(() => {
+      .catch((err: unknown) => {
+        console.error("[GLI] persistence: loadState failed", err);
         hydratedRef.current = true;
       });
     return () => {
@@ -593,7 +594,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!hydratedRef.current) return;
     const timer = window.setTimeout(() => {
-      saveState(state).catch(() => {});
+      saveState(state).catch((err: unknown) => {
+        console.error("[GLI] persistence: saveState failed", err);
+      });
     }, SAVE_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
   }, [

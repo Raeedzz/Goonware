@@ -38,7 +38,7 @@
 use std::fs;
 use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -799,7 +799,7 @@ fn install_codex_hooks() {
     }
 }
 
-fn upsert_codex_hooks_json(mut root: Value, script_path: &PathBuf) -> Value {
+fn upsert_codex_hooks_json(mut root: Value, script_path: &Path) -> Value {
     let command = script_path.to_string_lossy().into_owned();
     let hook_entry = json!([{"type": "command", "command": command}]);
     let with_matcher = json!([{"matcher": "startup|resume", "hooks": hook_entry}]);
@@ -954,7 +954,7 @@ fn install_gemini_hooks() {
     write_pretty_json(&settings_path, &updated, "gemini settings");
 }
 
-fn upsert_gemini_settings(mut root: Value, script_path: &PathBuf) -> Value {
+fn upsert_gemini_settings(mut root: Value, script_path: &Path) -> Value {
     let command = script_path.to_string_lossy().into_owned();
     let hook_entry = json!([{"type": "command", "command": command}]);
     let without_matcher = json!([{"hooks": hook_entry}]);

@@ -1,3 +1,10 @@
+// Doc comments in this crate use a mix of indented and unindented list
+// styles that pre-date the rustdoc list-indent lints. The rendered
+// output is unaffected; suppress the noise crate-wide so real warnings
+// stand out.
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::doc_overindented_list_items)]
+
 /// GLI Tauri entry point.
 ///
 /// Plugin set is the minimum needed for v1 features:

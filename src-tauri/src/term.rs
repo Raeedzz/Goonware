@@ -1112,6 +1112,7 @@ fn snapshot_grid_legacy<E: EventListener>(term: &Term<E>) -> Vec<RowSnapshot> {
 // into Session this becomes the prod snapshot path. Gated on test
 // for now to keep prod builds free of the unused-fn warning.
 #[cfg(test)]
+#[allow(dead_code)] // forward-compat scaffold for the FlatTerm migration; see comment above
 fn flat_storage_to_row_snapshots(
     fs: &crate::flat_storage::FlatStorage,
 ) -> Vec<RowSnapshot> {
@@ -1164,6 +1165,7 @@ fn spans_match(a: &Span, b: &Span) -> bool {
 /// Build a Span for one grapheme, with attributes lifted from
 /// FlatStorage's packed encoding.
 #[cfg(test)]
+#[allow(dead_code)]
 fn packed_cell_to_span(
     ch: char,
     fg: crate::flat_storage::PackedColor,
@@ -1189,6 +1191,7 @@ fn packed_cell_to_span(
 /// produces. The `Named` variant uses the raw NamedColor index — see
 /// `alac_adapter::color_to_packed` for the mapping.
 #[cfg(test)]
+#[allow(dead_code)]
 fn packed_color_to_css(
     c: crate::flat_storage::PackedColor,
     fallback: &'static str,
@@ -1217,6 +1220,7 @@ fn packed_color_to_css(
 /// for the Foreground / Background / Cursor / Dim* / Bright* set.
 /// Variants outside those ranges produce the fallback.
 #[cfg(test)]
+#[allow(dead_code)]
 fn named_color_from_raw_index(
     idx: u16,
     fallback: &'static str,
@@ -2751,7 +2755,6 @@ mod tests {
         assert_eq!(out.len(), 3);
     }
 
-    #[test]
     #[test]
     fn strip_trailing_alt_screen_exit_preserves_content() {
         // Simulate claude's Ctrl+C cleanup: enter alt-screen, draw,

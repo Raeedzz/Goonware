@@ -68,8 +68,22 @@ export function MainColumn() {
     <div
       style={{
         height: "100%",
+        // `minmax(0, 1fr)` (not the implicit `1fr`) — the implicit
+        // form resolves to `minmax(auto, 1fr)`, where `auto` is the
+        // min-content of the grid item. Anything inside (a wide
+        // terminal canvas, a long unbroken markdown line, a pre block
+        // with code) reports a large min-content width and the grid
+        // grows past the parent `<main>`. `<main>` has overflow:
+        // hidden so the overshoot is invisible, but the markdown's
+        // centered `maxWidth: 760, margin: 0 auto` then anchors to
+        // the *wider* invisible grid — that's why the prose ends up
+        // pushed off to the right edge instead of centered in the
+        // visible column. Forcing the min to 0 lets the grid shrink
+        // to whatever `<main>` actually gives us.
+        minWidth: 0,
         display: "grid",
         gridTemplateRows: "auto 1fr",
+        gridTemplateColumns: "minmax(0, 1fr)",
         backgroundColor: "var(--surface-2)",
       }}
     >
@@ -652,7 +666,7 @@ function TabContent({
   // already-mounted terminals — no re-listen, no re-term_start,
   // no React commit cascade for the BlockTerminal subtree.
   return (
-    <div style={{ minHeight: 0, position: "relative", overflow: "hidden" }}>
+    <div style={{ minHeight: 0, minWidth: 0, position: "relative", overflow: "hidden" }}>
       <ErrorBoundary>
         <TerminalKeepaliveLayer
           activeTerminalTabId={

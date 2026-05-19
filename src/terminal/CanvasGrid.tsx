@@ -543,7 +543,7 @@ export function CanvasGrid({
   // directly. The textarea-level handler still runs first when the
   // grid IS interactive, so this doesn't double-copy.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
+    const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.defaultPrevented) return;
       if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
       if (e.key.toLowerCase() !== "c") return;
