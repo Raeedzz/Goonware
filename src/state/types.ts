@@ -143,6 +143,36 @@ export const DEFAULT_PROJECT_SETTINGS: ProjectSettings = {
   prefs: DEFAULT_REPO_PREFERENCES,
 };
 
+/**
+ * Apply the user's branch-prefix setting to an auto-generated branch
+ * name. Returns the bare name verbatim when the prefix can't be
+ * resolved (no gh login resolved yet, or `custom` mode with an empty
+ * prefix). Prefixes are slugified to be branch-name-legal — strips
+ * leading `@`, collapses non-alnum into `-`, trims `-` from edges.
+ */
+export function applyBranchPrefix(
+  base: string,
+  mode: BranchPrefixMode,
+  githubUsername: string,
+  customPrefix: string,
+): string {
+  if (!base) return base;
+  let raw = "";
+  if (mode === "github") raw = githubUsername;
+  else if (mode === "custom") raw = customPrefix;
+  const prefix = sanitizeBranchPrefix(raw);
+  if (!prefix) return base;
+  return `${prefix}/${base}`;
+}
+
+function sanitizeBranchPrefix(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^@+/, "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 /** Read a project's settings with defaults filled in. */
 export function projectSettings(project: Project | null | undefined): ProjectSettings {
   return {
@@ -296,6 +326,7 @@ export type Tab =
  */
 export type SettingsSection =
   | { kind: "general" }
+  | { kind: "git" }
   | { kind: "repository"; id: ProjectId };
 
 /* ------------------------------------------------------------------
@@ -309,6 +340,7 @@ export type SettingsSection =
 
 export type CompletionSound = "none" | "subtle" | "bell";
 export type ArchiveBehavior = "stash" | "force" | "ask";
+export type BranchPrefixMode = "github" | "custom" | "none";
 
 export interface Settings {
   /** Show a macOS notification when an agent in a worktree goes idle. */
@@ -364,6 +396,36 @@ export interface Settings {
    *   ask   → prompt each time.
    */
   archiveBehavior: ArchiveBehavior;
+  /**
+   * Prefix applied to auto-generated worktree branch names. Lets a
+   * team share a fork without colliding on `eiffel`-style landmark
+   * names — `raeedzz/eiffel` is unmistakably mine.
+   *   github → `<gh-login>/<branch>` (auto-resolved via `gh api user`)
+   *   custom → `<customBranchPrefix>/<branch>` (verbatim string)
+   *   none   → no prefix (legacy behavior)
+   */
+  branchPrefixMode: BranchPrefixMode;
+  /** Verbatim string used when `branchPrefixMode === "custom"`. */
+  customBranchPrefix: string;
+  /**
+   * Cached GitHub login. Filled by a one-shot `gh api user` lookup so
+   * the Git-settings page can show "GitHub username (xxx)" without
+   * re-shelling on every render. Cleared if the lookup fails.
+   */
+  githubUsername: string;
+  /**
+   * Delete the local branch when archiving a worktree. Mirrors what
+   * GitHub does after a merged PR if the repo is configured that way.
+   * Remote-branch deletion stays on the server (configure in GitHub
+   * repo settings), as the chrome label notes.
+   */
+  deleteBranchOnArchive: boolean;
+  /**
+   * Auto-archive a worktree once its PR transitions to MERGED. Polls
+   * via the existing `pr_status` cadence, archives the first time it
+   * sees MERGED for a given worktree.
+   */
+  archiveOnMerge: boolean;
 }
 
 /** Resize bounds for the side columns. Reducer clamps writes here. */
@@ -398,6 +460,11 @@ export const DEFAULT_SETTINGS: Settings = {
   helperModelExplain: "",
   autoSummarize: true,
   archiveBehavior: "stash",
+  branchPrefixMode: "github",
+  customBranchPrefix: "",
+  githubUsername: "",
+  deleteBranchOnArchive: false,
+  archiveOnMerge: false,
 };
 
 export interface ArchiveRecord {

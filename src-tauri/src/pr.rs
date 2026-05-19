@@ -694,6 +694,26 @@ async fn run_git(cwd: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Look up the authenticated GitHub user's login via `gh api user`.
+/// Returns an empty string when `gh` isn't installed or the user
+/// isn't signed in — the caller falls back to the "Custom" / "None"
+/// branch-prefix modes in that case rather than surfacing the error.
+#[tauri::command]
+pub async fn gh_username() -> Result<String, String> {
+    let out = Command::new("gh")
+        .args(["api", "user", "--jq", ".login"])
+        .output()
+        .await
+        .map_err(|_| String::new());
+    let Ok(out) = out else {
+        return Ok(String::new());
+    };
+    if !out.status.success() {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();

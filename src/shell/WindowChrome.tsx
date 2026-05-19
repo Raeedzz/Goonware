@@ -25,6 +25,7 @@ import {
 } from "@/state/AppState";
 import { useToast } from "@/primitives/Toast";
 import { projectSettings, type Tab, type Worktree } from "@/state/types";
+import { worktreeArchive } from "@/lib/worktrees";
 
 const TRAFFIC_LIGHT_GUTTER = 78;
 // 36px matches the right panel's tab bar exactly, so the two
@@ -125,9 +126,36 @@ function BranchActionButton({ worktree }: { worktree: Worktree | null }) {
   const state = useAppState();
   const branch = worktree?.branch ?? "";
   const path = worktree?.path ?? "";
+  const archiveOnMerge = state.settings.archiveOnMerge;
+  const deleteBranchOnArchive = state.settings.deleteBranchOnArchive;
+  const project = worktree ? state.projects[worktree.projectId] : null;
 
   const [pr, setPr] = useState<PrStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  // Latch so the polling-driven archive-on-merge handler fires exactly
+  // once per worktree, even though `pr.state` keeps reporting MERGED
+  // on subsequent polls until the worktree disappears from state.
+  const archivedRef = useRef<Record<string, boolean>>({});
+
+  const archiveAfterMerge = useCallback(async () => {
+    if (!worktree) return;
+    if (archivedRef.current[worktree.id]) return;
+    archivedRef.current[worktree.id] = true;
+    try {
+      const cfg = projectSettings(project);
+      const record = await worktreeArchive(worktree, {
+        stash: true,
+        force: false,
+        deleteBranch: deleteBranchOnArchive,
+        archiveScript: cfg.archiveScript,
+      });
+      dispatch({ type: "archive-worktree", id: worktree.id, record });
+      toast.show({ message: `Archived ${worktree.name} after merge` });
+    } catch (e) {
+      archivedRef.current[worktree.id] = false;
+      toast.show({ message: `Auto-archive failed: ${e}` });
+    }
+  }, [worktree, project, deleteBranchOnArchive, dispatch, toast]);
 
   // The button is always shown and clickable when a worktree is
   // active. PR-status polling only runs once we have a branch to look
@@ -163,6 +191,17 @@ function BranchActionButton({ worktree }: { worktree: Worktree | null }) {
       window.removeEventListener("gli-git-refresh", onGitRefresh);
     };
   }, [canQuery, refresh, path]);
+
+  // Polling-driven archive-on-merge. Fires when a poll reveals the PR
+  // has flipped to MERGED — covers the case where the user merged on
+  // GitHub web instead of via the in-app button. The `archivedRef`
+  // latch keeps it from re-firing on subsequent polls.
+  useEffect(() => {
+    if (!archiveOnMerge) return;
+    if (!worktree) return;
+    if (pr?.state !== "MERGED") return;
+    void archiveAfterMerge();
+  }, [archiveOnMerge, worktree, pr?.state, archiveAfterMerge]);
 
   // Find a terminal-tab PTY to inject a prompt into when delegating
   // conflict resolution to the agent. Falls back to the secondary
@@ -201,6 +240,9 @@ function BranchActionButton({ worktree }: { worktree: Worktree | null }) {
       );
       toast.show({ message: `Merged PR #${pr.number} into ${branch === "master" ? "master" : "main"}.` });
       await refresh();
+      if (archiveOnMerge) {
+        void archiveAfterMerge();
+      }
     } catch (e) {
       toast.show({ message: `Merge failed: ${e}` });
     } finally {

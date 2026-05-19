@@ -156,6 +156,7 @@ pub fn run() {
             pr::pr_status,
             pr::pr_merge,
             pr::merge_base_into_branch,
+            pr::gh_username,
             // Connections (Task #10)
             connections::connections_scan,
             // Search (Task #15)

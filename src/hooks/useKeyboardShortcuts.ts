@@ -11,7 +11,7 @@ import {
   primaryTerminalTab,
   worktreeCreate,
 } from "@/lib/worktrees";
-import { projectSettings } from "@/state/types";
+import { applyBranchPrefix, projectSettings } from "@/state/types";
 
 /**
  * Match a digit press regardless of modifier-induced char shifting.
@@ -122,7 +122,13 @@ export function useKeyboardShortcuts() {
       // prompt: the branch is named via the random landmark pool.
       if (cmd && !shift && e.key.toLowerCase() === "n" && project) {
         e.preventDefault();
-        const branch = nextAutoBranch(project.id, state);
+        const base = nextAutoBranch(project.id, state);
+        const branch = applyBranchPrefix(
+          base,
+          state.settings.branchPrefixMode,
+          state.settings.githubUsername,
+          state.settings.customBranchPrefix,
+        );
         const proj = project;
         const cfg = projectSettings(proj);
         void (async () => {
@@ -131,7 +137,7 @@ export function useKeyboardShortcuts() {
               proj.id,
               proj.path,
               branch,
-              branch,
+              base,
               {
                 baseRef: cfg.baseBranch,
                 filesToCopy: cfg.filesToCopy,

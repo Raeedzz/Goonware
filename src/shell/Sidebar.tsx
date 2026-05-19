@@ -34,6 +34,7 @@ import {
   useAppState,
 } from "@/state/AppState";
 import {
+  applyBranchPrefix,
   projectSettings,
   type ArchiveRecord,
   type Project,
@@ -235,14 +236,20 @@ function ProjectGroup({
 
   const state = useAppState();
   const onCreate = async () => {
-    const branch = nextAutoBranch(project.id, state);
+    const base = nextAutoBranch(project.id, state);
+    const branch = applyBranchPrefix(
+      base,
+      state.settings.branchPrefixMode,
+      state.settings.githubUsername,
+      state.settings.customBranchPrefix,
+    );
     const cfg = projectSettings(project);
     try {
       const w = await worktreeCreate(
         project.id,
         project.path,
         branch,
-        branch,
+        base,
         {
           baseRef: cfg.baseBranch,
           filesToCopy: cfg.filesToCopy,
@@ -410,6 +417,7 @@ function ProjectGroup({
             project={project}
             isActive={activeWorktreeId === w.id}
             archiveBehavior={state.settings.archiveBehavior}
+            deleteBranchOnArchive={state.settings.deleteBranchOnArchive}
           />
         ))}
       </ul>
@@ -685,6 +693,7 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   project,
   isActive,
   archiveBehavior,
+  deleteBranchOnArchive,
 }: {
   worktree: Worktree;
   project: Project;
@@ -697,6 +706,8 @@ const WorktreeRow = memo(function WorktreeRowImpl({
    * to every settings touch (including unrelated ones).
    */
   archiveBehavior: "ask" | "stash" | "force";
+  /** Per-Git-settings tab. Drilled in for the same memo reasons. */
+  deleteBranchOnArchive: boolean;
 }) {
   // Live "is Claude doing something in this worktree" flag, sourced
   // from the singleton agentActivityStore which polls Claude's
@@ -816,7 +827,7 @@ const WorktreeRow = memo(function WorktreeRowImpl({
       const record = await worktreeArchive(worktree, {
         stash,
         force,
-        deleteBranch: false,
+        deleteBranch: deleteBranchOnArchive,
         archiveScript: cfg.archiveScript,
       });
       dispatch({ type: "archive-worktree", id: worktree.id, record });

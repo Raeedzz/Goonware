@@ -1,5 +1,6 @@
-import { type CSSProperties, type ReactNode } from "react";
+import { type CSSProperties, type ReactNode, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   IconBack,
   IconSettings,
@@ -146,10 +147,10 @@ function SettingsSidebar({
           onClick={() => onPick({ kind: "general" })}
         />
         <NavItem
-          active={false}
+          active={current.kind === "git"}
           icon={<IconBranch size={14} />}
-          label="Helpers"
-          onClick={() => onPick({ kind: "general" })}
+          label="Git"
+          onClick={() => onPick({ kind: "git" })}
         />
       </nav>
 
@@ -357,9 +358,13 @@ function SettingsMain({
           color: "var(--text-primary)",
         }}
       >
-        General
+        {section.kind === "git" ? "Git" : "General"}
       </h1>
-      <GeneralSection settings={settings} />
+      {section.kind === "git" ? (
+        <GitSection settings={settings} />
+      ) : (
+        <GeneralSection settings={settings} />
+      )}
     </main>
   );
 }
@@ -515,6 +520,239 @@ function GeneralSection({ settings }: { settings: Settings }) {
   );
 }
 
+function GitSection({ settings }: { settings: Settings }) {
+  const dispatch = useAppDispatch();
+  const update = (patch: Partial<Settings>) =>
+    dispatch({ type: "update-settings", patch });
+
+  // One-shot probe for the user's GitHub login so the radio option can
+  // render "GitHub username (raeedzz)" instead of an empty parenthetical.
+  // Cached in settings.githubUsername; we only re-probe when empty so a
+  // repeat visit to the settings page doesn't shell out to `gh` again.
+  useEffect(() => {
+    if (settings.githubUsername) return;
+    let cancelled = false;
+    invoke<string>("gh_username")
+      .then((name) => {
+        if (cancelled) return;
+        const trimmed = name.trim();
+        if (trimmed) update({ githubUsername: trimmed });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.githubUsername]);
+
+  const githubLabel = settings.githubUsername
+    ? `GitHub username (${settings.githubUsername})`
+    : "GitHub username";
+  const githubDisabled = !settings.githubUsername;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", maxWidth: 760 }}>
+      <div style={{ padding: "var(--space-4) 0", borderBottom: "var(--border-1)" }}>
+        <div
+          style={{
+            fontSize: "var(--text-md)",
+            fontWeight: "var(--weight-medium)",
+            color: "var(--text-primary)",
+          }}
+        >
+          Branch name prefix
+        </div>
+        <div
+          style={{
+            marginTop: 4,
+            fontSize: "var(--text-xs)",
+            lineHeight: "var(--leading-base)",
+            color: "var(--text-tertiary)",
+            maxWidth: 520,
+          }}
+        >
+          Prefix for new workspace branch names.
+        </div>
+        <div
+          role="radiogroup"
+          style={{
+            marginTop: "var(--space-3)",
+            display: "flex",
+            flexDirection: "column",
+            gap: "var(--space-2)",
+          }}
+        >
+          <RadioOption
+            checked={settings.branchPrefixMode === "github"}
+            disabled={githubDisabled}
+            label={githubLabel}
+            hint={
+              githubDisabled
+                ? "Sign in with `gh auth login` to enable this option."
+                : undefined
+            }
+            onSelect={() => update({ branchPrefixMode: "github" })}
+          />
+          <RadioOption
+            checked={settings.branchPrefixMode === "custom"}
+            label="Custom"
+            onSelect={() => update({ branchPrefixMode: "custom" })}
+            trailing={
+              settings.branchPrefixMode === "custom" ? (
+                <input
+                  type="text"
+                  value={settings.customBranchPrefix}
+                  onChange={(e) =>
+                    update({ customBranchPrefix: e.target.value })
+                  }
+                  placeholder="e.g. team-name"
+                  style={{
+                    marginLeft: "var(--space-2)",
+                    height: 26,
+                    padding: "0 8px",
+                    borderRadius: "var(--radius-sm)",
+                    border: "var(--border-1)",
+                    backgroundColor: "var(--surface-2)",
+                    color: "var(--text-primary)",
+                    fontSize: "var(--text-xs)",
+                    fontFamily: "var(--font-mono)",
+                    width: 200,
+                  }}
+                />
+              ) : null
+            }
+          />
+          <RadioOption
+            checked={settings.branchPrefixMode === "none"}
+            label="None"
+            onSelect={() => update({ branchPrefixMode: "none" })}
+          />
+        </div>
+      </div>
+
+      <SettingRow
+        title="Delete branch on archive"
+        description={
+          <>
+            Delete the local branch when archiving a workspace.
+            <br />
+            To delete the remote branch,{" "}
+            <a
+              href="https://github.com/settings/repositories"
+              target="_blank"
+              rel="noreferrer"
+              style={{ color: "var(--text-secondary)", textDecoration: "underline" }}
+            >
+              configure it on GitHub
+            </a>
+            .
+          </>
+        }
+        control={
+          <Toggle
+            checked={settings.deleteBranchOnArchive}
+            onChange={(v) => update({ deleteBranchOnArchive: v })}
+          />
+        }
+      />
+
+      <SettingRow
+        title="Archive on merge"
+        description="Automatically archive a workspace after merging its PR in RLI."
+        control={
+          <Toggle
+            checked={settings.archiveOnMerge}
+            onChange={(v) => update({ archiveOnMerge: v })}
+          />
+        }
+      />
+    </div>
+  );
+}
+
+function RadioOption({
+  checked,
+  disabled,
+  label,
+  hint,
+  onSelect,
+  trailing,
+}: {
+  checked: boolean;
+  disabled?: boolean;
+  label: string;
+  hint?: string;
+  onSelect: () => void;
+  trailing?: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={onSelect}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: 0,
+        background: "transparent",
+        border: "none",
+        cursor: disabled ? "default" : "pointer",
+        color: disabled ? "var(--text-tertiary)" : "var(--text-primary)",
+        fontSize: "var(--text-sm)",
+        textAlign: "left",
+        opacity: disabled ? 0.55 : 1,
+      }}
+    >
+      <span
+        aria-hidden
+        style={{
+          flexShrink: 0,
+          width: 16,
+          height: 16,
+          borderRadius: "var(--radius-pill)",
+          border: checked
+            ? "1.5px solid var(--text-primary)"
+            : "1.5px solid var(--surface-4)",
+          backgroundColor: "transparent",
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          transition: "border-color var(--motion-fast) var(--ease-out-quart)",
+        }}
+      >
+        {checked && (
+          <span
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: "var(--radius-pill)",
+              backgroundColor: "var(--text-primary)",
+            }}
+          />
+        )}
+      </span>
+      <span style={{ display: "inline-flex", flexDirection: "column" }}>
+        <span>{label}</span>
+        {hint && (
+          <span
+            style={{
+              fontSize: "var(--text-2xs)",
+              color: "var(--text-tertiary)",
+              marginTop: 2,
+            }}
+          >
+            {hint}
+          </span>
+        )}
+      </span>
+      {trailing}
+    </button>
+  );
+}
+
 /* ------------------------------------------------------------------
    Primitives
    ------------------------------------------------------------------ */
@@ -620,7 +858,7 @@ function SettingRow({
   control,
 }: {
   title: string;
-  description?: string;
+  description?: ReactNode;
   control: ReactNode;
 }) {
   return (
