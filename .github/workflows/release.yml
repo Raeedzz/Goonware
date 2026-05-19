@@ -1,21 +1,28 @@
 # Release pipeline for GLI.
 #
-# Triggered by pushing a tag matching `v*` (e.g. `v0.0.2`). Builds a
-# macOS DMG, signs the update artifact with the Tauri updater key,
-# and publishes everything to a GitHub Release. The published release
-# also contains a `latest.json` — the file the installed app polls
-# at `https://github.com/Raeedzz/GLI/releases/latest/download/latest.json`
-# to discover new versions.
+# Trigger: every push to `main` (which includes merged PRs). The
+# workflow computes the next version by patch-bumping the latest
+# `v*` git tag, patches that version into `package.json`,
+# `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`, builds a
+# universal macOS DMG, signs the update artifact with the Tauri
+# updater key, and publishes a GitHub Release as *Latest* (not draft).
+#
+# The published release also contains a `latest.json` — the file the
+# installed app polls at
+# `https://github.com/Raeedzz/GLI/releases/latest/download/latest.json`
+# to discover new versions. Because we publish as Latest immediately,
+# every push to main ships an update; `UpdaterToast.tsx` shows the
+# prompt in the corner on the user's next app start.
 #
 # ──────────────────────────── one-time setup ────────────────────────────
 #
 # 1. Generate the updater keypair on your dev machine:
 #
 #      mkdir -p ~/.tauri
-#      bun tauri signer generate -w ~/.tauri/gli.key
+#      npx @tauri-apps/cli signer generate --password "" --ci -w ~/.tauri/gli.key
 #
-#    You'll be prompted for a password — pick something memorable. The
-#    command prints a base64 public key when it finishes.
+#    (Use `--password "<your-password>"` instead of empty if you want
+#    one. If you set a password, also add the secret in step 3.)
 #
 # 2. Paste the public key into `src-tauri/tauri.conf.json`:
 #
@@ -26,13 +33,11 @@
 #        }
 #      }
 #
-#    Commit + push that change.
-#
-# 3. Add two GitHub secrets at
+# 3. Add the GitHub secret at
 #    https://github.com/Raeedzz/GLI/settings/secrets/actions :
 #
 #      TAURI_SIGNING_PRIVATE_KEY          ← contents of ~/.tauri/gli.key
-#      TAURI_SIGNING_PRIVATE_KEY_PASSWORD ← password you set in step 1
+#      TAURI_SIGNING_PRIVATE_KEY_PASSWORD ← (only if you set one in step 1)
 #
 # 4. (Optional — Apple notarization) If you want users to skip the
 #    Gatekeeper warning on first install, add the Apple secrets too:
@@ -45,38 +50,94 @@
 #      APPLE_TEAM_ID                 ← 10-char team id
 #
 #    Without these the build still runs and updates still install
-#    (Tauri's ed25519 signature covers integrity), users just see
+#    (Tauri's ed25519 signature covers integrity); users just see
 #    Gatekeeper on the very first install.
 #
-# 5. Ship a release:
+# ──────────────────────────── shipping a release ────────────────────────────
 #
-#      # bump the version in package.json + tauri.conf.json + Cargo.toml
-#      git commit -am "release v0.0.2"
-#      git tag v0.0.2
-#      git push origin main --tags
+# Just push to main. The next version is `latest_v_tag + patch`.
+# If you want to bump minor/major manually, push a tag yourself:
 #
-#    GitHub Actions will pick up the tag, build, and publish a draft
-#    release containing the DMG + `latest.json`. Promote the draft to
-#    "Latest release" and installed apps will pick it up within four
-#    hours (or sooner if the user relaunches).
+#      git tag v0.1.0 && git push origin v0.1.0
+#
+# That tag becomes the new "latest" and the next push to main will
+# compute v0.1.1.
+#
+# To skip a release for docs-only / non-code commits, include
+# `[skip ci]` in the commit message.
 
 name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+  workflow_dispatch:
+
+# Only one release at a time. If a push lands while one is running,
+# it queues; any further pushes replace the queued one (so the
+# eventual release ships the latest commit, not every intermediate).
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   build:
     name: Build & publish (macOS)
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]')
     runs-on: macos-14
     permissions:
       contents: write
 
     steps:
-      - name: Checkout
+      - name: Checkout (full history for tags)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version from latest git tag
+        id: ver
+        run: |
+          set -euo pipefail
+          # Most-recent v* tag, sorted as semver. If none exist this
+          # is the very first release.
+          LATEST=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$LATEST" ]; then
+            NEW="v0.0.1"
+          else
+            NUMS=${LATEST#v}
+            IFS=. read -r MAJ MIN PAT <<< "$NUMS"
+            PAT=$((PAT + 1))
+            NEW="v${MAJ}.${MIN}.${PAT}"
+          fi
+          echo "tag=$NEW"            >> "$GITHUB_OUTPUT"
+          echo "version=${NEW#v}"    >> "$GITHUB_OUTPUT"
+          echo "Bumping ${LATEST:-<none>} → $NEW"
+
+      - name: Patch version into source manifests
+        env:
+          NEW_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # tauri.conf.json — what tauri-action reads and what gets
+          # baked into the binary; this is the version users see and
+          # what the updater compares.
+          jq --arg v "$NEW_VERSION" '.version = $v' src-tauri/tauri.conf.json > /tmp/c.json
+          mv /tmp/c.json src-tauri/tauri.conf.json
+
+          # package.json — cosmetic; kept in sync so npm tooling and
+          # tauri-action's version detection agree.
+          jq --arg v "$NEW_VERSION" '.version = $v' package.json > /tmp/p.json
+          mv /tmp/p.json package.json
+
+          # Cargo.toml — first `version = "..."` line lives under
+          # `[package]`. Replace only that occurrence.
+          sed -i.bak -E '0,/^version = ".*"$/s//version = "'"$NEW_VERSION"'"/' src-tauri/Cargo.toml
+          rm -f src-tauri/Cargo.toml.bak
+
+          echo "Patched manifests:"
+          jq -r '"  tauri.conf.json -> " + .version' src-tauri/tauri.conf.json
+          jq -r '"  package.json    -> " + .version' package.json
+          grep -m1 '^version' src-tauri/Cargo.toml | sed 's/^/  Cargo.toml      -> /'
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -114,8 +175,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Updater signing — required for the updater plugin to
-          # accept the build. The pubkey baked into the app must match
-          # the private key here.
+          # accept the build. The pubkey baked into the app must
+          # match the private key here.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # Apple signing + notarization — optional; tauri-action
@@ -129,11 +190,12 @@ jobs:
         with:
           # Build universal so a single DMG runs on Apple Silicon + Intel.
           args: --target universal-apple-darwin
-          # The release notes pulled from the tag message. tauri-action
-          # creates a draft release with these fields populated.
-          tagName: ${{ github.ref_name }}
-          releaseName: "GLI ${{ github.ref_name }}"
-          releaseDraft: true
+          tagName: ${{ steps.ver.outputs.tag }}
+          releaseName: "GLI ${{ steps.ver.outputs.tag }}"
+          # Publish as Latest immediately so users' installed builds
+          # see the new version on their next poll. Drafts would
+          # require manual promotion before the updater toast fires.
+          releaseDraft: false
           prerelease: false
           # Generate + upload `latest.json` so the installed app's
           # configured endpoint resolves to a real artifact.
@@ -147,8 +209,9 @@ jobs:
       - name: Upload Goonware.dmg asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
           set -euo pipefail
           DMG=$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg | head -n1)
           cp "$DMG" "Goonware.dmg"
-          gh release upload "${{ github.ref_name }}" "Goonware.dmg" --clobber
+          gh release upload "$TAG" "Goonware.dmg" --clobber
