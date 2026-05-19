@@ -22,9 +22,17 @@ A native macOS app for orchestrating CLI coding agents the way you already think
 
 ---
 
-## Install
+## Download
 
-> GLI is in active development. No signed releases yet — building from source is the supported path.
+The signed macOS build lives at **[goonware.dev](https://goonware.dev)** — one click, drag to `/Applications`, done. The same DMG is served directly from GitHub at:
+
+```
+https://github.com/Raeedzz/GLI/releases/latest/download/Goonware.dmg
+```
+
+Apple Silicon and Intel are bundled into a single universal binary. First launch may show a Gatekeeper prompt while notarization rolls in.
+
+## Build from source
 
 **Prereqs**
 
@@ -36,8 +44,8 @@ A native macOS app for orchestrating CLI coding agents the way you already think
 **Build**
 
 ```bash
-git clone https://github.com/Raeedzz/RLI.git
-cd RLI
+git clone https://github.com/Raeedzz/GLI.git
+cd GLI
 bun install
 bun run tauri:dev      # dev with HMR
 bun run tauri:build    # production .app

@@ -4,7 +4,7 @@
 # macOS DMG, signs the update artifact with the Tauri updater key,
 # and publishes everything to a GitHub Release. The published release
 # also contains a `latest.json` — the file the installed app polls
-# at `https://github.com/Raeedzz/RLI/releases/latest/download/latest.json`
+# at `https://github.com/Raeedzz/GLI/releases/latest/download/latest.json`
 # to discover new versions.
 #
 # ──────────────────────────── one-time setup ────────────────────────────
@@ -29,7 +29,7 @@
 #    Commit + push that change.
 #
 # 3. Add two GitHub secrets at
-#    https://github.com/Raeedzz/RLI/settings/secrets/actions :
+#    https://github.com/Raeedzz/GLI/settings/secrets/actions :
 #
 #      TAURI_SIGNING_PRIVATE_KEY          ← contents of ~/.tauri/gli.key
 #      TAURI_SIGNING_PRIVATE_KEY_PASSWORD ← password you set in step 1
@@ -109,6 +109,7 @@ jobs:
         run: bun run download-rg
 
       - name: Build & sign DMG, publish release
+        id: tauri
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -138,3 +139,16 @@ jobs:
           # configured endpoint resolves to a real artifact.
           updaterJsonPreferNsis: false
           includeUpdaterJson: true
+
+      # Publish a stable filename `Goonware.dmg` alongside the versioned
+      # DMG, so the landing page's
+      # `/releases/latest/download/Goonware.dmg` link resolves without
+      # needing to be bumped each release.
+      - name: Upload Goonware.dmg asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DMG=$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg | head -n1)
+          cp "$DMG" "Goonware.dmg"
+          gh release upload "${{ github.ref_name }}" "Goonware.dmg" --clobber
