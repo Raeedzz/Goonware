@@ -272,7 +272,7 @@ function FileBlock({ section }: { section: FileSection }) {
             backgroundColor: "var(--surface-0)",
           }}
         >
-          <DiffBody lines={section.lines} />
+          <DiffBody lines={section.lines} filePath={section.path} />
         </div>
       )}
     </section>

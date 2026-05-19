@@ -1,6 +1,7 @@
 import { motion } from "motion/react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { git } from "@/lib/git";
+import { useDiffLineRenderers } from "./diff-highlight";
 
 interface Props {
   projectPath: string;
@@ -229,13 +230,22 @@ export function DiffView({ projectPath, filePath, staged, onClose }: Props) {
         {!loading && !error && lines.length === 0 && (
           <Empty label="no changes" />
         )}
-        {!loading && !error && lines.length > 0 && <DiffBody lines={lines} />}
+        {!loading && !error && lines.length > 0 && (
+          <DiffBody lines={lines} filePath={filePath} />
+        )}
       </div>
     </motion.div>
   );
 }
 
-export function DiffBody({ lines }: { lines: DiffLine[] }) {
+export function DiffBody({
+  lines,
+  filePath,
+}: {
+  lines: DiffLine[];
+  filePath?: string;
+}) {
+  const rendered = useDiffLineRenderers(lines, filePath);
   return (
     <table
       style={{
@@ -252,14 +262,14 @@ export function DiffBody({ lines }: { lines: DiffLine[] }) {
       </colgroup>
       <tbody>
         {lines.map((l, i) => (
-          <DiffRow key={i} line={l} />
+          <DiffRow key={i} line={l} body={rendered[i]} />
         ))}
       </tbody>
     </table>
   );
 }
 
-function DiffRow({ line }: { line: DiffLine }) {
+function DiffRow({ line, body }: { line: DiffLine; body: ReactNode }) {
   const bg =
     line.kind === "add"
       ? "var(--diff-add-bg)"
@@ -332,7 +342,7 @@ function DiffRow({ line }: { line: DiffLine }) {
           wordBreak: "break-word",
         }}
       >
-        {line.text || "​"}
+        {line.text ? body : "​"}
       </td>
     </tr>
   );
