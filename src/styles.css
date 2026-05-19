@@ -19,6 +19,13 @@
   opacity: 1;
 }
 
+/* Hide scrollbar while preserving scroll behavior. Used on the tab
+   strip so horizontal overflow scrolls silently without a visible
+   track under the tabs. Overrides the global *::-webkit-scrollbar
+   sizing in design/tokens.css. */
+.gli-no-scrollbar { scrollbar-width: none; }
+.gli-no-scrollbar::-webkit-scrollbar { width: 0; height: 0; }
+
 /* Resize-handle styling lives in design/motion.css. The earlier
    "8px gap between floating panes" styles that lived here have been
    removed — panes are now flush rectangles separated by a 0.5px

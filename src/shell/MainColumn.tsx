@@ -194,6 +194,7 @@ function TabStrip({
     >
       <div
         role="tablist"
+        className="gli-no-scrollbar"
         style={{
           flex: 1,
           minWidth: 0,
