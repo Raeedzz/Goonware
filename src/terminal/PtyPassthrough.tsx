@@ -83,6 +83,65 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
 
     const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
       if (isGlobalChord(e)) return;
+      // Cmd+C — copy. The hidden textarea is focused (we auto-focus on
+      // mount so keystrokes reach the agent) but it's empty, so the
+      // browser's default Cmd+C copies nothing. Intercept and write
+      // the document selection ourselves. Skipped when no selection so
+      // a stray Cmd+C in agent mode doesn't blow away the clipboard.
+      if (
+        e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "c"
+      ) {
+        const sel = window.getSelection();
+        const text =
+          sel && !sel.isCollapsed ? sel.toString() : "";
+        if (text.length > 0) {
+          e.preventDefault();
+          void navigator.clipboard.writeText(text).catch(() => {});
+        }
+        return;
+      }
+      // Cmd+V — paste. The browser CAN trigger onPaste on a focused
+      // hidden textarea, but the off-screen 1×1 + pointer-events:none
+      // textarea is brittle: in Tauri/WKWebView the paste-then-onInput
+      // chain has been observed to drop the value entirely when the
+      // textarea has no visible bounding box. Read the clipboard
+      // explicitly and forward — same wire encoding (bracketed paste
+      // markers when DECSET 2004 is on) as the onInput path below.
+      if (
+        e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "v"
+      ) {
+        e.preventDefault();
+        void navigator.clipboard
+          .readText()
+          .then((text) => {
+            if (text.length === 0) return;
+            const payload = encoder.encode(text);
+            if (bracketedPaste) {
+              const out = new Uint8Array(
+                PASTE_START.length + payload.length + PASTE_END.length,
+              );
+              out.set(PASTE_START, 0);
+              out.set(payload, PASTE_START.length);
+              out.set(PASTE_END, PASTE_START.length + payload.length);
+              onSendBytes(out);
+            } else {
+              onSendBytes(payload);
+            }
+          })
+          .catch(() => {
+            // Clipboard read denied / no permission — silently no-op;
+            // the user will retry and notice nothing landed.
+          });
+        return;
+      }
       const seq = keyToBytes(e, appCursor);
       if (seq) {
         e.preventDefault();

@@ -10,6 +10,7 @@
 export {
   // Layout & shell chrome
   SidebarLeftIcon as IconSidebar,
+  SidebarRightIcon as IconSidebarRight,
   PanelRightIcon as IconRightPanel,
   Add01Icon as IconPlus,
   Cancel01Icon as IconClose,

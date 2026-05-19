@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "motion/react";
 import {
   IconPlus,
   IconClose,
+  IconSidebarRight,
 } from "@/design/icons";
 import { Tooltip, useTooltipAnchor } from "@/primitives/Tooltip";
 import {
@@ -169,34 +170,78 @@ function TabStrip({
 
   return (
     <div
-      role="tablist"
       style={{
         display: "flex",
         alignItems: "center",
         height: "var(--tab-height)",
-        padding: "0 var(--space-1)",
         backgroundColor: "var(--surface-1)",
         borderBottom: "var(--border-1)",
-        gap: 2,
-        overflowX: "auto",
       }}
     >
-      {tabs.map((tab) => (
-        <TabButton
-          key={tab.id}
-          tab={tab}
-          active={tab.id === activeTabId}
-          worktreeId={worktreeId}
-          onCloseTab={onCloseTab}
-        />
-      ))}
+      <div
+        role="tablist"
+        style={{
+          flex: 1,
+          minWidth: 0,
+          display: "flex",
+          alignItems: "center",
+          padding: "0 var(--space-1)",
+          gap: 2,
+          overflowX: "auto",
+        }}
+      >
+        {tabs.map((tab) => (
+          <TabButton
+            key={tab.id}
+            tab={tab}
+            active={tab.id === activeTabId}
+            worktreeId={worktreeId}
+            onCloseTab={onCloseTab}
+          />
+        ))}
+        <button
+          type="button"
+          title="New terminal tab"
+          onClick={onNewTerminalTab}
+          style={{
+            width: 28,
+            height: 32,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "var(--text-tertiary)",
+            borderRadius: "var(--radius-sm)",
+            flexShrink: 0,
+            transition:
+              "background-color var(--motion-instant) var(--ease-out-quart)," +
+              "color var(--motion-instant) var(--ease-out-quart)",
+          }}
+          onMouseOver={(e) => {
+            e.currentTarget.style.backgroundColor = "var(--surface-3)";
+            e.currentTarget.style.color = "var(--text-primary)";
+          }}
+          onMouseOut={(e) => {
+            e.currentTarget.style.backgroundColor = "transparent";
+            e.currentTarget.style.color = "var(--text-tertiary)";
+          }}
+        >
+          <IconPlus size={14} />
+        </button>
+      </div>
+      {/* Right-panel toggle — pinned to the far right of the tab strip,
+          outside the scrollable tablist so it stays visible no matter
+          how many tabs are open. Uses IconSidebarRight (the horizontal
+          mirror of IconSidebar from Sidebar.tsx:176) so the bar sits
+          on the right edge of the glyph — visually pointing toward
+          the panel it toggles. */}
       <button
         type="button"
-        title="New terminal tab"
-        onClick={onNewTerminalTab}
+        title="Toggle right panel · ⌘\\"
+        onClick={() => dispatch({ type: "toggle-right-panel" })}
         style={{
-          width: 28,
+          width: 32,
           height: 32,
+          marginRight: "var(--space-1)",
           display: "inline-flex",
           alignItems: "center",
           justifyContent: "center",
@@ -216,7 +261,7 @@ function TabStrip({
           e.currentTarget.style.color = "var(--text-tertiary)";
         }}
       >
-        <IconPlus size={14} />
+        <IconSidebarRight size={16} />
       </button>
     </div>
   );

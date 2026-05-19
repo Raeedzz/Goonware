@@ -24,12 +24,30 @@
 
 const registry = new Map<string, () => void>();
 
+/**
+ * Tab id of the BlockTerminal the user most recently interacted with
+ * (mouseDown anywhere in its container). Used by the window-level
+ * Ctrl+C fallback in BlockTerminal so multi-pane setups don't dispatch
+ * 0x03 to every visible PTY at once when focus has drifted to
+ * `document.body` (e.g. after a drag-selection in a closed block).
+ */
+let lastInteractedTabId: string | null = null;
+
 export function registerTerminalFocus(tabId: string, fn: () => void): void {
   registry.set(tabId, fn);
 }
 
 export function unregisterTerminalFocus(tabId: string): void {
   registry.delete(tabId);
+  if (lastInteractedTabId === tabId) lastInteractedTabId = null;
+}
+
+export function markTerminalInteracted(tabId: string): void {
+  lastInteractedTabId = tabId;
+}
+
+export function getLastInteractedTerminal(): string | null {
+  return lastInteractedTabId;
 }
 
 /**

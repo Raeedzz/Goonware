@@ -533,17 +533,45 @@ export function CanvasGrid({
     return lines.join("\n");
   }, []);
 
+  // Window-level Cmd+C copy. When this CanvasGrid is rendered read-only
+  // (no onSendBytes — e.g. inside an inline LiveBlock in agent mode),
+  // there's no input textarea to host the onKeyDown handler. The
+  // textarea-level Cmd+C path below is never reached, so a canvas-
+  // drag selection has no way out to the clipboard. The window
+  // listener handles that case: when this grid has a live selection
+  // AND no DOM selection is competing, copy the selection text
+  // directly. The textarea-level handler still runs first when the
+  // grid IS interactive, so this doesn't double-copy.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      if (e.key.toLowerCase() !== "c") return;
+      if (!selectionRef.current) return;
+      const docSel = window.getSelection();
+      if (docSel && !docSel.isCollapsed && docSel.toString().length > 0) {
+        return;
+      }
+      const text = extractSelectionText();
+      if (text.length === 0) return;
+      e.preventDefault();
+      void navigator.clipboard.writeText(text).catch(() => {});
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [extractSelectionText]);
+
   // Input handling. Mirrors FullGrid / PtyPassthrough so all three
   // paths agree on encoding. Read-only when onSendBytes is omitted.
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     // Cmd+C while a selection is active → copy the selected cells to
-    // the clipboard. We have to intercept BEFORE checking onSendBytes
-    // / isGlobalChord because copy must work in read-only mode too
-    // (e.g. browsing scrollback). preventDefault() stops the browser
-    // from also firing a `copy` event on the hidden textarea, which
-    // would otherwise read the textarea's empty selection and clobber
-    // the clipboard.
-    if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key.toLowerCase() === "c") {
+    // the clipboard. Cmd+C only — NOT Ctrl+C. In a terminal context
+    // Ctrl+C means "interrupt the foreground process," and on macOS
+    // Cmd+C is the universal copy shortcut. Conflating them here was
+    // the bug: a stale selectionRef (e.g. user click-dragged once and
+    // never clicked away to clear it) caused Ctrl+C to copy that
+    // stale text instead of sending SIGINT to the running TUI.
+    if (e.metaKey && !e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === "c") {
       if (selectionRef.current) {
         const text = extractSelectionText();
         if (text.length > 0) {

@@ -17,6 +17,8 @@ import { TerminalStatusBar } from "./TerminalStatusBar";
 import { useTerminalSession } from "./useTerminalSession";
 import { getHistory, setHistory as memSetHistory } from "./sessionMemory";
 import {
+  getLastInteractedTerminal,
+  markTerminalInteracted,
   registerTerminalFocus,
   unregisterTerminalFocus,
 } from "./terminalFocusRegistry";
@@ -897,12 +899,112 @@ export function BlockTerminal({
     }
   };
 
+  // Mark this terminal as the most-recently-interacted one so the
+  // window-level Ctrl+C fallback below knows which PTY to route to.
+  // Fires on every mousedown inside the container — including drag-
+  // selections in closed blocks, which is exactly the path where focus
+  // drifts to document.body and the textarea handlers stop firing.
+  const onContainerMouseDown = useCallback(() => {
+    markTerminalInteracted(id);
+  }, [id]);
+
+  // Window-level Ctrl+C fallback — handles the "focus drifted to
+  // document.body after a drag-selection" case. Encoding is pinned
+  // by keyEncoding.test.ts; this pins the delivery path.
+  //
+  // Gates:
+  //   - No text currently selected (don't compete with copy paths).
+  //   - Focus is on body or non-editable (not stealing from real inputs).
+  //   - This terminal was most-recently interacted with (multi-pane).
+  useEffect(() => {
+    if (!isVisible) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+      if (e.key.toLowerCase() !== "c") return;
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.toString().length > 0) return;
+      const active = document.activeElement;
+      if (active && active !== document.body) {
+        const ae = active as HTMLElement;
+        if (
+          ae instanceof HTMLInputElement ||
+          ae instanceof HTMLTextAreaElement ||
+          ae.isContentEditable
+        ) {
+          return;
+        }
+      }
+      if (getLastInteractedTerminal() !== id) return;
+      e.preventDefault();
+      void sendBytes(new Uint8Array([0x03]));
+      if (foregroundIsAgentRef.current) {
+        passthroughRef.current?.focus();
+      } else {
+        promptRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [id, isVisible, sendBytes]);
+
+  // Window-level Cmd+C copy. Closed blocks are plain divs with
+  // userSelect: "text"; users can drag-select inside them. But our
+  // input textareas (PromptInput / PtyPassthrough) auto-focus on
+  // mount and the mouseUp refocus path keeps focus on the textarea
+  // even when a selection lives elsewhere in the document. Browser-
+  // native Cmd+C reads selection from the focused element — so it
+  // sees the textarea's empty selection instead of the closed block
+  // selection, and nothing lands on the clipboard.
+  //
+  // Fix: intercept Cmd+C at the window level. If the document
+  // selection is non-empty AND originates from inside this terminal's
+  // container (the closed block / live block area), copy it
+  // explicitly via navigator.clipboard.writeText.
+  //
+  // Why scope to this terminal's container? Multi-pane: each
+  // BlockTerminal registers this listener. Without the container
+  // contains() gate every visible terminal would race to copy on
+  // every Cmd+C — including ones whose container doesn't hold the
+  // selection. Containment is exact and avoids any need for a
+  // disambiguation registry on the copy path.
+  useEffect(() => {
+    if (!isVisible) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      if (e.key.toLowerCase() !== "c") return;
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed) return;
+      const text = sel.toString();
+      if (text.length === 0) return;
+      // If the selection originates inside an editable element, let
+      // the browser's native copy run — that's the right path for
+      // copying text the user actually typed into a textarea.
+      const anchor = sel.anchorNode;
+      const anchorEl =
+        anchor instanceof Element
+          ? anchor
+          : anchor?.parentElement ?? null;
+      if (anchorEl) {
+        const editable =
+          anchorEl.closest("textarea, input, [contenteditable='true']");
+        if (editable) return;
+      }
+      const container = containerRef.current;
+      if (!container || !anchor || !container.contains(anchor)) return;
+      e.preventDefault();
+      void navigator.clipboard.writeText(text).catch(() => {});
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isVisible]);
+
   const effectiveCwd = liveCwd ?? cwd ?? "";
 
   return (
     <div
       ref={containerRef}
       onMouseUp={onContainerMouseUp}
+      onMouseDown={onContainerMouseDown}
       data-bell-flash={bellFlash ? "1" : undefined}
       style={{
         height: "100%",
