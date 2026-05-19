@@ -162,6 +162,11 @@ pub async fn pr_create(
     if !Path::new(&cwd).exists() {
         return Err(format!("cwd does not exist: {cwd}"));
     }
+    // Get the branch ready: stage anything dirty, commit it under the PR
+    // title, then push (setting upstream if needed). The dialog button
+    // is a "ship it" gesture, not a "just call gh" call.
+    prepare_branch_for_pr(&cwd, &title, &body).await?;
+
     let out = Command::new("gh")
         .args(["pr", "create", "--title", &title, "--body", &body])
         .current_dir(&cwd)
@@ -184,6 +189,118 @@ pub async fn pr_create(
         .unwrap_or(stdout.as_str())
         .to_string();
     Ok(PrCreated { url })
+}
+
+/// Bring the worktree to a state where `gh pr create` can succeed:
+/// every dirty file committed under the PR title (body as commit body),
+/// and the branch pushed to its upstream (set with `-u` if missing).
+///
+/// Each step is conditional — a clean tree skips the commit, an already-
+/// synced branch skips the push, so calling this on a fully-prepped
+/// branch is a no-op.
+pub(crate) async fn prepare_branch_for_pr(
+    cwd: &str,
+    title: &str,
+    body: &str,
+) -> Result<(), String> {
+    let porcelain = run_git_checked(cwd, &["status", "--porcelain"]).await?;
+    let dirty = porcelain.lines().any(|l| !l.trim().is_empty());
+    if dirty {
+        run_git_checked(cwd, &["add", "-A"]).await?;
+        // Two -m flags becomes "title\n\nbody" in the commit — same shape
+        // the PR will have. Skip the second when body is empty.
+        let mut args: Vec<&str> = vec!["commit", "-m", title];
+        let trimmed_body = body.trim();
+        if !trimmed_body.is_empty() {
+            args.push("-m");
+            args.push(trimmed_body);
+        }
+        run_git_checked(cwd, &args).await?;
+    }
+
+    let branch = run_git_checked(cwd, &["symbolic-ref", "--short", "HEAD"])
+        .await
+        .map_err(|_| "could not determine current branch (detached HEAD?)".to_string())?
+        .trim()
+        .to_string();
+    if branch.is_empty() {
+        return Err("could not determine current branch (detached HEAD?)".into());
+    }
+
+    let has_upstream = run_git_checked(
+        cwd,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .await
+    .is_ok();
+
+    let push_args: Vec<&str> = if has_upstream {
+        // Already tracking. `git push` no-ops if up-to-date, pushes
+        // otherwise — either way we end in the "remote matches local"
+        // state pr_create needs.
+        vec!["push"]
+    } else {
+        vec!["push", "-u", "origin", branch.as_str()]
+    };
+
+    run_git_push(cwd, &push_args).await?;
+    Ok(())
+}
+
+/// Env vars that keep network-touching git from blocking on credential
+/// or passphrase prompts. Mirrors the rule in `git.rs::NON_INTERACTIVE_GIT_ENV`
+/// so the PR push behaves like the git panel's push.
+const NON_INTERACTIVE_GIT_ENV: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_ASKPASS", ""),
+    ("SSH_ASKPASS", ""),
+    ("GIT_SSH_COMMAND", "ssh -o BatchMode=yes"),
+];
+
+const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn run_git_push(cwd: &str, args: &[&str]) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null());
+    for (k, v) in NON_INTERACTIVE_GIT_ENV {
+        command.env(k, v);
+    }
+    let out = tokio::time::timeout(PUSH_TIMEOUT, command.output())
+        .await
+        .map_err(|_| {
+            format!(
+                "git push timed out after {}s — check the remote URL, credentials, or network",
+                PUSH_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git push failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+async fn run_git_checked(cwd: &str, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or(""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Look up a PR for the worktree's branch via `gh pr view <branch>`.
@@ -371,3 +488,243 @@ fn truncate(s: &str, max: usize) -> String {
     head
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as SyncCommand;
+    use tempfile::TempDir;
+
+    /// Build an isolated local clone wired to a bare "remote" repo on
+    /// disk. Returns (clone_dir, bare_dir). The clone has one initial
+    /// commit on a feature branch with no upstream — the realistic
+    /// pre-PR state.
+    fn build_repo_with_bare_remote(initial_branch: &str) -> (TempDir, TempDir) {
+        let bare = tempfile::tempdir().expect("tempdir bare");
+        let clone = tempfile::tempdir().expect("tempdir clone");
+
+        run_sync(bare.path(), &["init", "--bare", "--initial-branch=main"]);
+
+        run_sync(clone.path(), &["init", "--initial-branch=main"]);
+        run_sync(clone.path(), &["config", "user.email", "test@example.com"]);
+        run_sync(clone.path(), &["config", "user.name", "Test User"]);
+        run_sync(clone.path(), &["config", "commit.gpgsign", "false"]);
+        run_sync(
+            clone.path(),
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+
+        std::fs::write(clone.path().join("README.md"), "# init\n").unwrap();
+        run_sync(clone.path(), &["add", "README.md"]);
+        run_sync(clone.path(), &["commit", "-m", "init"]);
+        run_sync(clone.path(), &["push", "-u", "origin", "main"]);
+
+        run_sync(clone.path(), &["checkout", "-b", initial_branch]);
+        (clone, bare)
+    }
+
+    fn run_sync(cwd: &std::path::Path, args: &[&str]) -> String {
+        let out = SyncCommand::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn run_sync_allow_fail(cwd: &std::path::Path, args: &[&str]) -> (bool, String, String) {
+        let out = SyncCommand::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn git");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    // ---- parse_pr_draft ------------------------------------------------
+
+    #[test]
+    fn parse_pr_draft_plain_text() {
+        let raw = "Add login flow\n\nWires the new OAuth route into the\nhandler chain.";
+        let d = parse_pr_draft(raw);
+        assert_eq!(d.title, "Add login flow");
+        assert_eq!(
+            d.body,
+            "Wires the new OAuth route into the\nhandler chain."
+        );
+    }
+
+    #[test]
+    fn parse_pr_draft_strict_json() {
+        let raw = r#"{"title": "Fix race in cache", "body": "Use a Mutex around the map."}"#;
+        let d = parse_pr_draft(raw);
+        assert_eq!(d.title, "Fix race in cache");
+        assert_eq!(d.body, "Use a Mutex around the map.");
+    }
+
+    #[test]
+    fn parse_pr_draft_fenced_json() {
+        let raw = "```json\n{\"title\":\"X\",\"body\":\"Y\"}\n```";
+        let d = parse_pr_draft(raw);
+        assert_eq!(d.title, "X");
+        assert_eq!(d.body, "Y");
+    }
+
+    #[test]
+    fn parse_pr_draft_invalid_json_falls_back_to_plain_text() {
+        // Raw newlines inside a JSON string value break strict parsing;
+        // the body should still come through, not the literal JSON.
+        let raw = "{\"title\": \"hi\", \"body\": \"line1\nline2\"}";
+        let d = parse_pr_draft(raw);
+        // Title is the first non-empty line — the JSON header line in this case.
+        assert!(!d.title.starts_with('{') || d.title.contains("title"));
+        // Critical: the body must NOT be the raw JSON-looking blob.
+        // It either parsed cleanly or fell back to plain-text lines.
+        assert!(!d.body.contains("\"body\""));
+    }
+
+    // ---- prepare_branch_for_pr (behavior) ------------------------------
+
+    #[tokio::test]
+    async fn dirty_tree_gets_committed_and_pushed() {
+        let (clone, _bare) = build_repo_with_bare_remote("feature/login");
+        std::fs::write(clone.path().join("app.txt"), "hello\n").unwrap();
+
+        let cwd = clone.path().to_str().unwrap();
+        prepare_branch_for_pr(cwd, "Add login feature", "Body explaining why.")
+            .await
+            .expect("prepare succeeds");
+
+        // Behavior 1: working tree is clean afterwards.
+        let porcelain = run_sync(clone.path(), &["status", "--porcelain"]);
+        assert!(porcelain.trim().is_empty(), "expected clean tree, got: {porcelain}");
+
+        // Behavior 2: the head commit carries the PR title + body.
+        let subject = run_sync(clone.path(), &["log", "-1", "--pretty=%s"]);
+        assert_eq!(subject.trim(), "Add login feature");
+        let bodymsg = run_sync(clone.path(), &["log", "-1", "--pretty=%b"]);
+        assert!(
+            bodymsg.contains("Body explaining why."),
+            "expected body in commit, got: {bodymsg}"
+        );
+
+        // Behavior 3: branch has upstream set and is in sync with remote.
+        let upstream = run_sync(
+            clone.path(),
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        );
+        assert_eq!(upstream.trim(), "origin/feature/login");
+        let ahead = run_sync(
+            clone.path(),
+            &["rev-list", "--count", "@{u}..HEAD"],
+        );
+        assert_eq!(ahead.trim(), "0", "branch should be in sync with remote");
+    }
+
+    #[tokio::test]
+    async fn clean_tree_with_unpushed_commits_only_pushes() {
+        let (clone, _bare) = build_repo_with_bare_remote("feature/refactor");
+        std::fs::write(clone.path().join("x.txt"), "x\n").unwrap();
+        run_sync(clone.path(), &["add", "x.txt"]);
+        run_sync(clone.path(), &["commit", "-m", "user's own commit"]);
+        // No upstream yet; one commit ahead of where origin will be.
+
+        let cwd = clone.path().to_str().unwrap();
+        let head_before = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+
+        prepare_branch_for_pr(cwd, "PR title", "PR body")
+            .await
+            .expect("prepare succeeds");
+
+        // No new commit was created — the user's existing commit is HEAD.
+        let head_after = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(head_before.trim(), head_after.trim(),
+            "no auto-commit when tree is clean");
+        let subject = run_sync(clone.path(), &["log", "-1", "--pretty=%s"]);
+        assert_eq!(subject.trim(), "user's own commit");
+
+        // Branch is now pushed with upstream.
+        let upstream = run_sync(
+            clone.path(),
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        );
+        assert_eq!(upstream.trim(), "origin/feature/refactor");
+    }
+
+    #[tokio::test]
+    async fn fully_synced_branch_is_a_noop() {
+        let (clone, _bare) = build_repo_with_bare_remote("feature/synced");
+        std::fs::write(clone.path().join("x.txt"), "x\n").unwrap();
+        run_sync(clone.path(), &["add", "x.txt"]);
+        run_sync(clone.path(), &["commit", "-m", "already committed"]);
+        run_sync(clone.path(), &["push", "-u", "origin", "feature/synced"]);
+
+        let cwd = clone.path().to_str().unwrap();
+        let head_before = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+        let remote_head_before =
+            run_sync(clone.path(), &["rev-parse", "origin/feature/synced"]);
+
+        prepare_branch_for_pr(cwd, "PR title", "PR body")
+            .await
+            .expect("prepare succeeds");
+
+        let head_after = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+        let remote_head_after =
+            run_sync(clone.path(), &["rev-parse", "origin/feature/synced"]);
+        assert_eq!(head_before, head_after);
+        assert_eq!(remote_head_before, remote_head_after);
+    }
+
+    #[tokio::test]
+    async fn dirty_tree_with_empty_body_still_commits() {
+        let (clone, _bare) = build_repo_with_bare_remote("feature/no-body");
+        std::fs::write(clone.path().join("file.txt"), "content\n").unwrap();
+
+        let cwd = clone.path().to_str().unwrap();
+        prepare_branch_for_pr(cwd, "Title only", "")
+            .await
+            .expect("prepare succeeds");
+
+        let porcelain = run_sync(clone.path(), &["status", "--porcelain"]);
+        assert!(porcelain.trim().is_empty());
+        let subject = run_sync(clone.path(), &["log", "-1", "--pretty=%s"]);
+        assert_eq!(subject.trim(), "Title only");
+    }
+
+    #[tokio::test]
+    async fn untracked_files_are_included_in_the_auto_commit() {
+        // `git add -A` should pick up brand-new files, not just edits.
+        let (clone, _bare) = build_repo_with_bare_remote("feature/new-files");
+        std::fs::write(clone.path().join("brand_new.txt"), "shiny\n").unwrap();
+
+        let cwd = clone.path().to_str().unwrap();
+        prepare_branch_for_pr(cwd, "Add brand_new", "")
+            .await
+            .expect("prepare succeeds");
+
+        // The new file is tracked in HEAD now.
+        let (ok, stdout, _) = run_sync_allow_fail(
+            clone.path(),
+            &["ls-tree", "--name-only", "HEAD", "brand_new.txt"],
+        );
+        assert!(ok && stdout.trim() == "brand_new.txt",
+            "brand_new.txt should be tracked in HEAD; got ok={ok} stdout={stdout:?}");
+    }
+
+    #[tokio::test]
+    async fn missing_cwd_returns_error() {
+        let err = prepare_branch_for_pr("/nonexistent/path/zzz", "x", "y")
+            .await
+            .expect_err("missing cwd should error");
+        assert!(!err.is_empty());
+    }
+}
