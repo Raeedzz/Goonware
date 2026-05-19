@@ -203,8 +203,42 @@ pub(crate) async fn prepare_branch_for_pr(
     title: &str,
     body: &str,
 ) -> Result<(), String> {
+    // Resolve the branch FIRST. The default-branch handling below runs
+    // before any mutation — landing a commit on `main` is a destructive
+    // accident, and gh's "head == base" error would surface only after
+    // we'd already shipped that commit.
+    let mut branch = run_git_checked(cwd, &["symbolic-ref", "--short", "HEAD"])
+        .await
+        .map_err(|_| "could not determine current branch (detached HEAD?)".to_string())?
+        .trim()
+        .to_string();
+    if branch.is_empty() {
+        return Err("could not determine current branch (detached HEAD?)".into());
+    }
+
     let porcelain = run_git_checked(cwd, &["status", "--porcelain"]).await?;
     let dirty = porcelain.lines().any(|l| !l.trim().is_empty());
+
+    // If we're on the default branch with something to ship, lift those
+    // changes onto a fresh feature branch derived from the PR title.
+    // If there's nothing to ship, refuse — there's no PR to make.
+    if is_default_branch(cwd, &branch).await {
+        let ahead = branch_ahead_of_origin(cwd, &branch).await;
+        if !dirty && !ahead {
+            return Err(format!(
+                "Refusing to create a PR from `{branch}` — it's the repo's default branch and there are no local changes to ship.\n\
+                 Make a change first, or switch to a feature branch with unpushed commits."
+            ));
+        }
+        let slug = title_to_branch_slug(title);
+        let new_branch = unique_branch_name(cwd, &slug).await;
+        run_git_checked(cwd, &["checkout", "-b", &new_branch]).await?;
+        eprintln!(
+            "[pr] auto-created feature branch `{new_branch}` from `{branch}` for the PR"
+        );
+        branch = new_branch;
+    }
+
     if dirty {
         run_git_checked(cwd, &["add", "-A"]).await?;
         // Two -m flags becomes "title\n\nbody" in the commit — same shape
@@ -216,15 +250,6 @@ pub(crate) async fn prepare_branch_for_pr(
             args.push(trimmed_body);
         }
         run_git_checked(cwd, &args).await?;
-    }
-
-    let branch = run_git_checked(cwd, &["symbolic-ref", "--short", "HEAD"])
-        .await
-        .map_err(|_| "could not determine current branch (detached HEAD?)".to_string())?
-        .trim()
-        .to_string();
-    if branch.is_empty() {
-        return Err("could not determine current branch (detached HEAD?)".into());
     }
 
     let has_upstream = run_git_checked(
@@ -344,6 +369,97 @@ fn explain_push_error(err: &str) -> String {
     } else {
         format!("git push failed: {trimmed}")
     }
+}
+
+/// Lower-kebab-case slug derived from a PR title, suitable as a git
+/// branch name. Non-alphanumerics become `-`, runs collapse, the result
+/// is trimmed and capped at 50 chars. Empty / all-symbol titles fall
+/// back to `pr-<unix-timestamp>` so we always return a valid ref name.
+pub(crate) fn title_to_branch_slug(title: &str) -> String {
+    let mut s: String = title
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while s.contains("--") {
+        s = s.replace("--", "-");
+    }
+    let trimmed = s.trim_matches('-').to_string();
+    let mut out = if trimmed.len() > 50 {
+        trimmed.chars().take(50).collect::<String>()
+    } else {
+        trimmed
+    };
+    out = out.trim_end_matches('-').to_string();
+    if out.is_empty() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        return format!("pr-{ts}");
+    }
+    out
+}
+
+/// Return a branch name that doesn't already exist in `cwd`, starting
+/// from `base` and appending `-2`, `-3`, … as needed.
+async fn unique_branch_name(cwd: &str, base: &str) -> String {
+    let mut candidate = base.to_string();
+    let mut n = 2;
+    loop {
+        let r = run_git_checked(
+            cwd,
+            &["rev-parse", "--verify", &format!("refs/heads/{candidate}")],
+        )
+        .await;
+        if r.is_err() {
+            return candidate;
+        }
+        if n > 50 {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            return format!("{base}-{ts}");
+        }
+        candidate = format!("{base}-{n}");
+        n += 1;
+    }
+}
+
+/// Does the local branch have commits not on `origin/<branch>`? Used
+/// alongside the dirty-tree check to decide whether a default-branch
+/// PR-creation has anything to actually ship.
+async fn branch_ahead_of_origin(cwd: &str, branch: &str) -> bool {
+    let arg = format!("origin/{branch}..HEAD");
+    match run_git_checked(cwd, &["rev-list", "--count", &arg]).await {
+        Ok(s) => s.trim().parse::<u32>().unwrap_or(0) > 0,
+        Err(_) => false,
+    }
+}
+
+/// Is `branch` the repo's base branch (so creating a PR from it would
+/// either go nowhere or, worse, write commits to main)?
+///
+/// Prefers the authoritative source — `origin/HEAD` as set by `git
+/// clone` — and falls back to the universal defaults when origin
+/// hasn't published one (a fresh `git init`, an offline mirror, etc).
+async fn is_default_branch(cwd: &str, branch: &str) -> bool {
+    if let Ok(raw) =
+        run_git_checked(cwd, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).await
+    {
+        if let Some(default) = raw.trim().strip_prefix("origin/") {
+            if !default.is_empty() {
+                return branch == default;
+            }
+        }
+    }
+    branch == "main" || branch == "master"
 }
 
 /// Env vars that keep network-touching git from blocking on credential
@@ -890,6 +1006,180 @@ mod tests {
     fn explain_other_error_passes_through() {
         let msg = explain_push_error("Could not resolve host: github.com");
         assert!(msg.contains("Could not resolve host"));
+    }
+
+    /// Set up a clone sitting on `main` with `origin/HEAD → main` and a
+    /// shared bare remote. Returns (clone, bare). No feature branch.
+    fn build_repo_on_main(default: &str) -> (TempDir, TempDir) {
+        let bare = tempfile::tempdir().expect("tempdir bare");
+        let clone = tempfile::tempdir().expect("tempdir clone");
+        let init_arg = format!("--initial-branch={default}");
+        run_sync(bare.path(), &["init", "--bare", init_arg.as_str()]);
+        run_sync(clone.path(), &["init", init_arg.as_str()]);
+        run_sync(clone.path(), &["config", "user.email", "test@example.com"]);
+        run_sync(clone.path(), &["config", "user.name", "Test User"]);
+        run_sync(clone.path(), &["config", "commit.gpgsign", "false"]);
+        run_sync(
+            clone.path(),
+            &["remote", "add", "origin", bare.path().to_str().unwrap()],
+        );
+        std::fs::write(clone.path().join("README.md"), "# init\n").unwrap();
+        run_sync(clone.path(), &["add", "README.md"]);
+        run_sync(clone.path(), &["commit", "-m", "init"]);
+        run_sync(clone.path(), &["push", "-u", "origin", default]);
+        run_sync(clone.path(), &["remote", "set-head", "origin", default]);
+        (clone, bare)
+    }
+
+    // ---- title_to_branch_slug ------------------------------------------
+
+    #[test]
+    fn slug_basic_title() {
+        assert_eq!(title_to_branch_slug("Add login feature"), "add-login-feature");
+    }
+
+    #[test]
+    fn slug_collapses_runs_and_strips_edges() {
+        assert_eq!(title_to_branch_slug("  Fix!!  the  bug.  "), "fix-the-bug");
+    }
+
+    #[test]
+    fn slug_truncates_long_titles() {
+        let long = "a".repeat(200);
+        let s = title_to_branch_slug(&long);
+        assert!(s.len() <= 50, "expected <=50 chars, got {}", s.len());
+    }
+
+    #[test]
+    fn slug_empty_or_symbolic_uses_fallback() {
+        let s = title_to_branch_slug("");
+        assert!(s.starts_with("pr-"), "expected pr- fallback, got {s}");
+        let s2 = title_to_branch_slug("!@#$%^&*()");
+        assert!(s2.starts_with("pr-"), "expected pr- fallback, got {s2}");
+    }
+
+    #[test]
+    fn slug_unicode_becomes_hyphens_but_stays_valid() {
+        // résumé → r-sum- → r-sum after trim
+        let s = title_to_branch_slug("résumé update");
+        assert!(!s.is_empty() && !s.starts_with('-') && !s.ends_with('-'));
+    }
+
+    // ---- prepare_branch_for_pr on default branch ------------------------
+
+    #[tokio::test]
+    async fn default_branch_dirty_tree_auto_branches_and_ships() {
+        let (clone, _bare) = build_repo_on_main("main");
+        std::fs::write(clone.path().join("feature.txt"), "new thing\n").unwrap();
+
+        let main_head_before = run_sync(clone.path(), &["rev-parse", "main"]);
+        let remote_main_before =
+            run_sync(clone.path(), &["rev-parse", "refs/remotes/origin/main"]);
+
+        prepare_branch_for_pr(
+            clone.path().to_str().unwrap(),
+            "Add new feature",
+            "Body of the PR.",
+        )
+        .await
+        .expect("auto-branch + ship should succeed");
+
+        // We're on the new branch, derived from the title slug.
+        let current = run_sync(clone.path(), &["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(current.trim(), "add-new-feature");
+
+        // The new branch holds the commit; main locally is untouched.
+        let main_head_after = run_sync(clone.path(), &["rev-parse", "main"]);
+        assert_eq!(
+            main_head_before, main_head_after,
+            "local main must not gain commits"
+        );
+        let subject = run_sync(clone.path(), &["log", "-1", "--pretty=%s"]);
+        assert_eq!(subject.trim(), "Add new feature");
+
+        // The remote main is untouched — only the new branch was pushed.
+        let remote_main_after =
+            run_sync(clone.path(), &["rev-parse", "refs/remotes/origin/main"]);
+        assert_eq!(remote_main_before, remote_main_after,
+            "remote main must not be pushed to");
+
+        // The new branch has upstream set.
+        let upstream = run_sync(
+            clone.path(),
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        );
+        assert_eq!(upstream.trim(), "origin/add-new-feature");
+
+        // Working tree is clean.
+        let porcelain = run_sync(clone.path(), &["status", "--porcelain"]);
+        assert!(porcelain.trim().is_empty(), "expected clean tree: {porcelain}");
+    }
+
+    #[tokio::test]
+    async fn default_branch_clean_and_synced_refuses() {
+        // No dirty changes + main matches origin/main → nothing to PR.
+        let (clone, _bare) = build_repo_on_main("main");
+
+        let head_before = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+        let porcelain_before = run_sync(clone.path(), &["status", "--porcelain"]);
+        let remote_main_before =
+            run_sync(clone.path(), &["rev-parse", "refs/remotes/origin/main"]);
+
+        let err = prepare_branch_for_pr(
+            clone.path().to_str().unwrap(),
+            "Some title",
+            "Some body",
+        )
+        .await
+        .expect_err("clean + synced default branch has nothing to PR");
+        assert!(
+            err.contains("default branch") || err.contains("main"),
+            "expected default-branch error, got: {err}"
+        );
+
+        let head_after = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+        let porcelain_after = run_sync(clone.path(), &["status", "--porcelain"]);
+        let remote_main_after =
+            run_sync(clone.path(), &["rev-parse", "refs/remotes/origin/main"]);
+        assert_eq!(head_before, head_after);
+        assert_eq!(porcelain_before, porcelain_after);
+        assert_eq!(remote_main_before, remote_main_after);
+    }
+
+    #[tokio::test]
+    async fn default_branch_with_existing_slug_collides_then_picks_unique_name() {
+        let (clone, _bare) = build_repo_on_main("main");
+        // Pre-create a branch with the slug we'd derive — auto-branch
+        // should pick the next available name, not error.
+        run_sync(clone.path(), &["branch", "add-new-feature"]);
+        std::fs::write(clone.path().join("x.txt"), "y\n").unwrap();
+
+        prepare_branch_for_pr(
+            clone.path().to_str().unwrap(),
+            "Add new feature",
+            "",
+        )
+        .await
+        .expect("collision should resolve to a unique branch");
+
+        let current = run_sync(clone.path(), &["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(current.trim(), "add-new-feature-2");
+    }
+
+    #[tokio::test]
+    async fn master_default_clean_and_synced_still_refuses() {
+        let (clone, _bare) = build_repo_on_main("master");
+        let head_before = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+        let err = prepare_branch_for_pr(
+            clone.path().to_str().unwrap(),
+            "Title",
+            "Body",
+        )
+        .await
+        .expect_err("master clean+synced should refuse");
+        assert!(err.contains("default branch") || err.contains("master"));
+        let head_after = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(head_before, head_after);
     }
 
     #[tokio::test]
