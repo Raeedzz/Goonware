@@ -596,7 +596,7 @@ export function BlockTerminal({
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const compute = () => {
+    const computeDims = (): { rows: number; cols: number } => {
       const rect = el.getBoundingClientRect();
       // Agent mode now also reserves room for the AgentStatusBar below
       // the terminal grid (38px + a 6px breathing strip = 44).
@@ -616,36 +616,70 @@ export function BlockTerminal({
       const rows = foregroundIsAgent
         ? visibleRows + AGENT_ROW_HEADROOM
         : visibleRows;
-      const cols = Math.max(20, Math.floor((rect.width - 24) / cellWidth));
+      // Horizontal gutter:
+      //   12 px LiveBlock left padding
+      // + 12 px LiveBlock right padding
+      // + ~12 px safety (sub-pixel atlas rounding, occasional macOS
+      //   "always show" scrollbar setting, sidebar borderLeft, and a
+      //   one-cell buffer so claude's TUI right border never lands
+      //   under the right sidebar boundary).
+      // The prior 24 px only covered the LiveBlock padding and the
+      // user reported the symptom directly as "text spills behind
+      // the right sidebar."
+      const cols = Math.max(20, Math.floor((rect.width - 36) / cellWidth));
+      return { rows, cols };
+    };
+
+    // Debounced SIGWINCH to the PTY.
+    //
+    // Every term_resize call sends SIGWINCH to the child, and TUI
+    // agents (claude, codex, …) repaint their entire grid on every
+    // SIGWINCH. The old rAF-coalesced compute fired up to 60 SIGWINCH
+    // per second during a splitter drag, so the agent was redrawing
+    // continuously into a moving target — visually that's "jitters in
+    // and out" while the user resizes. Warp solves this by treating
+    // the resize drag as a continuous gesture: the canvas stays sized
+    // to the current container (fast, GPU-driven inside CanvasGrid's
+    // own observer), but the PTY only learns its new dimensions when
+    // the user pauses. Then a single redraw lands and settles.
+    //
+    // First fire is synchronous so the PTY has correct dimensions
+    // before its first frame; subsequent fires go through the timer.
+    const RESIZE_DEBOUNCE_MS = 140;
+    let timerId: number | null = null;
+    let pendingDims: { rows: number; cols: number } | null = null;
+
+    const fireResize = () => {
+      timerId = null;
+      const dims = pendingDims;
+      pendingDims = null;
+      if (!dims) return;
       const prev = lastResizeRef.current;
-      if (prev.rows === rows && prev.cols === cols) return;
-      lastResizeRef.current = { rows, cols };
-      void resize(rows, cols).catch(() => {});
+      if (prev.rows === dims.rows && prev.cols === dims.cols) return;
+      lastResizeRef.current = dims;
+      void resize(dims.rows, dims.cols).catch(() => {});
     };
-    compute();
-    // ResizeObserver fires synchronously on every layout commit — during
-    // an output burst (claude streaming, a `seq 1 100000`, the user
-    // dragging the splitter) that can mean dozens of fires per second
-    // per terminal. Even though `compute` short-circuits on unchanged
-    // dimensions, each fire still calls `getBoundingClientRect()` which
-    // forces a layout flush. Coalescing through rAF means: many fires
-    // in the same frame collapse into one bounding-rect read on the
-    // next paint, and at the (small) cost of a ≤16ms delay we save
-    // (N - 1) layout flushes per resize storm. At 20 panes this is the
-    // difference between smooth dragging and visible jank.
-    let rafId = 0;
-    const scheduleCompute = () => {
-      if (rafId) return;
-      rafId = requestAnimationFrame(() => {
-        rafId = 0;
-        compute();
-      });
+
+    const scheduleResize = (delayMs: number) => {
+      pendingDims = computeDims();
+      if (timerId !== null) {
+        window.clearTimeout(timerId);
+        timerId = null;
+      }
+      if (delayMs <= 0) {
+        fireResize();
+      } else {
+        timerId = window.setTimeout(fireResize, delayMs);
+      }
     };
-    const observer = new ResizeObserver(scheduleCompute);
+
+    scheduleResize(0);
+
+    const observer = new ResizeObserver(() => scheduleResize(RESIZE_DEBOUNCE_MS));
     observer.observe(el);
     return () => {
       observer.disconnect();
-      if (rafId) cancelAnimationFrame(rafId);
+      if (timerId !== null) window.clearTimeout(timerId);
     };
   }, [resize, agentMode, foregroundIsAgent]);
 
