@@ -32,14 +32,55 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::helper_agent::{run_inline, HelperMode};
+
+/// Process-wide kill switch for transcript scanning. Set to true the
+/// first time we hit a permission-style error reading ~/.claude/ —
+/// that's macOS Sequoia's "App Data" TCC popup denying us access
+/// because the JSONL files have a different "responsible bundle" MACL
+/// than `dev.raeedz.gli`. The kernel pops up the consent dialog
+/// BEFORE the read returns, so we can't prevent the first prompt, but
+/// flipping this flag prevents the polling loop from retriggering the
+/// dialog 12 times per minute for every new Claude session whose
+/// transcript file has a fresh MACL UUID. The flag resets on app
+/// restart so users who later grant Full Disk Access don't have to
+/// flush state manually.
+static APP_DATA_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+/// True if the last `claude_usage_status` call hit an access error
+/// and switched off the transcript scan. Surfaced as a field on the
+/// returned status so the frontend can show a "grant Full Disk
+/// Access" hint without re-attempting the read and re-spawning the
+/// TCC popup.
+fn is_app_data_blocked() -> bool {
+    APP_DATA_BLOCKED.load(Ordering::Relaxed)
+}
+
+fn note_app_data_error(err: &std::io::Error, path: &Path) {
+    // PermissionDenied is the canonical error after the user clicks
+    // "Don't Allow" on the App Data popup. NotFound means the file
+    // genuinely isn't there (no transcripts yet) — that's not a TCC
+    // issue and shouldn't trip the breaker. Anything else (e.g.
+    // operation timed out while the popup was open) is suspicious
+    // enough to back off too.
+    if matches!(err.kind(), ErrorKind::PermissionDenied) {
+        if !APP_DATA_BLOCKED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[claude-usage] disabling transcript scan after permission \
+                 error on {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
 
 /// Anthropic's enforced 5-hour session length. A "session" in
 /// Claude.ai's UI = a 5h timer that starts on your first message after
@@ -170,13 +211,32 @@ pub fn claude_usage_status() -> Result<ClaudeUsageStatus, String> {
     };
     let lookback_cutoff_ms = now_ms - LOOKBACK_MS;
 
+    // Honor the App Data circuit breaker. Once tripped, we don't
+    // open any files under ~/.claude/ for the rest of the session,
+    // which stops the 5s polling loop from re-spawning the TCC
+    // popup every time Claude creates a new session transcript
+    // with a fresh MACL UUID.
+    if is_app_data_blocked() {
+        return Ok(ClaudeUsageStatus::default());
+    }
+
     let projects_dir = match dirs::home_dir() {
         Some(h) => h.join(".claude").join("projects"),
         None => return Ok(ClaudeUsageStatus::default()),
     };
-    if !projects_dir.exists() {
-        // Claude Code never installed. Empty status — pill stays hidden.
-        return Ok(ClaudeUsageStatus::default());
+    // Use metadata() rather than exists() — a permission error here
+    // also trips the breaker, so a single "Don't Allow" closes the
+    // door on every downstream open() that would re-prompt.
+    match fs::metadata(&projects_dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // Claude Code never installed. Empty status — pill stays hidden.
+            return Ok(ClaudeUsageStatus::default());
+        }
+        Err(e) => {
+            note_app_data_error(&e, &projects_dir);
+            return Ok(ClaudeUsageStatus::default());
+        }
     }
 
     let files = collect_transcript_files(&projects_dir, lookback_cutoff_ms);
@@ -184,8 +244,20 @@ pub fn claude_usage_status() -> Result<ClaudeUsageStatus, String> {
     let mut rows: Vec<UsageRow> = Vec::new();
 
     for path in &files {
+        // Stop the moment we hit a permission denial — every
+        // subsequent open() would re-fire the macOS App Data popup
+        // for files with fresh MACL UUIDs.
+        if is_app_data_blocked() {
+            break;
+        }
         status.scanned_files += 1;
-        let Ok(file) = File::open(path) else { continue };
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                note_app_data_error(&e, path);
+                continue;
+            }
+        };
         let reader = BufReader::new(file);
         for line in reader.lines() {
             let Ok(raw) = line else { continue };
@@ -290,7 +362,19 @@ pub fn claude_usage_status() -> Result<ClaudeUsageStatus, String> {
     // exactly match what claude.ai's settings page shows.
     if let Some(home) = dirs::home_dir() {
         let cache = home.join(".claude").join("cache").join("gli-usage.json");
-        if let Ok(bytes) = fs::read(&cache) {
+        // Skip the read entirely once the breaker is tripped — same
+        // App Data popup risk as the transcript scan above.
+        let read_result = if is_app_data_blocked() {
+            Err(std::io::Error::from(ErrorKind::PermissionDenied))
+        } else {
+            fs::read(&cache).map_err(|e| {
+                if e.kind() != ErrorKind::NotFound {
+                    note_app_data_error(&e, &cache);
+                }
+                e
+            })
+        };
+        if let Ok(bytes) = read_result {
             if let Ok(c) = serde_json::from_slice::<CapturedUsage>(&bytes) {
                 // Some capture scripts (older versions, or the one
                 // Claude installs by default) write the rate-limit
@@ -339,15 +423,28 @@ pub fn claude_usage_status() -> Result<ClaudeUsageStatus, String> {
 /// historical transcripts on every poll.
 fn collect_transcript_files(root: &PathBuf, cutoff_ms: i64) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(top) = fs::read_dir(root) else {
-        return out;
+    let top = match fs::read_dir(root) {
+        Ok(it) => it,
+        Err(e) => {
+            note_app_data_error(&e, root);
+            return out;
+        }
     };
     for entry in top.flatten() {
+        if is_app_data_blocked() {
+            break;
+        }
         let p = entry.path();
         if !p.is_dir() {
             continue;
         }
-        let Ok(inner) = fs::read_dir(&p) else { continue };
+        let inner = match fs::read_dir(&p) {
+            Ok(it) => it,
+            Err(e) => {
+                note_app_data_error(&e, &p);
+                continue;
+            }
+        };
         for f in inner.flatten() {
             let path = f.path();
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {

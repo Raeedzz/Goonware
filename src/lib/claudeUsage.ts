@@ -113,11 +113,21 @@ export interface ClaudeUsageStatus {
 
 /** How often we re-walk the transcript dir + re-read the captured
  *  rate-limit cache. Claude rewrites the cache file on every status-
- *  line redraw (≈ every keystroke / agent step), so a 5s cadence
- *  keeps the displayed % within a few seconds of Claude's own
- *  `/usage` reading. The full transcript walk is bounded by the 5h
- *  lookback window so it stays cheap even at 5s. */
-const POLL_MS = 5_000;
+ *  line redraw (≈ every keystroke / agent step), so a 30s cadence
+ *  keeps the displayed % reasonably current without re-spawning the
+ *  macOS App Data TCC popup every five seconds. (In Sequoia 15+ each
+ *  ~/.claude/projects/*.jsonl carries the creator app's MACL xattr,
+ *  so reading it from GLI triggers a "would like to access data from
+ *  other apps" prompt — the cadence change is half of the fix; the
+ *  Rust-side circuit breaker stops the retry loop once any read
+ *  fails.) The full transcript walk is bounded by the 5h lookback
+ *  window so it stays cheap. */
+const POLL_MS = 30_000;
+
+/** Polling cadence once we know the backend short-circuited — there's
+ *  nothing to retry every minute, and tighter cadences just keep the
+ *  IPC channel warm for no benefit. */
+const POLL_MS_BLOCKED = 5 * 60_000;
 
 // ── Singleton polling store ──────────────────────────────────────
 // Every `useClaudeUsage()` consumer shares one polling loop. Without
@@ -131,6 +141,8 @@ const POLL_MS = 5_000;
 // detach a listener to the shared cache.
 let storeStatus: ClaudeUsageStatus | null = null;
 let pollStarted = false;
+let pollTimer: number | null = null;
+let consecutiveEmpty = 0;
 const storeListeners = new Set<() => void>();
 
 function ensurePolling() {
@@ -143,9 +155,18 @@ function ensurePolling() {
       storeStatus = null;
     }
     storeListeners.forEach((fn) => fn());
+    // Adaptive cadence: once the backend has repeatedly returned an
+    // empty payload (the shape the Rust circuit breaker emits after a
+    // permission error or a never-installed Claude), stretch out the
+    // poll interval. Tight polling at that point is wasted IPC and,
+    // worse, keeps macOS's per-app energy budget warm.
+    const empty = !storeStatus || (!storeStatus.active && !storeStatus.real_captured_at_ms);
+    consecutiveEmpty = empty ? consecutiveEmpty + 1 : 0;
+    const next = consecutiveEmpty >= 3 ? POLL_MS_BLOCKED : POLL_MS;
+    if (pollTimer !== null) window.clearTimeout(pollTimer);
+    pollTimer = window.setTimeout(pull, next);
   };
   void pull();
-  window.setInterval(pull, POLL_MS);
 }
 
 function subscribeStore(notify: () => void): () => void {
