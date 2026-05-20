@@ -78,7 +78,7 @@ export function AppShell() {
   // project; the result persists so subsequent launches are cheap.
   useEffect(() => {
     let cancelled = false;
-    for (const project of projects) {
+    for (const project of Object.values(projects)) {
       if (project.faviconDataUri || project.iconName) continue;
       fs.scanProjectIcon(project.path)
         .then((faviconDataUri) => {
