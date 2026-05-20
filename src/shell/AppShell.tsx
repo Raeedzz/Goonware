@@ -152,7 +152,13 @@ export function AppShell() {
           }}
         >
           <Sidebar />
-          {!sidebarCollapsed && <ResizeHandle side="left" />}
+          {!sidebarCollapsed && (
+            <ResizeHandle
+              side="left"
+              effectiveWidth={sidebarPx}
+              otherSideWidth={rightPx}
+            />
+          )}
         </aside>
 
         <main
@@ -176,7 +182,13 @@ export function AppShell() {
             position: "relative",
           }}
         >
-          {!rightPanelCollapsed && <ResizeHandle side="right" />}
+          {!rightPanelCollapsed && (
+            <ResizeHandle
+              side="right"
+              effectiveWidth={rightPx}
+              otherSideWidth={sidebarPx}
+            />
+          )}
           <RightPanel />
         </aside>
       </div>
@@ -195,9 +207,23 @@ export function AppShell() {
    the document during drag.
    ------------------------------------------------------------------ */
 
-function ResizeHandle({ side }: { side: "left" | "right" }) {
+function ResizeHandle({
+  side,
+  effectiveWidth,
+  otherSideWidth,
+}: {
+  side: "left" | "right";
+  /** The currently-rendered width of this panel (post viewport
+   *  clamp). Used as the drag baseline so the handle moves 1:1 with
+   *  the cursor instead of starting from a possibly-larger stored
+   *  width. */
+  effectiveWidth: number;
+  /** Currently-rendered width of the opposite side panel. Drives the
+   *  dynamic max so the drag never writes a width that would force
+   *  the main column below MIN_MAIN_WIDTH. */
+  otherSideWidth: number;
+}) {
   const dispatch = useAppDispatch();
-  const state = useAppState();
   const startXRef = useRef(0);
   const startWRef = useRef(0);
   const draggingRef = useRef(false);
@@ -205,22 +231,19 @@ function ResizeHandle({ side }: { side: "left" | "right" }) {
   const [active, setActive] = useState(false);
 
   const min = side === "left" ? SIDEBAR_MIN : RIGHT_MIN;
-  const max = side === "left" ? SIDEBAR_MAX : RIGHT_MAX;
-  const widthSelector = side === "left"
-    ? state.sidebarWidth
-    : state.rightPanelWidth;
+  const baseMax = side === "left" ? SIDEBAR_MAX : RIGHT_MAX;
 
   const onMouseDown = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
       draggingRef.current = true;
       startXRef.current = e.clientX;
-      startWRef.current = widthSelector;
+      startWRef.current = effectiveWidth;
       setActive(true);
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [widthSelector],
+    [effectiveWidth],
   );
 
   useEffect(() => {
@@ -249,12 +272,24 @@ function ResizeHandle({ side }: { side: "left" | "right" }) {
     const onMove = (e: MouseEvent) => {
       if (!draggingRef.current) return;
       const dx = e.clientX - startXRef.current;
+      // Dynamic max: leave at least MIN_MAIN_WIDTH for the center
+      // column, accounting for the opposite side panel's current
+      // rendered width. Without this, dragging past the viewport's
+      // capacity grows the stored value while the rendered width
+      // clamps — which feels like the panel "got stuck" because the
+      // cursor keeps moving but the boundary doesn't.
+      const viewport =
+        typeof window === "undefined" ? Infinity : window.innerWidth;
+      const dynamicMax = Math.max(
+        min,
+        Math.min(baseMax, viewport - MIN_MAIN_WIDTH - otherSideWidth),
+      );
       // Sidebar grows to the right (positive dx → wider).
       // Right panel grows to the left (positive dx → narrower).
       pendingWidth =
         side === "left"
-          ? Math.min(max, Math.max(min, startWRef.current + dx))
-          : Math.min(max, Math.max(min, startWRef.current - dx));
+          ? Math.min(dynamicMax, Math.max(min, startWRef.current + dx))
+          : Math.min(dynamicMax, Math.max(min, startWRef.current - dx));
       if (rafId === null) {
         rafId = window.requestAnimationFrame(flush);
       }
@@ -280,7 +315,7 @@ function ResizeHandle({ side }: { side: "left" | "right" }) {
       window.removeEventListener("mouseup", onUp);
       if (rafId !== null) window.cancelAnimationFrame(rafId);
     };
-  }, [side, min, max, dispatch]);
+  }, [side, min, baseMax, otherSideWidth, dispatch]);
 
   const lit = hover || active;
   return (
