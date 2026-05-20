@@ -245,6 +245,16 @@ export function LiveBlock({
             flex: fill ? "1 1 0" : undefined,
             minHeight: fill ? 0 : undefined,
             overflow: fill ? "auto" : undefined,
+            // Always clip horizontally. The CanvasGrid inside can resize
+            // smoothly while the PTY's cols are still settling (the
+            // SIGWINCH is debounced — see BlockTerminal), and during
+            // that window the canvas may briefly render content that
+            // assumed a wider grid. Without this clip the rightmost
+            // cells would visually spill out of the LiveBlock body and
+            // — when the right sidebar is open — read as "text going
+            // behind the sidebar." Vertical scroll behaviour is
+            // unchanged for the fill (alt-screen) case.
+            overflowX: "hidden",
           }}
         >
           {/* Agent TUI blocks (preserveGrid) always render through the

@@ -333,14 +333,21 @@ export class GridRenderer {
 
   resize(cssWidth: number, cssHeight: number, dpr: number): void {
     if (this.lost) return;
-    // 1. Compute physical (device) pixels from the CSS box. We round
-    //    UP (ceil), not down — flooring can leave the buffer one
-    //    physical pixel short of the content the atlas wants to draw
-    //    when DPR × CSS height isn't an integer (fractional DPRs like
-    //    1.5 or 3 are the common offenders). One-pixel-short buffers
-    //    clip the bottom of the last row, which is the symptom the
-    //    user reported as "text getting cut off."
-    const physWidth = Math.max(1, Math.ceil(cssWidth * dpr));
+    // Compute physical (device) pixels from the CSS box.
+    //
+    // Width: FLOOR so the canvas's CSS width is never larger than
+    // what the wrapper asked for. Ceil + fractional cssWidth (common
+    // at 1.5/2.5/3 DPRs, or any non-integer wrapper width that flex
+    // layout produces) makes the canvas overflow its parent by up to
+    // one CSS pixel — visible as "text spilling behind the right
+    // sidebar" when the panel is docked.
+    //
+    // Height: keep CEIL. Flooring leaves the buffer one physical
+    // pixel short of the content the atlas wants to draw when
+    // DPR × CSS height isn't an integer, which clips the bottom of
+    // the last row. There's no neighbour below the canvas to compete
+    // with, so an extra pixel of vertical headroom is invisible.
+    const physWidth = Math.max(1, Math.floor(cssWidth * dpr));
     const physHeight = Math.max(1, Math.ceil(cssHeight * dpr));
     // 2. Pin the canvas's CSS size to physWidth/dpr (instead of letting
     //    the layout pick a fractional CSS size). This avoids browser
