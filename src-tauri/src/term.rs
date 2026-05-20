@@ -1020,15 +1020,33 @@ const ANSI_16: [&str; 16] = [
    so the eventual swap is provably equivalent. */
 
 fn snapshot_grid<E: EventListener>(term: &Term<E>) -> Vec<RowSnapshot> {
-    let cols = term.columns();
-    let rows = term.screen_lines();
-    let mut out = Vec::with_capacity(rows);
+    snapshot_grid_range(term, 0)
+}
 
-    for row_idx in 0..rows {
+/// Snapshot every row from `first_line` (inclusive, may be negative
+/// for history rows) to `term.screen_lines() - 1` (inclusive, the
+/// last visible row). The live emit path always passes 0 — it only
+/// cares about the visible grid and sends per-row diffs at 125 fps,
+/// so dragging the entire scrollback through the wire on each tick
+/// would shred IPC bandwidth. The closed-block path (see
+/// `snapshot_transcript`) passes `-history_size()` so a finished
+/// claude conversation preserves its full scrollback as
+/// `block_rows`, which is what users mean by "the closed block
+/// should be the entire history, not just the last screen."
+fn snapshot_grid_range<E: EventListener>(
+    term: &Term<E>,
+    first_line: i32,
+) -> Vec<RowSnapshot> {
+    let cols = term.columns();
+    let last_line = term.screen_lines() as i32;
+    let row_count = (last_line - first_line).max(0) as usize;
+    let mut out = Vec::with_capacity(row_count);
+
+    for row_idx in first_line..last_line {
         let mut spans: Vec<Span> = Vec::new();
         let mut current: Option<Span> = None;
         for col_idx in 0..cols {
-            let point = Point::new(Line(row_idx as i32), Column(col_idx));
+            let point = Point::new(Line(row_idx), Column(col_idx));
             let cell: &Cell = &term.grid()[point];
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
@@ -1324,7 +1342,15 @@ fn snapshot_transcript(transcript: &str, cols: u16, rows: u16) -> Vec<RowSnapsho
     let mut term = Term::new(TermConfig::default(), &dims, NullEventProxy);
     let mut parser: Processor = Processor::new();
     parser.advance(&mut term, trimmed.as_bytes());
-    let mut snap = snapshot_grid(&term);
+    // Walk visible + scrollback. With the default TermConfig the
+    // scratch Term has a 10 000-row history, so a long claude
+    // session whose UI scrolled past the visible screen still
+    // surfaces every row that ever rendered. Walking only the
+    // visible grid (the prior behaviour) silently lost everything
+    // above the screen at close-time, which is what users mean by
+    // "the closed agent block got cut off."
+    let first_line = -(term.history_size() as i32);
+    let mut snap = snapshot_grid_range(&term, first_line);
     // Drop trailing rows that are empty / all-whitespace. A row is
     // "empty" when its spans contain nothing but whitespace text.
     // Done greedily from the bottom — we never trim from the middle
