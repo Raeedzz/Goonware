@@ -52,15 +52,25 @@ export function shouldRenderBlockList(_foregroundIsAgent: boolean): boolean {
  * Styles for the scroll container that wraps `<BlockList>` + the
  * `<LiveBlock>`. The `containerType: "size"` is what makes `100cqh`
  * inside the LiveBlock resolve to this element's measured height.
+ *
+ * `allowHorizontalScroll` opts an individual terminal into a
+ * horizontally-scrollable viewport. Default is off because the PTY
+ * already sizes its grid to the container width — horizontal scroll
+ * is normally just a footgun. The right-panel secondary terminal
+ * passes true so long lines in closed blocks (and the narrow live
+ * grid) can be panned via trackpad without truncation. Pair with
+ * the `gli-no-horizontal-scrollbar` class to suppress the track.
  */
-export function agentScrollContainerStyle(): CSSProperties {
+export function agentScrollContainerStyle(
+  allowHorizontalScroll = false,
+): CSSProperties {
   return {
     flex: 1,
     minHeight: 0,
     display: "flex",
     flexDirection: "column",
     overflowY: "auto",
-    overflowX: "hidden",
+    overflowX: allowHorizontalScroll ? "auto" : "hidden",
     // Establishes a size-typed query container so the fill-mode
     // LiveBlock below can use `100cqh` to claim a hard min-height
     // equal to this viewport. Without this, the `cqh` units would

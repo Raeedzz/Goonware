@@ -98,8 +98,18 @@ describe("agentScrollContainerStyle — must establish a size containment for cq
     expect(style.display).toBe("flex");
     expect(style.flexDirection).toBe("column");
     expect(style.overflowY).toBe("auto");
-    // Horizontal scroll is the user's enemy in a terminal — never auto.
+    // Horizontal scroll is the user's enemy in a terminal by default
+    // — never auto unless the caller explicitly opts in (right-panel
+    // secondary terminal threads `allowHorizontalScroll` so long
+    // lines pan instead of clip).
     expect(style.overflowX).toBe("hidden");
+  });
+
+  test("opt-in flag enables horizontal scroll for narrow side terminals", () => {
+    const style = agentScrollContainerStyle(true);
+    expect(style.overflowX).toBe("auto");
+    // Vertical scroll behavior must remain unchanged.
+    expect(style.overflowY).toBe("auto");
   });
 
   test("takes the remaining vertical space from its parent", () => {

@@ -26,6 +26,12 @@
 .gli-no-scrollbar { scrollbar-width: none; }
 .gli-no-scrollbar::-webkit-scrollbar { width: 0; height: 0; }
 
+/* Hide ONLY the horizontal scrollbar (track + thumb) while keeping
+   the vertical one visible. Used on the right-panel secondary
+   terminal so long lines can be scrolled horizontally via trackpad
+   without a chunky 8px track running under the prompt input. */
+.gli-no-horizontal-scrollbar::-webkit-scrollbar:horizontal { height: 0; }
+
 /* Resize-handle styling lives in design/motion.css. The earlier
    "8px gap between floating panes" styles that lived here have been
    removed — panes are now flush rectangles separated by a 0.5px

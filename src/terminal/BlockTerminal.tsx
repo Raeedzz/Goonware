@@ -154,6 +154,15 @@ interface Props {
    * (non-keepalive) uses keep working.
    */
   isVisible?: boolean;
+  /**
+   * Allow the outer scroll container to scroll horizontally when
+   * its content overflows. Off by default — the PTY normally sizes
+   * its grid to the container width and horizontal scroll would
+   * just be a footgun. The right-panel secondary terminal opts in
+   * so long lines pan via trackpad instead of clipping behind the
+   * narrow pane edge.
+   */
+  allowHorizontalScroll?: boolean;
 }
 
 const DEFAULT_ROWS = 32;
@@ -191,6 +200,7 @@ export function BlockTerminal({
   initialAgentCli = null,
   autoFocus = true,
   isVisible = true,
+  allowHorizontalScroll = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   /**
@@ -1260,7 +1270,10 @@ export function BlockTerminal({
         <div
           ref={scrollContainerRef}
           onScroll={onScrollContainerScroll}
-          style={agentScrollContainerStyle()}
+          className={
+            allowHorizontalScroll ? "gli-no-horizontal-scrollbar" : undefined
+          }
+          style={agentScrollContainerStyle(allowHorizontalScroll)}
         >
           {/* BlockList must render in BOTH shell and agent modes so the
               user can always scroll back into closed-block history.
