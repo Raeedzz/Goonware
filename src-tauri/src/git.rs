@@ -377,21 +377,46 @@ pub async fn git_push(
     if !Path::new(&cwd).exists() {
         return Err(format!("cwd does not exist: {cwd}"));
     }
-    let mut args: Vec<&str> = vec!["push"];
-    let remote_owned;
-    let branch_owned;
+    // Determine what to push:
+    //   • If the caller specified remote+branch explicitly, honor them
+    //     verbatim — power-user override stays power-user-shaped.
+    //   • Otherwise resolve the current branch name and push with an
+    //     explicit `HEAD:<branch>` refspec to origin. This works in
+    //     every case the bare `git push` form does NOT:
+    //       - upstream missing (would otherwise need -u)
+    //       - upstream points at a *different* branch name (would
+    //         otherwise fail with "The upstream branch of your current
+    //         branch does not match the name of your current branch"
+    //         under push.default=simple)
+    //   We also pass `-u` so a successful push retargets the upstream
+    //   to origin/<branch> — subsequent plain `git push` from the
+    //   terminal will then work without flags.
+    let mut args: Vec<String> = vec!["push".into()];
     if let Some(r) = remote.as_deref() {
-        remote_owned = r.to_string();
-        args.push(&remote_owned);
+        args.push(r.to_string());
         if let Some(b) = branch.as_deref() {
-            branch_owned = b.to_string();
-            args.push(&branch_owned);
+            args.push(b.to_string());
         }
+    } else {
+        let resolved_branch = run(&cwd, &["symbolic-ref", "--short", "HEAD"])
+            .await
+            .map_err(|e| format!("could not determine current branch: {e}"))?
+            .trim()
+            .to_string();
+        if resolved_branch.is_empty() {
+            return Err("could not determine current branch (detached HEAD?)".into());
+        }
+        args.extend([
+            "-u".into(),
+            "origin".into(),
+            format!("HEAD:{resolved_branch}"),
+        ]);
     }
+    let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let mut command = Command::new("git");
     command
-        .args(&args)
+        .args(&args_refs)
         .current_dir(&cwd)
         // Close stdin so git can never block on a read (some flows ask
         // for confirmation via stdin even when askpass is suppressed).

@@ -252,21 +252,20 @@ pub(crate) async fn prepare_branch_for_pr(
         run_git_checked(cwd, &args).await?;
     }
 
-    let has_upstream = run_git_checked(
-        cwd,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-    )
-    .await
-    .is_ok();
-
-    let push_args: Vec<&str> = if has_upstream {
-        // Already tracking. `git push` no-ops if up-to-date, pushes
-        // otherwise — either way we end in the "remote matches local"
-        // state pr_create needs.
-        vec!["push"]
-    } else {
-        vec!["push", "-u", "origin", branch.as_str()]
-    };
+    // Always push with an explicit refspec to the branch's own name on
+    // origin, and set upstream in the same step. This is bug-resistant
+    // against branches whose existing upstream points at a *different*
+    // remote branch (e.g. a feature branch that was `git checkout -b`'d
+    // from `main` and inherited `branch.<name>.merge = refs/heads/main`).
+    // Plain `git push` in that situation fails with
+    //   "fatal: The upstream branch of your current branch does not
+    //    match the name of your current branch."
+    // because the default push.default=simple refuses to ship local
+    // commits to a remote branch with a different name. Explicit
+    // `HEAD:<branch>` sidesteps that entirely — every PR's commits go
+    // to refs/heads/<branch> on origin, full stop.
+    let head_refspec = format!("HEAD:{branch}");
+    let push_args: Vec<&str> = vec!["push", "-u", "origin", &head_refspec];
 
     push_with_https_fallback(cwd, &push_args).await?;
     Ok(())
