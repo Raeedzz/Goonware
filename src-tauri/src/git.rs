@@ -199,7 +199,42 @@ pub async fn git_diff(
         args.push("--");
         args.push(p);
     }
-    run(&cwd, &args).await
+    let primary = run(&cwd, &args).await?;
+    if !primary.is_empty() || staged {
+        return Ok(primary);
+    }
+    // `git diff` deliberately ignores untracked files. If we got an
+    // empty unstaged diff for a specific path, check whether it's
+    // actually untracked — if so, synthesize a /dev/null-vs-file diff
+    // via `--no-index` so the user can read the new file's contents
+    // in the same viewer instead of seeing "no changes".
+    let Some(p) = path.as_deref() else {
+        return Ok(primary);
+    };
+    let untracked = run(&cwd, &["ls-files", "--others", "--exclude-standard", "--", p])
+        .await
+        .unwrap_or_default();
+    if untracked.trim().is_empty() {
+        return Ok(primary);
+    }
+    // `git diff --no-index` exits with 1 when files differ — the
+    // expected case here. Accept 0 or 1 as success.
+    let out = Command::new("git")
+        .args(["diff", "--no-color", "--no-index", "--", "/dev/null", p])
+        .current_dir(&cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("spawn git: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    match out.status.code() {
+        Some(0) | Some(1) => Ok(stdout),
+        code => {
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            Err(format!("git exited {}: {}", code.unwrap_or(-1), stderr.trim()))
+        }
+    }
 }
 
 /// Aggregate diff stats vs HEAD (working tree + index). Powers the

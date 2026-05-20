@@ -28,7 +28,7 @@ import { properties } from "@codemirror/legacy-modes/mode/properties";
 import { r } from "@codemirror/legacy-modes/mode/r";
 import { haskell } from "@codemirror/legacy-modes/mode/haskell";
 import { clojure } from "@codemirror/legacy-modes/mode/clojure";
-import type { DiffLine } from "./DiffView";
+import type { DiffLine } from "./diff-parse";
 
 /**
  * Standalone diff highlighter. Mirrors the palette in cm6-theme.ts so
@@ -234,9 +234,28 @@ function parserForPath(path: string): Parser | null {
   return parser;
 }
 
-function parseInlineStyle(css: string): React.CSSProperties {
+/**
+ * Parses the synthetic "class" strings used by `HL`. Each entry in
+ * `tagHighlighter` carries a literal CSS declaration list (e.g.
+ * `"color:var(--state-info);font-weight:500"`). When a single text
+ * range matches more than one tag, `highlightTree` concatenates them
+ * with a space — so we may receive something like:
+ *   `"color:var(--state-info);font-weight:500 color:var(--state-success)"`
+ *
+ * A naive `split(";")` mishandles that and produces invalid React
+ * style values like `fontWeight: "500 color:var(--state-success)"`,
+ * which browsers silently drop, losing both colors. We split on `;`
+ * OR on whitespace that sits between a value and the next property
+ * (a letter/dash followed by a colon), so multi-tag spans get every
+ * declaration applied. Last-write-wins on conflicting properties,
+ * matching the rest of the inline-style semantics on the page.
+ */
+export function parseInlineStyle(css: string): React.CSSProperties {
   const out: Record<string, string> = {};
-  for (const decl of css.split(";")) {
+  // Split on `;` or whitespace immediately before `<ident>:` — that
+  // catches the space-separated multi-tag case without breaking
+  // legitimate spaces inside values like `var(--x, fallback)`.
+  for (const decl of css.split(/;|\s+(?=[a-zA-Z-]+\s*:)/)) {
     const i = decl.indexOf(":");
     if (i < 0) continue;
     const prop = decl.slice(0, i).trim();
@@ -257,83 +276,98 @@ function parseInlineStyle(css: string): React.CSSProperties {
  * The single-parse trick keeps multi-line constructs (template
  * literals, block comments) coherent even when add and remove lines
  * appear adjacent — strictly per-line parsing would mis-color those.
+ *
+ * Exported as a pure function so tests can render diff output without
+ * pulling in React's hook runtime. The `useDiffLineRenderers` hook
+ * below is the production-facing wrapper that memoizes the result.
  */
+export function renderDiffLines(
+  lines: DiffLine[],
+  filePath?: string,
+): ReactNode[] {
+  // Start every line with its plain text. Highlighting is purely
+  // additive on top — if anything below fails, we still ship the
+  // raw text so the diff stays visible. This is the regression
+  // guard for the "I can't see diffs anymore" production bug:
+  // a thrown parser, an empty tokens stream, or a renderer mistake
+  // can degrade highlighting, but it must never erase the content.
+  const out = new Array<ReactNode>(lines.length);
+  for (let i = 0; i < lines.length; i++) {
+    out[i] = lines[i].text;
+  }
+
+  const parser = filePath ? parserForPath(filePath) : null;
+  if (!parser) return out;
+
+  type Range = { start: number; end: number; idx: number };
+  const ranges: Range[] = [];
+  let cursor = 0;
+  const pieces: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.kind === "header" || l.kind === "hunk") continue;
+    ranges.push({ start: cursor, end: cursor + l.text.length, idx: i });
+    pieces.push(l.text);
+    cursor += l.text.length + 1; // +1 for the join \n
+  }
+  const source = pieces.join("\n");
+
+  let tree;
+  try {
+    tree = parser.parse(source);
+  } catch {
+    return out;
+  }
+
+  type Token = { from: number; to: number; style: string };
+  const tokens: Token[] = [];
+  try {
+    highlightTree(tree, HL, (from, to, classes) => {
+      if (from < to) tokens.push({ from, to, style: classes });
+    });
+  } catch {
+    return out;
+  }
+
+  // tokens are emitted in document order; walk them per line.
+  let tokIdx = 0;
+  for (const r of ranges) {
+    const text = lines[r.idx].text;
+    const parts: ReactNode[] = [];
+    let pos = r.start;
+    while (tokIdx < tokens.length && tokens[tokIdx].to <= r.start) tokIdx++;
+    let j = tokIdx;
+    while (j < tokens.length && tokens[j].from < r.end) {
+      const tok = tokens[j];
+      if (tok.to <= r.start) {
+        j++;
+        continue;
+      }
+      const from = Math.max(tok.from, r.start);
+      const to = Math.min(tok.to, r.end);
+      if (from > pos) {
+        parts.push(text.slice(pos - r.start, from - r.start));
+      }
+      parts.push(
+        <span key={from} style={parseInlineStyle(tok.style)}>
+          {text.slice(from - r.start, to - r.start)}
+        </span>,
+      );
+      pos = to;
+      j++;
+    }
+    if (pos < r.end) parts.push(text.slice(pos - r.start));
+    // Only swap in the highlighted version if we actually produced
+    // any spans. Bare text comes through verbatim — `out[r.idx]` is
+    // already `text` from the initial pass above.
+    if (parts.length > 0) out[r.idx] = parts;
+  }
+  return out;
+}
+
 export function useDiffLineRenderers(
   lines: DiffLine[],
   filePath?: string,
 ): ReactNode[] {
-  return useMemo(() => {
-    const out = new Array<ReactNode>(lines.length);
-    const parser = filePath ? parserForPath(filePath) : null;
-
-    if (!parser) {
-      for (let i = 0; i < lines.length; i++) out[i] = lines[i].text;
-      return out;
-    }
-
-    type Range = { start: number; end: number; idx: number };
-    const ranges: Range[] = [];
-    let cursor = 0;
-    const pieces: string[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      const l = lines[i];
-      if (l.kind === "header" || l.kind === "hunk") continue;
-      ranges.push({ start: cursor, end: cursor + l.text.length, idx: i });
-      pieces.push(l.text);
-      cursor += l.text.length + 1; // +1 for the join \n
-    }
-    const source = pieces.join("\n");
-
-    let tree;
-    try {
-      tree = parser.parse(source);
-    } catch {
-      for (let i = 0; i < lines.length; i++) out[i] = lines[i].text;
-      return out;
-    }
-
-    type Token = { from: number; to: number; style: string };
-    const tokens: Token[] = [];
-    try {
-      highlightTree(tree, HL, (from, to, classes) => {
-        if (from < to) tokens.push({ from, to, style: classes });
-      });
-    } catch {
-      for (let i = 0; i < lines.length; i++) out[i] = lines[i].text;
-      return out;
-    }
-
-    // tokens are emitted in document order; walk them per line.
-    let tokIdx = 0;
-    for (let i = 0; i < lines.length; i++) out[i] = lines[i].text;
-    for (const r of ranges) {
-      const text = lines[r.idx].text;
-      const parts: ReactNode[] = [];
-      let pos = r.start;
-      while (tokIdx < tokens.length && tokens[tokIdx].to <= r.start) tokIdx++;
-      let j = tokIdx;
-      while (j < tokens.length && tokens[j].from < r.end) {
-        const tok = tokens[j];
-        if (tok.to <= r.start) {
-          j++;
-          continue;
-        }
-        const from = Math.max(tok.from, r.start);
-        const to = Math.min(tok.to, r.end);
-        if (from > pos) {
-          parts.push(text.slice(pos - r.start, from - r.start));
-        }
-        parts.push(
-          <span key={from} style={parseInlineStyle(tok.style)}>
-            {text.slice(from - r.start, to - r.start)}
-          </span>,
-        );
-        pos = to;
-        j++;
-      }
-      if (pos < r.end) parts.push(text.slice(pos - r.start));
-      out[r.idx] = parts.length > 0 ? parts : text;
-    }
-    return out;
-  }, [lines, filePath]);
+  return useMemo(() => renderDiffLines(lines, filePath), [lines, filePath]);
 }
