@@ -1764,6 +1764,14 @@ function SecondaryTerminals({ worktree }: { worktree: Worktree }) {
               // a worktree — that means "I want to type in the main
               // terminal," full stop.
               autoFocus={false}
+              // The right panel is narrow — closed blocks that
+              // contain long lines (paths, command flags, log lines)
+              // would otherwise clip against the pane edge. Allow
+              // horizontal scrolling here so the user can pan with
+              // a trackpad. The track itself is hidden via
+              // `gli-no-horizontal-scrollbar` so it doesn't sit
+              // under the prompt input.
+              allowHorizontalScroll
             />
           </div>
         );

@@ -1,0 +1,70 @@
+# PR gate. Runs the same checks `bun run test:all` does locally:
+# TypeScript build, Bun JS tests, Rust unit tests. Blocks merge on
+# failure so a broken typecheck can't slip into main and brick the
+# release workflow (which builds + publishes on push, with no
+# typecheck of its own beyond the implicit `bun run build` step
+# inside tauri-action's beforeBuildCommand).
+#
+# Triggers on every PR to main, plus pushes to main itself so the
+# Branch Protection "Required status checks" UI has something to
+# pin to. Skip via `[skip ci]` in the commit message.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Typecheck + tests
+    if: github.event_name == 'pull_request' || !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            src-tauri/target/
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Install JS deps
+        run: bun install --frozen-lockfile
+
+      - name: Download `rg` sidecar binaries
+        # tauri-build's build.rs refuses to run if any `externalBin`
+        # path declared in tauri.conf.json is missing — and *every*
+        # cargo invocation under src-tauri (including `cargo test`)
+        # runs that build.rs. Without this step `bun run test:rs`
+        # exits 101 before a single test compiles.
+        run: bun run download-rg
+
+      - name: TypeScript build
+        run: bun run typecheck
+
+      - name: JS tests
+        run: bun run test
+
+      - name: Rust tests
+        run: bun run test:rs

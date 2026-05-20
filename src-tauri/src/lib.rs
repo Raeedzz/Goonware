@@ -52,6 +52,19 @@ pub fn run() {
         .manage(TerminalState::default())
         .manage(agent_hooks::AgentHookState::default());
 
+    // macOS Edit menu: without an explicit menu, bundled .app builds
+    // get a stripped-down OS-default menu whose Edit items aren't
+    // wired to AppKit's responder chain, so ⌘C / ⌘V / ⌘X / ⌘A /
+    // ⌘Z silently no-op inside the WKWebView. (It works under
+    // `tauri dev` because the dev shim installs its own menu.)
+    // `Menu::default` builds the full standard macOS menu — App /
+    // Edit (cut/copy/paste/select-all/undo/redo) / View / Window /
+    // Help — using `PredefinedMenuItem`s that send the native
+    // cut:/copy:/paste:/selectAll: selectors WebKit honors out of
+    // the box for both selected text and focused inputs.
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(|app| tauri::menu::Menu::default(app));
+
     #[cfg(target_os = "macos")]
     let builder = builder
         .manage(BrowserState::default())
