@@ -425,7 +425,9 @@ export class GridRenderer {
       cursor: {
         row: frame.cursor_row,
         col: frame.cursor_col,
-        visible: true,
+        // DECTCEM. Suppress the cursor draw when the running program
+        // has hidden it (claude's picker, fzf, vim normal mode, etc).
+        visible: frame.cursor_visible !== false,
       },
     });
   }

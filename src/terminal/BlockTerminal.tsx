@@ -1256,6 +1256,16 @@ export function BlockTerminal({
               frame={liveFrame}
               cwd={effectiveCwd}
               preserveGrid={foregroundIsAgent}
+              // Agent TUIs own the surface — let the LiveBlock fill
+              // the pane instead of sizing to content. Without this,
+              // a tall agent grid (claude with the slash-command
+              // picker open) draws below an empty BlockList region,
+              // the outer scroll anchors that combined column at the
+              // bottom, and the user sees a fat band of blank canvas
+              // above the picker. Filling the pane puts the picker's
+              // first row at the visible top edge — what users mean
+              // by "I want to see what I'm picking."
+              fill={foregroundIsAgent}
             />
           )}
         </div>
