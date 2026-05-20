@@ -184,7 +184,21 @@ export function reducer(state: AppState, action: AppAction): AppState {
     /* Worktrees --------------------------------------------------- */
 
     case "add-worktree": {
-      const w = action.worktree;
+      const incoming = action.worktree;
+      // Rust's worktree_create returns `secondaryPtyId` but no
+      // `secondaryTerminals` array, so seed it here — otherwise the
+      // SecondaryPanel renders zero tabs and the user has to click +
+      // before the bottom-left terminal appears.
+      const hasList =
+        Array.isArray(incoming.secondaryTerminals) &&
+        incoming.secondaryTerminals.length > 0;
+      const w: Worktree = hasList
+        ? incoming
+        : {
+            ...incoming,
+            secondaryTerminals: [incoming.secondaryPtyId],
+            secondaryActiveTerminalId: incoming.secondaryPtyId,
+          };
       const tabs = { ...state.tabs };
       // Caller is expected to also dispatch open-tab for w.tabIds, but
       // for convenience let new worktrees come with their tabs included
@@ -244,7 +258,17 @@ export function reducer(state: AppState, action: AppAction): AppState {
     }
 
     case "restore-worktree": {
-      const w = action.worktree;
+      const incoming = action.worktree;
+      const hasList =
+        Array.isArray(incoming.secondaryTerminals) &&
+        incoming.secondaryTerminals.length > 0;
+      const w: Worktree = hasList
+        ? incoming
+        : {
+            ...incoming,
+            secondaryTerminals: [incoming.secondaryPtyId],
+            secondaryActiveTerminalId: incoming.secondaryPtyId,
+          };
       const archivedWorktrees = state.archivedWorktrees.filter(
         (a) => a.id !== action.archiveId,
       );
