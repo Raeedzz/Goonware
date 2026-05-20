@@ -2154,6 +2154,36 @@ pub fn term_resize(
     Ok(())
 }
 
+/// Out-of-band grid reset. Feeds `ESC[2J ESC[H` straight into the
+/// alacritty parser (NOT the PTY writer — we don't want zsh to see
+/// or echo it) and clears `last_snapshot` so the next emit lands as
+/// a full-frame redraw of an empty grid.
+///
+/// Why this exists: OSC 133 C already triggers an equivalent clear
+/// inside the reader loop, so most new-command transitions are
+/// covered. But "Ctrl+C an agent → type a new agent immediately"
+/// can outrun the OSC 133 path on flaky integration setups, leaving
+/// the previous claude's TUI cells ghosting through the new claude's
+/// banner — exactly the "new agent doesn't show up properly" symptom
+/// users report. Calling this from `onSubmit` whenever the typed
+/// command line is an agent makes the reset frontend-driven and
+/// race-free.
+#[tauri::command]
+pub fn term_reset_grid(
+    state: State<TerminalState>,
+    id: String,
+) -> Result<(), String> {
+    let arc = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.get(&id).cloned().ok_or("unknown term session")?
+    };
+    let mut s = arc.lock().map_err(|e| e.to_string())?;
+    s.last_snapshot.clear();
+    let Session { parser, term, .. } = &mut *s;
+    parser.advance(term, b"\x1b[2J\x1b[H");
+    Ok(())
+}
+
 #[tauri::command]
 pub fn term_close(
     state: State<TerminalState>,

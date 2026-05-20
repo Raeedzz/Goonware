@@ -29,6 +29,7 @@ import {
   clearTerminalRunning,
 } from "./terminalActivityStore";
 import { detectClaude } from "@/lib/claudeUsage";
+import { termResetGrid } from "@/lib/tauri/term";
 
 /** Command names that always run as an interactive TUI agent. */
 function isAgentCommand(command: string): boolean {
@@ -806,6 +807,21 @@ export function BlockTerminal({
   const onSubmit = useCallback(
     (text: string) => {
       setActiveCommand(text);
+      // Defensive grid reset for agent transitions. When the user
+      // Ctrl+C's an agent and immediately types another agent,
+      // alacritty's grid still holds the dying TUI's last frame.
+      // OSC 133 C will eventually clear it inside the reader loop,
+      // but on a flaky integration (or just normal latency) the
+      // shell echoes "claude\n" + claude's banner into the same
+      // grid before that fires, and the user sees the new agent's
+      // first paint ghosted on top of the old one. Firing the
+      // clear from here makes the transition race-free.
+      if (commandLineIsAgent(text)) {
+        void termResetGrid(id).catch(() => {
+          // Best-effort — if the backend is mid-flight we just fall
+          // back to the OSC 133 C clear path. No need to surface.
+        });
+      }
       void sendLine(text);
       if (text.trim().length > 0) {
         setHistory((prev) => {

@@ -115,6 +115,23 @@ export async function termResize(
 }
 
 /**
+ * Force-clear alacritty's grid and the snapshot baseline so the next
+ * frame lands as a full repaint of an empty grid. Used right before
+ * starting a new agent (claude / codex / aider) so any leftover
+ * cells from the previous foreground process can't ghost through
+ * the new agent's banner — covers the "Ctrl+C → type claude → new
+ * claude doesn't show up properly" race that beats OSC 133's own
+ * clear path on flaky integration setups.
+ *
+ * Safe to call between commands; a no-op on shells with nothing to
+ * clear. The bytes go through alacritty's parser, NOT the PTY
+ * writer — zsh never sees them.
+ */
+export async function termResetGrid(id: string): Promise<void> {
+  await invoke("term_reset_grid", { id });
+}
+
+/**
  * Hand the backend the set of PTY ids currently visible in the UI.
  * The backend uses this to throttle hidden sessions from 60 Hz down
  * to 4 Hz so backgrounded agents don't burn the IPC bus.

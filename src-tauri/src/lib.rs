@@ -122,6 +122,7 @@ pub fn run() {
             term::term_start,
             term::term_input,
             term::term_resize,
+            term::term_reset_grid,
             term::term_close,
             term::term_set_visible_set,
             term::term_running_session_ids,
