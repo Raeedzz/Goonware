@@ -35,11 +35,12 @@
 //! known Codex sessions and `kill(pid, 0)`. After two consecutive
 //! misses, synthesize a SessionEnd to evict the session from the map.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -182,6 +183,15 @@ struct HookEnvelope {
     /// belt-and-braces.
     #[serde(default)]
     gli_session_id: Option<String>,
+    /// User's typed prompt text. Populated for UserPromptSubmit
+    /// events; empty for everything else. Fed into the tab-subtitle
+    /// summarizer (`claude_activity_summary`) so we can render a
+    /// creative "what are you working on" label without reading
+    /// `~/.claude/projects/*.jsonl` — which would trigger macOS App
+    /// Data Isolation prompts every time Claude opens a new session
+    /// (each transcript file gets a fresh MACL UUID).
+    #[serde(default)]
+    prompt: String,
 }
 
 /// Drop envelopes that shouldn't move the spinner at all. Two rules:
@@ -296,6 +306,35 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Latest user-prompt text per cwd, captured live from
+/// UserPromptSubmit hook events. This is the TCC-safe data source
+/// for the tab-subtitle summarizer — Claude's hook script runs
+/// inside Claude's process tree (so reading the stdin payload
+/// doesn't trip macOS App Data Isolation) and forwards just the
+/// prompt string to GLI via the existing Unix socket. GLI never has
+/// to touch `~/.claude/projects/*.jsonl`, which is the only way to
+/// avoid the "would like to access data from other apps" popup that
+/// fires on every fresh transcript file's MACL xattr.
+static LATEST_PROMPT_BY_CWD: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn record_prompt_for_cwd(cwd: &str, prompt: &str) {
+    if cwd.is_empty() || prompt.is_empty() {
+        return;
+    }
+    let store = LATEST_PROMPT_BY_CWD.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut g) = store.lock() {
+        g.insert(cwd.to_string(), prompt.to_string());
+    }
+}
+
+/// Fetch the most recent user prompt observed for `cwd`. Returns
+/// `None` until the user submits at least one prompt in a Claude
+/// session running in that working directory.
+pub fn latest_prompt_for_cwd(cwd: &str) -> Option<String> {
+    let store = LATEST_PROMPT_BY_CWD.get_or_init(|| Mutex::new(HashMap::new()));
+    store.lock().ok().and_then(|g| g.get(cwd).cloned())
+}
+
 /// Spawn the Unix-socket listener + the Codex liveness watchdog.
 pub fn start_socket_server(app: AppHandle<Wry>) {
     let _ = fs::remove_file(SOCKET_PATH);
@@ -379,6 +418,15 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
             envelope.session_id
         );
         return;
+    }
+
+    // Capture the user's prompt text for the tab-subtitle summarizer
+    // before the event flows through the spinner state machine. This
+    // is the only hook field the summarizer needs, and stashing it
+    // up here means we don't have to thread it through the rest of
+    // the handler.
+    if envelope.event == "UserPromptSubmit" && !envelope.prompt.is_empty() {
+        record_prompt_for_cwd(&envelope.cwd, &envelope.prompt);
     }
 
     let state = match app.try_state::<AgentHookState>() {

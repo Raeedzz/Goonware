@@ -126,10 +126,9 @@ pub fn run() {
             term::term_close,
             term::term_set_visible_set,
             term::term_running_session_ids,
-            // Claude usage (real, from ~/.claude/projects transcripts)
+            // Claude usage (OAuth API + hook-fed activity summarizer)
             claude_usage::claude_usage_status,
             claude_usage::claude_activity_summary,
-            claude_usage::claude_active_status,
             agent_hooks::agent_sessions,
             // Git (Task #8)
             git::git_status,
@@ -174,6 +173,7 @@ pub fn run() {
             fs::fs_read_dir,
             fs::fs_read_text_file,
             fs::fs_write_text_file,
+            fs::fs_scan_project_icon,
             fs::fs_cwd,
             fs::system_home_dir,
             fs::system_open,

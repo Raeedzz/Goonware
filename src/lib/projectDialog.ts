@@ -1,6 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import type { Dispatch } from "react";
 import type { AppAction } from "@/state/types";
+import { fs } from "@/lib/fs";
 
 /**
  * Show the system "Open Folder" picker and dispatch an `add-project`
@@ -43,5 +44,21 @@ export async function openProjectDialog(
       expanded: true,
     },
   });
+
+  // Best-effort icon detection. Don't block the add — the project shows
+  // up immediately with the letter fallback and swaps to the real icon
+  // once the scan resolves. Failures are silent: the fallback glyph is
+  // already a reasonable default.
+  fs.scanProjectIcon(path)
+    .then((faviconDataUri) => {
+      if (!faviconDataUri) return;
+      dispatch({
+        type: "update-project",
+        id,
+        patch: { faviconDataUri },
+      });
+    })
+    .catch(() => {});
+
   return id;
 }

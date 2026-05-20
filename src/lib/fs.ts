@@ -12,6 +12,15 @@ export const fs = {
     invoke<string>("fs_read_text_file", { path }),
   writeTextFile: (path: string, content: string) =>
     invoke<void>("fs_write_text_file", { path, content }),
+  /**
+   * Best-effort scan for a project's own app icon — favicon, Tauri app
+   * icon, Next.js icon, etc. — returned as a `data:` URI ready to drop
+   * into `<img src>`. Resolves to `null` when nothing matched. The
+   * sidebar renders this in place of the first-letter glyph so e.g.
+   * GLI itself shows the GLI app icon instead of "G".
+   */
+  scanProjectIcon: (path: string) =>
+    invoke<string | null>("fs_scan_project_icon", { path }),
   cwd: () => invoke<string>("fs_cwd"),
 };
 
