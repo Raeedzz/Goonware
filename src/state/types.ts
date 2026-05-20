@@ -431,10 +431,10 @@ export interface Settings {
 /** Resize bounds for the side columns. Reducer clamps writes here. */
 export const SIDEBAR_MIN = 200;
 export const SIDEBAR_MAX = 480;
-export const SIDEBAR_DEFAULT = 248;
+export const SIDEBAR_DEFAULT = 264;
 export const RIGHT_MIN = 280;
 export const RIGHT_MAX = 720;
-export const RIGHT_DEFAULT = 372;
+export const RIGHT_DEFAULT = 516;
 
 export function clampSidebar(w: number): number {
   if (Number.isNaN(w)) return SIDEBAR_DEFAULT;
