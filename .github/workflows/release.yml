@@ -169,6 +169,50 @@ jobs:
         # bundle declares in `tauri.conf.json`.
         run: bun run download-rg
 
+      - name: Import Apple Developer certificate
+        # Decodes the .p12 from the APPLE_CERTIFICATE secret into a
+        # fresh build-only keychain. We create our own keychain
+        # rather than using the default one so a flaky build can't
+        # leave stray certs lying around the runner image (and so
+        # KEYCHAIN_PASSWORD can be a throwaway, not anything we'd
+        # ever reuse).
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain  -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain  -p "$KEYCHAIN_PASSWORD" build.keychain
+          # 3600s auto-lock + lock on sleep is plenty for the build window.
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          # Without this, codesign would be prompted GUI-style for
+          # access to the private key on every invocation. The
+          # partition list authorizes apple-tool/codesign/etc. to
+          # use the key non-interactively under our keychain pwd.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm -f "$RUNNER_TEMP/certificate.p12"
+
+      - name: Resolve signing identity name
+        # Reads the "Developer ID Application: …" CN back out of the
+        # imported cert and surfaces it as APPLE_SIGNING_IDENTITY for
+        # later steps. This avoids hardcoding the identity string in
+        # the workflow — rotate the cert and nothing here changes.
+        run: |
+          set -euo pipefail
+          CERT_LINE=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
+          CERT_ID=$(echo "$CERT_LINE" | awk -F'"' '{print $2}')
+          echo "APPLE_SIGNING_IDENTITY=$CERT_ID" >> "$GITHUB_ENV"
+          echo "Will sign with: $CERT_ID"
+
       - name: Build & sign DMG, publish release
         id: tauri
         uses: tauri-apps/tauri-action@v0
@@ -179,22 +223,14 @@ jobs:
           # match the private key here.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Apple signing + notarization env vars are intentionally
-          # omitted. tauri-action / tauri-cli treats "defined but
-          # empty" as "user wants signing" and tries to import an
-          # empty .p12, which fails. When you add the Apple Developer
-          # secrets to the repo, re-introduce these here:
-          #
-          #   APPLE_CERTIFICATE
-          #   APPLE_CERTIFICATE_PASSWORD
-          #   APPLE_SIGNING_IDENTITY
-          #   APPLE_ID
-          #   APPLE_PASSWORD
-          #   APPLE_TEAM_ID
-          #
-          # Until then the DMG is unsigned at the Apple layer; users
-          # see Gatekeeper on first install. The Tauri updater
-          # signature (ed25519) is independent and still applies.
+          # Apple Developer ID signing + notarization. APPLE_SIGNING_IDENTITY
+          # is populated by the "Resolve signing identity name" step
+          # above, not from a raw secret.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           # Build universal so a single DMG runs on Apple Silicon + Intel.
           args: --target universal-apple-darwin
