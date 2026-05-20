@@ -96,7 +96,7 @@ export function MainColumn() {
       <TabContent
         worktree={worktree}
         tab={activeTab}
-        projectPath={project.path}
+        cwd={worktree.path}
       />
       <CloseTabConfirmDialog
         tab={pendingClose}
@@ -645,11 +645,16 @@ function isTabDirty(tab: Tab): boolean {
 function TabContent({
   worktree,
   tab,
-  projectPath,
+  cwd,
 }: {
   worktree: Worktree;
   tab: Tab | null;
-  projectPath: string;
+  // `cwd` is the WORKTREE path, not the project root. Git commands
+  // (`git_diff`, `git_diff_all`) must run inside the active worktree
+  // — running them at the project root would silently report the
+  // wrong directory's diff (which can be empty even when the
+  // worktree has changes).
+  cwd: string;
 }) {
   // Terminal-kind tabs go through the always-mounted keepalive
   // layer; non-terminal kinds (diff, markdown, all-changes,
@@ -704,12 +709,12 @@ function TabContent({
             {tab.kind === "diff" ? (
               <DiffTabContent
                 key={tab.id}
-                projectPath={projectPath}
+                cwd={cwd}
                 filePath={tab.filePath}
                 staged={tab.staged}
               />
             ) : tab.kind === "all-changes" ? (
-              <AllChangesView key={tab.id} projectPath={projectPath} />
+              <AllChangesView key={tab.id} projectPath={cwd} />
             ) : tab.kind === "project-settings" ? (
               <RepositorySettingsView
                 key={tab.id}
@@ -925,17 +930,17 @@ function playCompletionSound(kind: "subtle" | "bell") {
 }
 
 function DiffTabContent({
-  projectPath,
+  cwd,
   filePath,
   staged,
 }: {
-  projectPath: string;
+  cwd: string;
   filePath: string;
   staged: boolean;
 }) {
   return (
     <DiffView
-      projectPath={projectPath}
+      projectPath={cwd}
       filePath={filePath}
       staged={staged}
       onClose={() => {
