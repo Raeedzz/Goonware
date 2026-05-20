@@ -187,19 +187,40 @@ function ResizeHandle({ side }: { side: "left" | "right" }) {
   );
 
   useEffect(() => {
+    // rAF-coalesce drag dispatches. macOS trackpads + high-refresh
+    // pointers fire mousemove well above 60 Hz (often 120 Hz). In
+    // dev that's masked by the slower devtools-attached pipeline,
+    // but in a notarized production build every event drives a full
+    // state dispatch → React commit → AppShell flex re-layout →
+    // CanvasGrid ResizeObserver → WebGPU backbuffer reallocation.
+    // Two of those per frame is visible jitter. Aligning the
+    // dispatch to rAF gives the layout one chance per frame to
+    // settle and matches the cadence the GPU is rendering at
+    // anyway.
+    let rafId: number | null = null;
+    let pendingWidth: number | null = null;
+    const flush = () => {
+      rafId = null;
+      const next = pendingWidth;
+      pendingWidth = null;
+      if (next == null) return;
+      dispatch({
+        type: side === "left" ? "set-sidebar-width" : "set-right-panel-width",
+        width: next,
+      });
+    };
     const onMove = (e: MouseEvent) => {
       if (!draggingRef.current) return;
       const dx = e.clientX - startXRef.current;
       // Sidebar grows to the right (positive dx → wider).
       // Right panel grows to the left (positive dx → narrower).
-      const next =
+      pendingWidth =
         side === "left"
           ? Math.min(max, Math.max(min, startWRef.current + dx))
           : Math.min(max, Math.max(min, startWRef.current - dx));
-      dispatch({
-        type: side === "left" ? "set-sidebar-width" : "set-right-panel-width",
-        width: next,
-      });
+      if (rafId === null) {
+        rafId = window.requestAnimationFrame(flush);
+      }
     };
     const onUp = () => {
       if (!draggingRef.current) return;
@@ -207,12 +228,20 @@ function ResizeHandle({ side }: { side: "left" | "right" }) {
       setActive(false);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
+      // Make sure the final width lands even if mouseup arrives
+      // between the last rAF-scheduled flush and its fire.
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+        rafId = null;
+        flush();
+      }
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     return () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
     };
   }, [side, min, max, dispatch]);
 
