@@ -179,14 +179,22 @@ jobs:
           # match the private key here.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Apple signing + notarization — optional; tauri-action
-          # skips the steps when these are blank.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Apple signing + notarization env vars are intentionally
+          # omitted. tauri-action / tauri-cli treats "defined but
+          # empty" as "user wants signing" and tries to import an
+          # empty .p12, which fails. When you add the Apple Developer
+          # secrets to the repo, re-introduce these here:
+          #
+          #   APPLE_CERTIFICATE
+          #   APPLE_CERTIFICATE_PASSWORD
+          #   APPLE_SIGNING_IDENTITY
+          #   APPLE_ID
+          #   APPLE_PASSWORD
+          #   APPLE_TEAM_ID
+          #
+          # Until then the DMG is unsigned at the Apple layer; users
+          # see Gatekeeper on first install. The Tauri updater
+          # signature (ed25519) is independent and still applies.
         with:
           # Build universal so a single DMG runs on Apple Silicon + Intel.
           args: --target universal-apple-darwin
