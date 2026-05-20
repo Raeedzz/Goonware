@@ -8,6 +8,8 @@ import {
   type MouseEvent,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { joinShellPaths } from "@/lib/shellQuote";
 import { BlockList } from "./BlockList";
 import { CanvasGrid } from "./CanvasGrid";
 import { LiveBlock } from "./LiveBlock";
@@ -876,6 +878,88 @@ export function BlockTerminal({
     [sendBytes],
   );
 
+  // Tauri drag-and-drop. The webview intercepts native drops before any
+  // DOM `ondrop` would fire and surfaces them through this global event
+  // channel — so we subscribe once per terminal and gate by position
+  // against the container's bounding box. With multiple terminals
+  // mounted (right-panel side terminals, hidden-but-mounted worktree
+  // keepalives) only the one whose box contains the drop point
+  // accepts. Hidden terminals (display:none) have a zero-area rect, so
+  // they never match.
+  //
+  // Shell mode → splice the quoted path(s) into the visible PromptInput
+  // textarea so the user can edit / chain args / Enter to send. Agent
+  // mode → route straight to the PTY via bracketed paste so claude,
+  // codex, aider see "open this file" as one atomic input event.
+  const [dragOver, setDragOver] = useState(false);
+  useEffect(() => {
+    if (!isVisible) return;
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        // `leave` is positionless — the drag was cancelled or exited
+        // the webview entirely. Clear the highlight and exit.
+        if (event.payload.type === "leave") {
+          setDragOver(false);
+          return;
+        }
+        const container = containerRef.current;
+        if (!container) return;
+        const rect = container.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
+        // Tauri's drag-drop event reports `position` in PHYSICAL pixels
+        // while `getBoundingClientRect()` returns CSS (logical) pixels.
+        // On a Retina display the physical coords are ~2× larger, so
+        // without this scale-down a drop on the lower-right pane of a
+        // split layout would match the *upper-left* terminal's rect.
+        const dpr = window.devicePixelRatio || 1;
+        const x = event.payload.position.x / dpr;
+        const y = event.payload.position.y / dpr;
+        const inside =
+          x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          setDragOver(inside);
+          return;
+        }
+        if (event.payload.type === "drop") {
+          setDragOver(false);
+          if (!inside) return;
+          const paths = event.payload.paths;
+          if (!paths || paths.length === 0) return;
+          // Trailing space so the path is its own token regardless of
+          // what the user types next ("describe this", "cat", etc.).
+          const joined = `${joinShellPaths(paths)} `;
+          if (foregroundIsAgentRef.current) {
+            // Bracketed paste so the agent sees one atomic input event
+            // even if the joined string has spaces / newlines.
+            onPaste(joined);
+            passthroughRef.current?.focus();
+          } else {
+            promptRef.current?.insertText(joined);
+            promptRef.current?.focus();
+          }
+          markTerminalInteracted(id);
+        }
+      })
+      .then((un) => {
+        if (cancelled) {
+          un();
+          return;
+        }
+        unlisten = un;
+      })
+      .catch(() => {
+        // Webview API unavailable (non-Tauri host, future plugin
+        // permission tightening, etc.) — leave drag-drop off rather
+        // than crash the terminal.
+      });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [isVisible, id, onPaste]);
+
   const historyAt = useCallback(
     (offset: number) => history[offset] ?? null,
     [history],
@@ -1014,10 +1098,15 @@ export function BlockTerminal({
         backgroundColor: "var(--surface-0)",
         position: "relative",
         // Soft warm pulse when the terminal rings the bell. CSS handles
-        // the easing so the runtime cost is one class flip.
-        boxShadow: bellFlash
-          ? "inset 0 0 0 1px var(--state-warning)"
-          : undefined,
+        // the easing so the runtime cost is one class flip. When a file
+        // drag is hovering this pane, swap the warning ring for the
+        // accent ring so the user can see which terminal will receive
+        // the dropped paths.
+        boxShadow: dragOver
+          ? "inset 0 0 0 2px var(--accent-bright)"
+          : bellFlash
+            ? "inset 0 0 0 1px var(--state-warning)"
+            : undefined,
         transition: "box-shadow 480ms cubic-bezier(0.16, 1, 0.3, 1)",
       }}
     >

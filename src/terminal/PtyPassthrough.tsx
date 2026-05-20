@@ -7,6 +7,8 @@ import {
   type ClipboardEvent,
   type KeyboardEvent,
 } from "react";
+import { system } from "@/lib/fs";
+import { shellQuotePath } from "@/lib/shellQuote";
 import { isGlobalChord, keyToBytes } from "./keyEncoding";
 
 export interface PtyPassthroughHandle {
@@ -76,6 +78,28 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
       focus: () => inputRef.current?.focus(),
     }));
 
+    /**
+     * Forward a string to the PTY using the same wire encoding the
+     * Cmd+V branch and the onInput branch both want: bracketed-paste
+     * markers when the running program has issued DECSET 2004, plain
+     * bytes otherwise. Centralizing the encoding keeps the image-paste
+     * and text-paste branches from drifting apart.
+     */
+    const sendPasteText = (text: string) => {
+      const payload = encoder.encode(text);
+      if (bracketedPaste) {
+        const out = new Uint8Array(
+          PASTE_START.length + payload.length + PASTE_END.length,
+        );
+        out.set(PASTE_START, 0);
+        out.set(payload, PASTE_START.length);
+        out.set(PASTE_END, PASTE_START.length + payload.length);
+        onSendBytes(out);
+      } else {
+        onSendBytes(payload);
+      }
+    };
+
     useEffect(() => {
       if (autoFocus === false) return;
       inputRef.current?.focus();
@@ -111,6 +135,12 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
       // textarea has no visible bounding box. Read the clipboard
       // explicitly and forward — same wire encoding (bracketed paste
       // markers when DECSET 2004 is on) as the onInput path below.
+      //
+      // Image clipboard items get the same path-spool treatment as the
+      // PromptInput textarea: write the bytes to /tmp/gli-paste and
+      // send the quoted path. Claude / codex / aider all accept inline
+      // file paths as image references, so a Cmd+Shift+Ctrl+4 → Cmd+V
+      // delivers a usable screenshot to the agent in two keystrokes.
       if (
         e.metaKey &&
         !e.ctrlKey &&
@@ -119,27 +149,34 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
         e.key.toLowerCase() === "v"
       ) {
         e.preventDefault();
-        void navigator.clipboard
-          .readText()
-          .then((text) => {
-            if (text.length === 0) return;
-            const payload = encoder.encode(text);
-            if (bracketedPaste) {
-              const out = new Uint8Array(
-                PASTE_START.length + payload.length + PASTE_END.length,
-              );
-              out.set(PASTE_START, 0);
-              out.set(payload, PASTE_START.length);
-              out.set(PASTE_END, PASTE_START.length + payload.length);
-              onSendBytes(out);
-            } else {
-              onSendBytes(payload);
+        void (async () => {
+          try {
+            // navigator.clipboard.read() surfaces every MIME the OS
+            // attached (image + html + plain text); readText() would
+            // silently strip the image and we'd lose the screenshot.
+            const items = await navigator.clipboard.read();
+            for (const item of items) {
+              const imageType = item.types.find((t) => t.startsWith("image/"));
+              if (!imageType) continue;
+              const blob = await item.getType(imageType);
+              const buf = new Uint8Array(await blob.arrayBuffer());
+              const ext = mimeToExt(imageType);
+              const path = await system.saveImageToTemp(buf, ext);
+              // Trailing space so a follow-up "describe this screenshot"
+              // doesn't smash against the closing quote.
+              sendPasteText(`${shellQuotePath(path)} `);
+              return;
             }
-          })
-          .catch(() => {
-            // Clipboard read denied / no permission — silently no-op;
+            // No image MIME found — fall through to plain text.
+            const text = await navigator.clipboard.readText();
+            if (text.length === 0) return;
+            sendPasteText(text);
+          } catch {
+            // Clipboard access denied / no permission / API missing
+            // (e.g. clipboard.read() not exposed) — silently no-op;
             // the user will retry and notice nothing landed.
-          });
+          }
+        })();
         return;
       }
       const seq = keyToBytes(e, appCursor);
@@ -210,4 +247,23 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
     );
   },
 ));
+
+/**
+ * Map a clipboard image MIME to a file extension that the OS + the
+ * receiving agent will both recognize. Defaults to PNG — that's what
+ * macOS screenshots produce and it's the most lossless choice when
+ * the MIME is something exotic.
+ */
+function mimeToExt(mime: string): string {
+  const m = mime.toLowerCase();
+  if (m === "image/jpeg" || m === "image/jpg") return "jpg";
+  if (m === "image/png") return "png";
+  if (m === "image/gif") return "gif";
+  if (m === "image/webp") return "webp";
+  if (m === "image/bmp") return "bmp";
+  if (m === "image/tiff") return "tiff";
+  if (m === "image/heic") return "heic";
+  if (m === "image/svg+xml") return "svg";
+  return "png";
+}
 

@@ -177,6 +177,7 @@ pub fn run() {
             fs::system_home_dir,
             fs::system_open,
             fs::system_open_with,
+            fs::system_save_image_to_temp,
             // State persistence
             state::state_save,
             state::state_load,

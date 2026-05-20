@@ -16,6 +16,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Stdio;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
 use tokio::process::Command;
 
@@ -141,6 +142,53 @@ pub async fn system_open(path: String, reveal: bool) -> Result<(), String> {
         return Err(format!("open exited {}", status.code().unwrap_or(-1)));
     }
     Ok(())
+}
+
+/// Persist a base64-encoded image blob to a stable temp location and
+/// return its absolute path. Used by the frontend's image-paste flow:
+/// when the user Cmd+V's a screenshot into a terminal pane, the
+/// clipboard image bytes have nowhere to land in a PTY, so we drop
+/// them on disk and feed the running shell/agent the file path
+/// instead. Claude Code, codex, etc. all accept image paths inline
+/// as prompt context, so the round-trip "screenshot → paste → agent
+/// reads it" is one keystroke for the user.
+///
+/// `extension` is sanitized — only well-known raster formats are
+/// accepted; anything else is coerced to `png` so a malicious or
+/// fat-fingered value can't write `paste-123.sh` (or worse) into
+/// /tmp. Each file gets a millisecond timestamp + a 6-byte random
+/// suffix so two pastes inside the same ms don't collide.
+#[tauri::command]
+pub fn system_save_image_to_temp(
+    base64_bytes: String,
+    extension: String,
+) -> Result<String, String> {
+    let bytes = STANDARD
+        .decode(base64_bytes.as_bytes())
+        .map_err(|e| format!("decode base64: {e}"))?;
+
+    let ext = match extension.to_ascii_lowercase().as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "heic" | "svg" => {
+            extension.to_ascii_lowercase()
+        }
+        _ => "png".to_string(),
+    };
+
+    let dir = std::env::temp_dir().join("gli-paste");
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    // Cheap entropy to disambiguate same-ms pastes without pulling in
+    // a `rand` crate. Two pastes in the same ms is rare but possible
+    // (drag-and-drop of multiple files lands as one event).
+    let nonce: u32 = (stamp as u32).wrapping_mul(2654435761);
+    let path = dir.join(format!("paste-{stamp}-{nonce:08x}.{ext}"));
+
+    fs::write(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Opens a path in a named application (e.g. "Visual Studio Code",

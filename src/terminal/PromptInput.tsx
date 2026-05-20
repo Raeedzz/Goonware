@@ -8,10 +8,18 @@ import {
   type ClipboardEvent,
   type KeyboardEvent,
 } from "react";
-import { fs, type DirEntry } from "@/lib/fs";
+import { fs, system, type DirEntry } from "@/lib/fs";
+import { shellQuotePath } from "@/lib/shellQuote";
 
 export interface PromptInputHandle {
   focus: () => void;
+  /**
+   * Splice plain text into the textarea at the current caret/selection.
+   * Used by the drag-drop path so dropped file paths land in the prompt
+   * the same way Cmd+V'd image paths do — the user can edit / chain
+   * additional args / Enter to submit.
+   */
+  insertText: (text: string) => void;
 }
 
 interface Props {
@@ -371,6 +379,22 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
 
     useImperativeHandle(ref, () => ({
       focus: () => textareaRef.current?.focus(),
+      insertText: (text: string) => {
+        const ta = textareaRef.current;
+        const start = ta?.selectionStart ?? value.length;
+        const end = ta?.selectionEnd ?? value.length;
+        const before = value.slice(0, start);
+        const after = value.slice(end);
+        const next = before + text + after;
+        setValue(next);
+        requestAnimationFrame(() => {
+          const t = textareaRef.current;
+          if (!t) return;
+          t.focus();
+          const cursor = before.length + text.length;
+          t.setSelectionRange(cursor, cursor);
+        });
+      },
     }));
 
     // Auto-focus on mount so the first keystroke after a pane opens
@@ -400,6 +424,45 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
       // Reset the textarea height after multi-line input gets cleared.
       if (textareaRef.current) textareaRef.current.style.height = "auto";
       lastNewlineCountRef.current = 0;
+    };
+
+    /**
+     * Spool a clipboard image blob to disk, then splice the resolved
+     * temp-file path into the textarea at the current selection.
+     * Keeps surrounding whitespace clean so the inserted path is its
+     * own shell token whether the caret was mid-word or in empty space.
+     */
+    const insertImagePathAtSelection = async (
+      file: File,
+      selStart: number,
+      selEnd: number,
+    ) => {
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const ext = imageExtensionFor(file);
+      try {
+        const path = await system.saveImageToTemp(buf, ext);
+        const quoted = shellQuotePath(path);
+        const before = value.slice(0, selStart);
+        const after = value.slice(selEnd);
+        const needLeading = before.length > 0 && !/\s$/.test(before);
+        const needTrailing = after.length > 0 && !/^\s/.test(after);
+        const insert = `${needLeading ? " " : ""}${quoted}${needTrailing ? " " : ""}`;
+        const next = before + insert + after;
+        setValue(next);
+        // Move the caret to right after the inserted path so the user
+        // can immediately keep typing (or Enter to submit).
+        requestAnimationFrame(() => {
+          const ta = textareaRef.current;
+          if (!ta) return;
+          ta.focus();
+          const cursor = before.length + insert.length;
+          ta.setSelectionRange(cursor, cursor);
+        });
+      } catch (err) {
+        // Silent — the user will notice nothing landed and can retry
+        // by Cmd+V'ing again. A toast system would be overkill here.
+        console.error("[prompt] image paste failed", err);
+      }
     };
 
     const applyCompletion = (entry: DirEntry) => {
@@ -845,6 +908,28 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
               }
             }}
             onPaste={(e: ClipboardEvent<HTMLTextAreaElement>) => {
+              // Image paste: macOS Cmd+Shift+Ctrl+4, web-page image copy,
+              // Preview "Copy" — all land here as a DataTransferItem of
+              // kind "file" with an `image/*` MIME. PTYs can't carry
+              // image bytes, so spool them to /tmp and splice the
+              // resolved path into the textarea at the caret. The user
+              // sees `'/tmp/gli-paste/paste-…png' ` appear inline and
+              // can Enter to send it to claude / cat / file / etc.
+              const items = Array.from(e.clipboardData?.items ?? []);
+              const imageItem = items.find(
+                (it) => it.kind === "file" && it.type.startsWith("image/"),
+              );
+              if (imageItem) {
+                const file = imageItem.getAsFile();
+                if (file) {
+                  e.preventDefault();
+                  const ta = e.currentTarget;
+                  const selStart = ta.selectionStart;
+                  const selEnd = ta.selectionEnd;
+                  void insertImagePathAtSelection(file, selStart, selEnd);
+                  return;
+                }
+              }
               if (!onPaste) return;
               const pasted = e.clipboardData.getData("text/plain");
               // Only intercept multi-line pastes — single-line pastes
@@ -974,6 +1059,30 @@ function PromptHighlight({
       {children}
     </div>
   );
+}
+
+/**
+ * Pick a sane file extension for a pasted image blob. Prefers the
+ * extension already in the file name (some browsers attach
+ * `clipboard.png`), then derives from MIME, finally falls back to
+ * PNG — the macOS screenshot tool's default + the most lossless
+ * choice for a paste of unknown provenance.
+ */
+function imageExtensionFor(file: File): string {
+  const fromName = file.name.includes(".")
+    ? file.name.split(".").pop()?.toLowerCase()
+    : "";
+  if (fromName && /^[a-z0-9]{2,5}$/.test(fromName)) return fromName;
+  const mime = file.type.toLowerCase();
+  if (mime === "image/jpeg" || mime === "image/jpg") return "jpg";
+  if (mime === "image/png") return "png";
+  if (mime === "image/gif") return "gif";
+  if (mime === "image/webp") return "webp";
+  if (mime === "image/bmp") return "bmp";
+  if (mime === "image/tiff") return "tiff";
+  if (mime === "image/heic") return "heic";
+  if (mime === "image/svg+xml") return "svg";
+  return "png";
 }
 
 function FolderArrow({ active }: { active: boolean }) {
