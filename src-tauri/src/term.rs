@@ -388,6 +388,16 @@ pub struct RenderFrame {
     /// atomically — without it, multi-line pastes trickle in line by
     /// line and the bottom of a big prompt appears to "load slowly."
     pub bracketed_paste: bool,
+    /// DECTCEM (`ESC[?25h/l`). True iff the running program has the
+    /// cursor visible. Claude / fzf / readline-based pickers hide
+    /// the cursor while their inline UI is open so the user sees
+    /// only the picker's own selection chevron — not a stray block
+    /// caret in the middle of a description row. Without honoring
+    /// this, a spurious cursor paints over picker text wherever
+    /// alacritty's last write landed, which is exactly the
+    /// "█ in the middle of 'Switch between Clau█'" symptom users
+    /// reported.
+    pub cursor_visible: bool,
     /// Sparse: only rows that changed since the last frame. Frontend
     /// keeps the rest from its previous snapshot.
     pub dirty: Vec<DirtyRow>,
@@ -1815,6 +1825,7 @@ pub fn term_start(
                     command_running: s.last_command_running,
                     app_cursor: s.term.mode().contains(TermMode::APP_CURSOR),
                     bracketed_paste: s.term.mode().contains(TermMode::BRACKETED_PASTE),
+                    cursor_visible: s.term.mode().contains(TermMode::SHOW_CURSOR),
                     dirty,
                 };
                 let _ = s.frame_channel.send(frame);
@@ -2195,6 +2206,7 @@ fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
         command_running: cmd_running,
         app_cursor: s.term.mode().contains(TermMode::APP_CURSOR),
         bracketed_paste: s.term.mode().contains(TermMode::BRACKETED_PASTE),
+        cursor_visible: s.term.mode().contains(TermMode::SHOW_CURSOR),
         dirty,
     };
     let _ = s.frame_channel.send(frame);

@@ -63,6 +63,14 @@ export interface RenderFrame {
    * this is set.
    */
   bracketed_paste: boolean;
+  /**
+   * DECTCEM (`ESC[?25h/l`). True when the running program has the
+   * cursor visible. Claude / fzf / readline pickers flip this off
+   * while their inline UI is open — we honor it by suppressing our
+   * own cursor draw so a stray block caret doesn't land in the
+   * middle of a picker description row.
+   */
+  cursor_visible: boolean;
   dirty: DirtyRow[];
 }
 
