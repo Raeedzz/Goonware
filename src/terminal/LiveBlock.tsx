@@ -243,33 +243,28 @@ export function LiveBlock({
         <div
           style={{
             color: "var(--text-secondary)",
-            flex: fill ? "1 1 0" : undefined,
-            minHeight: fill ? 0 : undefined,
-            // Bottom-anchor the canvas when the body fills the pane.
-            // Claude (and every other inline TUI agent) renders the
-            // input + footer at the BOTTOM of its grid; the transcript
-            // above is what scrolls out of view. If the canvas is
-            // taller than the body we want the most recent rows — the
-            // ones with the input box and picker — flush against the
-            // bottom edge, with older rows clipped off the top. With
-            // flex-end + overflow:hidden the canvas anchors at the
-            // bottom and any excess top rows are simply hidden. The
-            // bottom rows (input row + the "Press Ctrl-C again" line
-            // claude paints below it) stay visible no matter how tall
-            // the transcript grows.
+            // Fill mode: `flex: 1 1 auto` — basis is the canvas's
+            // natural height, so the body grows with its content.
+            // The OUTER scroll container handles overflow, never this
+            // body. Critical: do NOT set `minHeight: 0` here — combined
+            // with the default `flex-shrink: 1` on the CanvasGrid
+            // wrapper, that would let flex layout cap the canvas height
+            // at the body's viewport allotment. The wrapper's
+            // ResizeObserver would then push the shrunk height into
+            // `renderer.resize()` and the bottom rows of the canvas
+            // (claude's input box + footer) would simply never be
+            // painted. flex-end keeps the canvas hugging the bottom of
+            // the body whenever it IS shorter than the body — so a
+            // freshly-started agent's input row sits flush against the
+            // agent status bar below instead of floating in the middle.
+            flex: fill ? "1 1 auto" : undefined,
             display: fill ? "flex" : undefined,
             flexDirection: fill ? "column" : undefined,
             justifyContent: fill ? "flex-end" : undefined,
-            overflow: fill ? "hidden" : undefined,
-            // Always clip horizontally. The CanvasGrid inside can resize
-            // smoothly while the PTY's cols are still settling (the
-            // SIGWINCH is debounced — see BlockTerminal), and during
-            // that window the canvas may briefly render content that
-            // assumed a wider grid. Without this clip the rightmost
-            // cells would visually spill out of the LiveBlock body and
-            // — when the right sidebar is open — read as "text going
-            // behind the sidebar." Vertical scroll behaviour is
-            // unchanged for the fill (alt-screen) case.
+            // Horizontal clip stays — the CanvasGrid can briefly
+            // render at an over-wide grid while the SIGWINCH debounce
+            // settles, and without this the right edge spills under
+            // the right sidebar.
             overflowX: "hidden",
           }}
         >
