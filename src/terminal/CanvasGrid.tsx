@@ -316,7 +316,12 @@ export function CanvasGrid({
           cursor = {
             row: cursorRowInWindow,
             col: f.cursor_col,
-            visible: true,
+            // Honor DECTCEM. Claude hides the cursor while its slash-
+            // command picker is open; without this gate a spurious
+            // block caret paints over whatever picker cell happens to
+            // sit at (cursor_row, cursor_col) and the user sees a
+            // "stuck" cursor in the middle of a description.
+            visible: f.cursor_visible !== false,
           };
         }
       }
@@ -334,7 +339,11 @@ export function CanvasGrid({
         rows: f.dirty,
         cols: f.cols,
         seq: f.seq,
-        cursor: { row: f.cursor_row, col: f.cursor_col, visible: true },
+        cursor: {
+          row: f.cursor_row,
+          col: f.cursor_col,
+          visible: f.cursor_visible !== false,
+        },
         selection: sel,
       });
     } else {
