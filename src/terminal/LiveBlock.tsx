@@ -244,7 +244,22 @@ export function LiveBlock({
             color: "var(--text-secondary)",
             flex: fill ? "1 1 0" : undefined,
             minHeight: fill ? 0 : undefined,
-            overflow: fill ? "auto" : undefined,
+            // Bottom-anchor the canvas when the body fills the pane.
+            // Claude (and every other inline TUI agent) renders the
+            // input + footer at the BOTTOM of its grid; the transcript
+            // above is what scrolls out of view. If the canvas is
+            // taller than the body we want the most recent rows — the
+            // ones with the input box and picker — flush against the
+            // bottom edge, with older rows clipped off the top. With
+            // flex-end + overflow:hidden the canvas anchors at the
+            // bottom and any excess top rows are simply hidden. The
+            // bottom rows (input row + the "Press Ctrl-C again" line
+            // claude paints below it) stay visible no matter how tall
+            // the transcript grows.
+            display: fill ? "flex" : undefined,
+            flexDirection: fill ? "column" : undefined,
+            justifyContent: fill ? "flex-end" : undefined,
+            overflow: fill ? "hidden" : undefined,
             // Always clip horizontally. The CanvasGrid inside can resize
             // smoothly while the PTY's cols are still settling (the
             // SIGWINCH is debounced — see BlockTerminal), and during
