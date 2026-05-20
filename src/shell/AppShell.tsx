@@ -15,6 +15,7 @@ import { useVisibleTerminalSet } from "@/hooks/useVisibleTerminalSet";
 import { useTerminalRunningPoll } from "@/terminal/terminalActivityStore";
 import { useAgentHookSubscription } from "@/state/agentActivityStore";
 import { useAppDispatch, useAppState } from "@/state/AppState";
+import { fs } from "@/lib/fs";
 import {
   RIGHT_DEFAULT,
   RIGHT_MAX,
@@ -67,7 +68,33 @@ export function AppShell() {
     rightPanelCollapsed,
     sidebarWidth,
     rightPanelWidth,
+    projects,
   } = useAppState();
+  const dispatch = useAppDispatch();
+
+  // Backfill auto-detected favicons / app icons for projects that were
+  // added before the scan existed (faviconDataUri is null and the user
+  // hasn't picked a HugeIcon override). Runs once per session per
+  // project; the result persists so subsequent launches are cheap.
+  useEffect(() => {
+    let cancelled = false;
+    for (const project of projects) {
+      if (project.faviconDataUri || project.iconName) continue;
+      fs.scanProjectIcon(project.path)
+        .then((faviconDataUri) => {
+          if (cancelled || !faviconDataUri) return;
+          dispatch({
+            type: "update-project",
+            id: project.id,
+            patch: { faviconDataUri },
+          });
+        })
+        .catch(() => {});
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [projects, dispatch]);
 
   // Guard against any pathway that lands `undefined`/`NaN` here — an
   // invalid CSS length in `grid-template-columns` collapses the whole

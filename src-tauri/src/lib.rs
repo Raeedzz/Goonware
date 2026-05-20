@@ -174,6 +174,7 @@ pub fn run() {
             fs::fs_read_dir,
             fs::fs_read_text_file,
             fs::fs_write_text_file,
+            fs::fs_scan_project_icon,
             fs::fs_cwd,
             fs::system_home_dir,
             fs::system_open,

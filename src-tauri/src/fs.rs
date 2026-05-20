@@ -95,6 +95,159 @@ fn decode_text(bytes: &[u8]) -> Result<String, String> {
         .map_err(|_| "file is not valid UTF-8 — open with the default app instead".into())
 }
 
+/// Look inside a project folder for a likely "app icon" — favicon,
+/// Tauri/Electron app icon, Next.js icon, etc. — and return it as a
+/// `data:` URI so the sidebar can render the project's real icon
+/// instead of the first-letter glyph fallback. Returns `Ok(None)` when
+/// nothing was found; never throws on missing files, only on unreadable
+/// paths the caller passed in.
+///
+/// The candidate list is ordered: Tauri icons first (so GLI itself
+/// shows its app icon), then common web favicon locations across the
+/// frameworks we see in real projects. We cap at 256 KiB per icon so
+/// a stray huge PNG can't bloat persisted state.
+#[tauri::command]
+pub fn fs_scan_project_icon(path: String) -> Result<Option<String>, String> {
+    use std::path::PathBuf;
+    let root = PathBuf::from(&path);
+    if !root.is_dir() {
+        return Ok(None);
+    }
+
+    const CANDIDATES: &[&str] = &[
+        // Tauri (medium size first so the sidebar gets a crisp icon
+        // without paying for the 1024 master).
+        "src-tauri/icons/icon-128.png",
+        "src-tauri/icons/icon-256.png",
+        "src-tauri/icons/icon.png",
+        "src-tauri/icons/icon-64.png",
+        "src-tauri/icons/icon-32.png",
+        "src-tauri/icons/icon-512.png",
+        // Vite / generic web — `public/`
+        "public/favicon.svg",
+        "public/icon.svg",
+        "public/favicon.png",
+        "public/icon.png",
+        "public/apple-touch-icon.png",
+        "public/favicon.ico",
+        "public/logo.svg",
+        "public/logo.png",
+        // SvelteKit — `static/`
+        "static/favicon.svg",
+        "static/favicon.png",
+        "static/favicon.ico",
+        "static/logo.svg",
+        "static/logo.png",
+        // Next.js app router
+        "app/icon.svg",
+        "app/icon.png",
+        "app/favicon.ico",
+        "app/apple-icon.png",
+        // Angular / Vue / generic src layouts
+        "src/favicon.ico",
+        "src/assets/icon.svg",
+        "src/assets/icon.png",
+        "src/assets/logo.svg",
+        "src/assets/logo.png",
+        "src/assets/favicon.svg",
+        "src/assets/favicon.png",
+        // Monorepo conventions (Turbo / Nx / pnpm-workspaces)
+        "apps/web/public/favicon.svg",
+        "apps/web/public/favicon.png",
+        "apps/web/public/favicon.ico",
+        "apps/web/public/icon.svg",
+        "apps/web/public/icon.png",
+        "apps/app/public/favicon.svg",
+        "apps/app/public/favicon.png",
+        "apps/app/public/favicon.ico",
+        "apps/frontend/public/favicon.svg",
+        "apps/frontend/public/favicon.png",
+        "apps/frontend/public/favicon.ico",
+        "frontend/public/favicon.svg",
+        "frontend/public/favicon.png",
+        "frontend/public/favicon.ico",
+        "client/public/favicon.svg",
+        "client/public/favicon.png",
+        "client/public/favicon.ico",
+        "web/public/favicon.svg",
+        "web/public/favicon.png",
+        "web/public/favicon.ico",
+        // Common asset dirs
+        "assets/icon.svg",
+        "assets/icon.png",
+        "assets/logo.svg",
+        "assets/logo.png",
+        "assets/favicon.svg",
+        "assets/favicon.png",
+        "images/logo.svg",
+        "images/logo.png",
+        "images/icon.svg",
+        "images/icon.png",
+        "media/logo.svg",
+        "media/logo.png",
+        "media/icon.svg",
+        "media/icon.png",
+        "docs/logo.svg",
+        "docs/logo.png",
+        "resources/icon.png",
+        "resources/icon.svg",
+        // Electron
+        "build/icon.png",
+        "build/icons/icon.png",
+        "electron/build/icon.png",
+        "electron/icon.png",
+        // Repo root
+        "icon.svg",
+        "icon.png",
+        "favicon.svg",
+        "favicon.png",
+        "favicon.ico",
+        "logo.svg",
+        "logo.png",
+    ];
+
+    const MAX_BYTES: u64 = 256 * 1024;
+
+    for rel in CANDIDATES {
+        let p = root.join(rel);
+        let md = match fs::metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !md.is_file() || md.len() == 0 || md.len() > MAX_BYTES {
+            continue;
+        }
+        let bytes = match fs::read(&p) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mime = mime_for_path(rel);
+        let b64 = STANDARD.encode(&bytes);
+        return Ok(Some(format!("data:{mime};base64,{b64}")));
+    }
+
+    Ok(None)
+}
+
+fn mime_for_path(rel: &str) -> &'static str {
+    let lower = rel.to_ascii_lowercase();
+    if lower.ends_with(".svg") {
+        "image/svg+xml"
+    } else if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".ico") {
+        "image/x-icon"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    }
+}
+
 #[tauri::command]
 pub fn fs_cwd() -> Result<String, String> {
     std::env::current_dir()
