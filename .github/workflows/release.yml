@@ -226,8 +226,17 @@ jobs:
           # Apple Developer ID signing + notarization. APPLE_SIGNING_IDENTITY
           # is populated by the "Resolve signing identity name" step
           # above, not from a raw secret.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          #
+          # APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD are
+          # intentionally NOT passed to tauri-action. When they are,
+          # tauri's bundle_dmg.sh creates its own throwaway keychain
+          # for DMG signing, imports the cert there, but skips the
+          # `security set-key-partition-list` step — causing codesign
+          # to hang waiting for interactive keychain approval that no
+          # one is around to grant. Instead, the dedicated "Import
+          # Apple Developer certificate" step above puts the cert
+          # into build.keychain (with the partition list set), and
+          # codesign finds it there via APPLE_SIGNING_IDENTITY.
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
