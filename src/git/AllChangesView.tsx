@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "motion/react";
 import { git } from "@/lib/git";
-import { DiffBody, parseUnifiedDiff, type DiffLine } from "./DiffView";
+import { DiffBody } from "./DiffView";
+import { parseUnifiedDiff, type DiffLine } from "./diff-parse";
 
 /**
  * Single scrollable view of every uncommitted change in the worktree
