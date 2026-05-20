@@ -57,7 +57,18 @@ export function IconPickerDialog({
       return;
     }
     setDraftName(targetName);
-    const t = window.setTimeout(() => inputRef.current?.focus(), 80);
+    // Renaming is the most common reason to open this dialog, so focus
+    // the name input and pre-select its text — users can immediately
+    // type a new label and hit Enter. Falls back to the icon search
+    // when the row isn't renameable (e.g. read-only callers).
+    const t = window.setTimeout(() => {
+      if (onRename && nameRef.current) {
+        nameRef.current.focus();
+        nameRef.current.select();
+      } else {
+        inputRef.current?.focus();
+      }
+    }, 80);
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
@@ -66,7 +77,7 @@ export function IconPickerDialog({
       window.clearTimeout(t);
       window.removeEventListener("keydown", onKey);
     };
-  }, [open, onClose, targetName]);
+  }, [open, onClose, onRename, targetName]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
