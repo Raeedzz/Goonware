@@ -30,6 +30,10 @@ import {
 } from "./terminalActivityStore";
 import { detectClaude } from "@/lib/claudeUsage";
 import { termResetGrid } from "@/lib/tauri/term";
+import {
+  agentScrollContainerStyle,
+  shouldRenderBlockList,
+} from "./agentScrollLayout";
 
 /** Command names that always run as an interactive TUI agent. */
 function isAgentCommand(command: string): boolean {
@@ -1256,32 +1260,21 @@ export function BlockTerminal({
         <div
           ref={scrollContainerRef}
           onScroll={onScrollContainerScroll}
-          style={{
-            flex: 1,
-            minHeight: 0,
-            display: "flex",
-            flexDirection: "column",
-            overflowY: "auto",
-            overflowX: "hidden",
-          }}
+          style={agentScrollContainerStyle()}
         >
-          {/* Hide BlockList while an agent owns the foreground. Two
-              reasons:
-              (1) Closed agent blocks now carry full scrollback (see
-                  `snapshot_transcript`), so a recently-closed claude
-                  block can be hundreds of rows tall. Stacked above a
-                  flex:1-1-0 LiveBlock with minHeight:0, BlockList eats
-                  the entire vertical budget and the new agent's
-                  LiveBlock collapses — the user sees the running
-                  counter "cut in half" at the visible bottom and the
-                  agent's input box is below the pane.
-              (2) Visually it matches how claude renders in a real
-                  terminal: the agent owns the screen, history is what
-                  you see *after* the agent exits. The closed block is
-                  still in `blocks` state, so the moment the user
-                  Ctrl+Cs back to the shell, every prior block
-                  (including the agent transcript) re-appears. */}
-          {!foregroundIsAgent && <BlockList blocks={blocks} />}
+          {/* BlockList must render in BOTH shell and agent modes so the
+              user can always scroll back into closed-block history.
+              The earlier "hide it during agent mode" workaround broke
+              scrollback while a live agent was running (user-reported
+              "i cant scroll in the terminal while an agent is
+              running"). Squashing of the LiveBlock by a tall BlockList
+              is now prevented by the fill-mode LiveBlock's hard
+              min-height: 100cqh (see `liveBlockOuterStyle`), not by
+              hiding history. `shouldRenderBlockList` always returns
+              true and exists so the regression is pinned by a test. */}
+          {shouldRenderBlockList(foregroundIsAgent) && (
+            <BlockList blocks={blocks} />
+          )}
           {liveFrame?.command_running && !exited && (
             <LiveBlock
               command={activeCommand}

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { CanvasGrid } from "./CanvasGrid";
 import { CellRow } from "./CellRow";
 import { formatCwd, formatDuration } from "./formatBlockMeta";
+import { liveBlockOuterStyle } from "./agentScrollLayout";
 import type { DirtyRow, RenderFrame } from "./types";
 
 interface Props {
@@ -165,11 +166,11 @@ export function LiveBlock({
   return (
     <div
       style={{
-        flex: fill ? "1 1 0" : "0 0 auto",
-        minHeight: fill ? 0 : undefined,
-        overflow: fill ? "hidden" : undefined,
-        display: "flex",
-        flexDirection: "column",
+        // Outer-flex sizing comes from agentScrollLayout so the
+        // squash-prevention invariant (fill mode must have a hard,
+        // viewport-sized min-height and zero flex-shrink) stays
+        // pinned by tests in agentScrollLayout.test.ts.
+        ...liveBlockOuterStyle(fill),
         padding: "var(--space-2) var(--space-3)",
         borderTop: "var(--border-1)",
         fontFamily: "var(--font-mono)",
