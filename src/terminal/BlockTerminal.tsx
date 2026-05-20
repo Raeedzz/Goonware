@@ -1265,7 +1265,23 @@ export function BlockTerminal({
             overflowX: "hidden",
           }}
         >
-          <BlockList blocks={blocks} />
+          {/* Hide BlockList while an agent owns the foreground. Two
+              reasons:
+              (1) Closed agent blocks now carry full scrollback (see
+                  `snapshot_transcript`), so a recently-closed claude
+                  block can be hundreds of rows tall. Stacked above a
+                  flex:1-1-0 LiveBlock with minHeight:0, BlockList eats
+                  the entire vertical budget and the new agent's
+                  LiveBlock collapses — the user sees the running
+                  counter "cut in half" at the visible bottom and the
+                  agent's input box is below the pane.
+              (2) Visually it matches how claude renders in a real
+                  terminal: the agent owns the screen, history is what
+                  you see *after* the agent exits. The closed block is
+                  still in `blocks` state, so the moment the user
+                  Ctrl+Cs back to the shell, every prior block
+                  (including the agent transcript) re-appears. */}
+          {!foregroundIsAgent && <BlockList blocks={blocks} />}
           {liveFrame?.command_running && !exited && (
             <LiveBlock
               command={activeCommand}
