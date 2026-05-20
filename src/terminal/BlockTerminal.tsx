@@ -605,12 +605,18 @@ export function BlockTerminal({
       const reserved = inputChrome + liveBlockChrome;
       const usableHeight = Math.max(120, rect.height - reserved);
       const cellHeight = 13 * 1.35;
-      // JetBrains Mono at 13px advances ~7.8px per glyph. Be slightly
-      // conservative (0.62) so we ask the PTY for fewer columns than the
-      // container can technically fit — better to leave a 1–2px gutter
-      // on the right than to have claude paint a column that gets
-      // clipped, which reads as "broken / cut off".
-      const cellWidth = 13 * 0.62;
+      // JetBrains Mono at 13px has a raw glyph advance of ~7.8px, but
+      // the atlas rounds the physical-pixel advance UP and divides by
+      // DPR, so the rendered cell width in CSS px is
+      // `ceil(advance * dpr) / dpr` — usually 8.0, sometimes 8.5
+      // depending on font hinting + DPR rounding. Picking 8.6 (= 13 *
+      // ~0.66) for the cols estimate over-estimates the cell on the
+      // common DPR=2 path by 0.6 CSS px, which costs ~1 cell of right-
+      // edge gutter, but guarantees the PTY never asks for more cols
+      // than the canvas can actually render. The prior 0.62 multiplier
+      // undercounted on the 8.5-cell DPR path and was the direct cause
+      // of the "fresh sta[te]" right-edge clipping in agent panes.
+      const cellWidth = 13 * 0.66;
       const visibleRows = Math.max(8, Math.floor(usableHeight / cellHeight));
       const AGENT_ROW_HEADROOM = 80;
       const rows = foregroundIsAgent
@@ -645,9 +651,21 @@ export function BlockTerminal({
     //
     // First fire is synchronous so the PTY has correct dimensions
     // before its first frame; subsequent fires go through the timer.
+    //
+    // Step vs drag: a sidebar-collapse / right-panel-collapse click
+    // produces a single ResizeObserver event with a large width delta
+    // (the whole pane jumps by SIDEBAR_DEFAULT / RIGHT_DEFAULT px in
+    // one frame). Without special casing, the user would see 140 ms
+    // of stale-grid overflow before the PTY repaints into the new
+    // size — text spills past the new container boundary the entire
+    // debounce window. Detection: a delta >= STEP_DELTA_PX in either
+    // dimension is treated as a step and fires immediately;
+    // anything smaller goes through the trailing-edge debounce.
     const RESIZE_DEBOUNCE_MS = 140;
+    const STEP_DELTA_PX = 40;
     let timerId: number | null = null;
     let pendingDims: { rows: number; cols: number } | null = null;
+    let lastObservedRect: { width: number; height: number } | null = null;
 
     const fireResize = () => {
       timerId = null;
@@ -674,8 +692,23 @@ export function BlockTerminal({
     };
 
     scheduleResize(0);
+    lastObservedRect = (() => {
+      const r = el.getBoundingClientRect();
+      return { width: r.width, height: r.height };
+    })();
 
-    const observer = new ResizeObserver(() => scheduleResize(RESIZE_DEBOUNCE_MS));
+    const observer = new ResizeObserver((entries) => {
+      const cr = entries[0].contentRect;
+      const dx = lastObservedRect
+        ? Math.abs(cr.width - lastObservedRect.width)
+        : Infinity;
+      const dy = lastObservedRect
+        ? Math.abs(cr.height - lastObservedRect.height)
+        : 0;
+      lastObservedRect = { width: cr.width, height: cr.height };
+      const isStep = dx >= STEP_DELTA_PX || dy >= STEP_DELTA_PX;
+      scheduleResize(isStep ? 0 : RESIZE_DEBOUNCE_MS);
+    });
     observer.observe(el);
     return () => {
       observer.disconnect();
