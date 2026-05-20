@@ -34,6 +34,17 @@ logs
 .env
 .env.*
 !.env.example
+# Certificates / private keys (any format, anywhere in the tree)
+*.p12
+*.pfx
+*.pem
+*.cer
+*.crt
+*.key
+# Common secret directories
+secrets/
+**/secrets/
+GLI_secrets/
 
 # RLI runtime data (per-project worktrees, local DB, etc.)
 .rli/
