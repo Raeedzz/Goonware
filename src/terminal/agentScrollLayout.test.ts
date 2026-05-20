@@ -6,21 +6,31 @@ import {
 } from "./agentScrollLayout";
 
 /**
- * Regression guard: the user reported "i cant scroll in the terminal
- * while an agent is running" after PR #10 hid <BlockList /> entirely
- * during agent sessions. These tests pin three invariants so the
- * regression can't sneak back:
+ * Regression guards. Two user-reported bugs are pinned here:
+ *
+ *   A. "i cant scroll in the terminal while an agent is running" —
+ *      caused by PR #10 hiding <BlockList /> during agent sessions.
+ *   B. "the bottom part of the agent is being cut, I cant scroll" —
+ *      caused by the LiveBlock body's `flex: 1 1 0 + overflow: hidden`
+ *      capping the canvas wrapper's height. The ResizeObserver on the
+ *      wrapper pushed the shrunk height into `renderer.resize()`, and
+ *      claude's input row (at the bottom of its grid) was never painted.
+ *
+ * The invariants below ensure both regressions stay fixed:
  *
  *   1. BlockList renders regardless of agent state — the user must be
  *      able to scroll back into closed-block history during a live
  *      agent session.
  *   2. The fill-mode LiveBlock has a hard, viewport-sized minimum
- *      height (`100cqh`). Without this, a tall sibling BlockList
- *      would squash the LiveBlock to zero (the original PR #9 bug
- *      that PR #10 tried to side-step the wrong way).
+ *      height (`100cqh`) — a freshly-started agent fills the pane and
+ *      a tall sibling BlockList can't squash it to zero.
  *   3. The fill-mode LiveBlock NEVER combines `flex-shrink: 1` with
  *      `min-height: 0` — that's literally the squash recipe.
- *   4. The scroll container declares `container-type: size` so
+ *   4. The fill-mode LiveBlock has NO `overflow: hidden`. Otherwise
+ *      the canvas inside gets shrunk by flex layout and the
+ *      ResizeObserver clips the bottom rows of the agent grid (bug B).
+ *      The OUTER scroll container is what owns scrolling.
+ *   5. The scroll container declares `container-type: size` so
  *      `100cqh` resolves against its viewport.
  */
 
@@ -53,6 +63,18 @@ describe("liveBlockOuterStyle — fill mode cannot be squashed by sibling histor
     const style = liveBlockOuterStyle(true);
     expect(style.display).toBe("flex");
     expect(style.flexDirection).toBe("column");
+  });
+
+  test("fill mode does NOT set overflow: hidden — that clips the canvas", () => {
+    // Bug B regression: `overflow: hidden` here combined with the
+    // body's `flex: 1 1 0` caps the canvas wrapper's height at the
+    // body viewport. The CanvasGrid wrapper's ResizeObserver then
+    // hands the shrunk height to `renderer.resize()` and any rows
+    // past that height — claude's input box, the "Press Ctrl-C
+    // again" hint — are silently never painted.
+    const style = liveBlockOuterStyle(true);
+    expect(style.overflow).toBeUndefined();
+    expect(style.overflowY).toBeUndefined();
   });
 
   test("non-fill mode (shell command output) sizes to content", () => {

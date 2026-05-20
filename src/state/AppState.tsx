@@ -27,68 +27,17 @@ import {
 import { loadState, saveState } from "../lib/persistence";
 
 /* ------------------------------------------------------------------
-   First-launch defaults — one project pointing at the current cwd,
-   one worktree using the project root (no detached worktree yet),
-   one terminal tab. The user replaces this with ⌘O.
+   First-launch state — totally blank. The user opens their first
+   project via ⌘O, and all subsequent state persists from there.
    ------------------------------------------------------------------ */
 
-const DEFAULT_PROJECT_ID: ProjectId = "p_default";
-const DEFAULT_WORKTREE_ID: WorktreeId = "w_default";
-const DEFAULT_TAB_ID = "t_default";
-const DEFAULT_PTY_PRIMARY = "pty_default_primary";
-const DEFAULT_PTY_SECONDARY = "pty_default_secondary";
-
-const DEFAULT_PROJECT: Project = {
-  id: DEFAULT_PROJECT_ID,
-  path: "/Users/raeedz/Developer/RLI",
-  name: "GLI",
-  glyph: "G",
-  faviconDataUri: null,
-  pinned: false,
-  expanded: true,
-};
-
-const DEFAULT_WORKTREE: Worktree = {
-  id: DEFAULT_WORKTREE_ID,
-  projectId: DEFAULT_PROJECT_ID,
-  branch: "main",
-  name: "main",
-  path: "/Users/raeedz/Developer/RLI",
-  changeCount: 0,
-  agentStatus: "idle",
-  agentCli: null,
-  createdAt: Date.now(),
-  tabIds: [DEFAULT_TAB_ID],
-  activeTabId: DEFAULT_TAB_ID,
-  rightPanel: "files",
-  rightSplitPct: 60,
-  secondaryTab: "terminal",
-  secondaryPtyId: DEFAULT_PTY_SECONDARY,
-  secondaryTerminals: [DEFAULT_PTY_SECONDARY],
-  secondaryActiveTerminalId: DEFAULT_PTY_SECONDARY,
-};
-
-const DEFAULT_TAB: Tab = {
-  id: DEFAULT_TAB_ID,
-  worktreeId: DEFAULT_WORKTREE_ID,
-  kind: "terminal",
-  title: "main",
-  summary: "ready",
-  summaryUpdatedAt: Date.now(),
-  ptyId: DEFAULT_PTY_PRIMARY,
-  detectedCli: null,
-  agentStatus: "idle",
-};
-
 export const INITIAL_STATE: AppState = {
-  projects: { [DEFAULT_PROJECT_ID]: DEFAULT_PROJECT },
-  projectOrder: [DEFAULT_PROJECT_ID],
-  worktrees: { [DEFAULT_WORKTREE_ID]: DEFAULT_WORKTREE },
-  tabs: { [DEFAULT_TAB_ID]: DEFAULT_TAB },
-  activeProjectId: DEFAULT_PROJECT_ID,
-  activeWorktreeByProject: {
-    [DEFAULT_PROJECT_ID]: DEFAULT_WORKTREE_ID,
-  },
+  projects: {},
+  projectOrder: [],
+  worktrees: {},
+  tabs: {},
+  activeProjectId: null,
+  activeWorktreeByProject: {},
   archivedWorktrees: [],
   sidebarCollapsed: false,
   rightPanelCollapsed: false,
@@ -235,7 +184,21 @@ export function reducer(state: AppState, action: AppAction): AppState {
     /* Worktrees --------------------------------------------------- */
 
     case "add-worktree": {
-      const w = action.worktree;
+      const incoming = action.worktree;
+      // Rust's worktree_create returns `secondaryPtyId` but no
+      // `secondaryTerminals` array, so seed it here — otherwise the
+      // SecondaryPanel renders zero tabs and the user has to click +
+      // before the bottom-left terminal appears.
+      const hasList =
+        Array.isArray(incoming.secondaryTerminals) &&
+        incoming.secondaryTerminals.length > 0;
+      const w: Worktree = hasList
+        ? incoming
+        : {
+            ...incoming,
+            secondaryTerminals: [incoming.secondaryPtyId],
+            secondaryActiveTerminalId: incoming.secondaryPtyId,
+          };
       const tabs = { ...state.tabs };
       // Caller is expected to also dispatch open-tab for w.tabIds, but
       // for convenience let new worktrees come with their tabs included
@@ -295,7 +258,17 @@ export function reducer(state: AppState, action: AppAction): AppState {
     }
 
     case "restore-worktree": {
-      const w = action.worktree;
+      const incoming = action.worktree;
+      const hasList =
+        Array.isArray(incoming.secondaryTerminals) &&
+        incoming.secondaryTerminals.length > 0;
+      const w: Worktree = hasList
+        ? incoming
+        : {
+            ...incoming,
+            secondaryTerminals: [incoming.secondaryPtyId],
+            secondaryActiveTerminalId: incoming.secondaryPtyId,
+          };
       const archivedWorktrees = state.archivedWorktrees.filter(
         (a) => a.id !== action.archiveId,
       );
