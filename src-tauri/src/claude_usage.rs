@@ -1,86 +1,38 @@
-//! Real Claude usage scanner — reads Claude Code's own transcript files
-//! at `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl` and
-//! aggregates token counts within the rolling 5-hour usage window.
+//! Claude usage tracking — sourced from Anthropic's OAuth usage
+//! endpoint, NOT from local transcript files.
 //!
-//! This replaces the previous PTY-banner-sniff heuristic, which only
-//! knew "claude was launched at time X in this pane" — useless for
-//! actual rate-limit budgeting because:
+//! We used to walk `~/.claude/projects/<encoded-cwd>/*.jsonl` to add
+//! up per-assistant-turn token counts in the rolling 5-hour window.
+//! That broke under macOS Sequoia's App Data Isolation: each new
+//! Claude session writes a fresh `.jsonl` with a unique
+//! `com.apple.macl` xattr, and the first read of each one triggers a
+//! "GLI would like to access data from other apps" prompt. So users
+//! got a permission popup every time they opened a new agent.
 //!
-//!   - it didn't see usage from claude sessions launched outside RLI
-//!   - it didn't reset on a real window roll-over (5h after first msg)
-//!   - it had no token visibility at all
+//! The fix mirrors what `notchi` does. We read Claude Code's cached
+//! OAuth token from the macOS Keychain (one-time "Always Allow"
+//! prompt, native keychain ACL — completely separate from TCC File
+//! Access) and call `https://api.anthropic.com/api/oauth/usage`
+//! directly. The response carries the exact `five_hour` and
+//! `seven_day` utilization percentages that Claude.ai's settings
+//! page shows.
 //!
-//! Schema (one JSON per line, append-only). The fields we care about:
-//!
-//! ```json
-//! {
-//!   "type": "assistant",
-//!   "timestamp": "2026-04-28T01:16:32.435Z",
-//!   "message": {
-//!     "model": "claude-opus-4-7",
-//!     "usage": {
-//!       "input_tokens": 6,
-//!       "output_tokens": 190,
-//!       "cache_read_input_tokens": 14779,
-//!       "cache_creation_input_tokens": 14181
-//!     }
-//!   }
-//! }
-//! ```
-//!
-//! User messages don't carry usage; we only count `assistant` rows.
+//! The lower-cadence `claude_activity_summary` command (tab subtitle
+//! summarizer) still reads transcripts since there's no API
+//! equivalent for "what is the user currently working on" — that's
+//! covered by the existing `autoSummarize` setting users can switch
+//! off if the prompts are unwelcome.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, ErrorKind};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::helper_agent::{run_inline, HelperMode};
 
-/// Process-wide kill switch for transcript scanning. Set to true the
-/// first time we hit a permission-style error reading ~/.claude/ —
-/// that's macOS Sequoia's "App Data" TCC popup denying us access
-/// because the JSONL files have a different "responsible bundle" MACL
-/// than `dev.raeedz.gli`. The kernel pops up the consent dialog
-/// BEFORE the read returns, so we can't prevent the first prompt, but
-/// flipping this flag prevents the polling loop from retriggering the
-/// dialog 12 times per minute for every new Claude session whose
-/// transcript file has a fresh MACL UUID. The flag resets on app
-/// restart so users who later grant Full Disk Access don't have to
-/// flush state manually.
-static APP_DATA_BLOCKED: AtomicBool = AtomicBool::new(false);
-
-/// True if the last `claude_usage_status` call hit an access error
-/// and switched off the transcript scan. Surfaced as a field on the
-/// returned status so the frontend can show a "grant Full Disk
-/// Access" hint without re-attempting the read and re-spawning the
-/// TCC popup.
-fn is_app_data_blocked() -> bool {
-    APP_DATA_BLOCKED.load(Ordering::Relaxed)
-}
-
-fn note_app_data_error(err: &std::io::Error, path: &Path) {
-    // PermissionDenied is the canonical error after the user clicks
-    // "Don't Allow" on the App Data popup. NotFound means the file
-    // genuinely isn't there (no transcripts yet) — that's not a TCC
-    // issue and shouldn't trip the breaker. Anything else (e.g.
-    // operation timed out while the popup was open) is suspicious
-    // enough to back off too.
-    if matches!(err.kind(), ErrorKind::PermissionDenied) {
-        if !APP_DATA_BLOCKED.swap(true, Ordering::Relaxed) {
-            eprintln!(
-                "[claude-usage] disabling transcript scan after permission \
-                 error on {}: {err}",
-                path.display()
-            );
-        }
-    }
-}
 
 /// Anthropic's enforced 5-hour session length. A "session" in
 /// Claude.ai's UI = a 5h timer that starts on your first message after
@@ -88,13 +40,6 @@ fn note_app_data_error(err: &std::io::Error, path: &Path) {
 /// chronologically, restart the session anchor whenever 5h has elapsed
 /// since the current anchor.
 const WINDOW_MS: i64 = 5 * 60 * 60 * 1000;
-
-/// We need to look back far enough to find the boundary BEFORE the
-/// current session — i.e. up to 5h of in-session messages plus a
-/// generous gap for the previous session. 12h is enough to anchor
-/// any current session correctly even if the user has been active
-/// continuously for hours.
-const LOOKBACK_MS: i64 = 12 * 60 * 60 * 1000;
 
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct ModelBreakdown {
@@ -105,7 +50,7 @@ pub struct ModelBreakdown {
     pub cache_creation_tokens: u64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Clone)]
 pub struct ClaudeUsageStatus {
     /// True when at least one assistant message was found in the
     /// window. When false the pill should be hidden.
@@ -143,329 +88,196 @@ pub struct ClaudeUsageStatus {
     pub real_captured_at_ms: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CapturedRateLimit {
-    used_percentage: Option<f32>,
-    resets_at: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CapturedRateLimits {
-    five_hour: Option<CapturedRateLimit>,
-    seven_day: Option<CapturedRateLimit>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CapturedUsage {
-    rate_limits: Option<CapturedRateLimits>,
-    captured_at_ms: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TranscriptLine {
-    #[serde(default, rename = "type")]
-    line_type: String,
-    #[serde(default)]
-    timestamp: Option<String>,
-    #[serde(default)]
-    message: Option<MessagePayload>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MessagePayload {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    usage: Option<UsageBlock>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct UsageBlock {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<u64>,
-    #[serde(default)]
-    cache_creation_input_tokens: Option<u64>,
-}
-
-/// One assistant message worth of usage data, retained as a flat row
-/// so we can sort them across files before walking session boundaries.
-#[derive(Debug, Clone)]
-struct UsageRow {
-    ts_ms: i64,
-    model: Option<String>,
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_creation: u64,
-}
 
 #[tauri::command]
-pub fn claude_usage_status() -> Result<ClaudeUsageStatus, String> {
+pub async fn claude_usage_status() -> Result<ClaudeUsageStatus, String> {
+    // OAuth-API path (notchi-style). We avoid reading
+    // `~/.claude/projects/*.jsonl` entirely — those files carry
+    // macOS App Data MACL xattrs unique to each Claude session, and
+    // the first read of each one triggers a "GLI would like to
+    // access data from other apps" prompt. By calling Anthropic's
+    // OAuth usage endpoint directly we get the same five_hour /
+    // seven_day numbers that the official UI shows, sourced from a
+    // single Keychain item the user authorizes once with "Always
+    // Allow".
+    //
+    // Failure modes are all benign: missing Claude Code install →
+    // empty status (pill self-hides), expired/missing OAuth token →
+    // empty status, network down → cached previous response if we
+    // have one, otherwise empty status.
+    Ok(fetch_oauth_usage().await.unwrap_or_default())
+}
+
+/// Cache the resolved `claude --version` output so we don't fork a
+/// subprocess on every poll. The version is stable for the lifetime
+/// of the GLI process (a `claude` upgrade in between would just
+/// produce a slightly-stale UA string, which is benign).
+static CLAUDE_USER_AGENT: OnceLock<Option<String>> = OnceLock::new();
+
+fn resolve_claude_user_agent() -> Option<String> {
+    CLAUDE_USER_AGENT
+        .get_or_init(|| {
+            // Try the conventional install paths in priority order.
+            // PATH is unreliable inside Tauri (the launched binary
+            // doesn't inherit a login shell's PATH), so we probe the
+            // common locations explicitly.
+            let home = dirs::home_dir()?;
+            let candidates = [
+                home.join(".local/bin/claude"),
+                PathBuf::from("/opt/homebrew/bin/claude"),
+                PathBuf::from("/usr/local/bin/claude"),
+            ];
+            for c in candidates.iter() {
+                let Ok(output) = Command::new(c)
+                    .arg("--version")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output()
+                else {
+                    continue;
+                };
+                if !output.status.success() {
+                    continue;
+                }
+                let raw = String::from_utf8_lossy(&output.stdout);
+                // `claude --version` prints e.g. "1.0.108 (Claude Code)" —
+                // grab the first whitespace-delimited token.
+                let version = raw.split_whitespace().next()?.to_string();
+                return Some(format!("claude-code/{version}"));
+            }
+            None
+        })
+        .clone()
+}
+
+/// Read Claude Code's OAuth credentials JSON from the macOS Keychain.
+/// We use `/usr/bin/security` (Apple-signed) rather than the
+/// Security.framework directly so the keychain ACL prompt only fires
+/// once — the user picks "Always Allow", and every subsequent
+/// invocation reads the password silently. Calling
+/// `SecItemCopyMatching` from our process triggers the prompt every
+/// launch because the ACL is keyed on the calling executable's path.
+fn read_oauth_credentials_from_keychain() -> Option<ClaudeOAuthCredentials> {
+    let output = Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let blob: KeychainBlob = serde_json::from_str(raw.trim()).ok()?;
+    Some(blob.claude_ai_oauth)
+}
+
+#[derive(Debug, Deserialize)]
+struct KeychainBlob {
+    #[serde(rename = "claudeAiOauth")]
+    claude_ai_oauth: ClaudeOAuthCredentials,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ClaudeOAuthCredentials {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthUsageResponse {
+    #[serde(default)]
+    five_hour: Option<OAuthQuotaPeriod>,
+    #[serde(default)]
+    seven_day: Option<OAuthQuotaPeriod>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthQuotaPeriod {
+    utilization: f32,
+    resets_at: Option<String>,
+}
+
+/// In-memory cache of the last successful OAuth fetch. Surfaces the
+/// most recent reading when a poll fails (token refresh, transient
+/// network blip) so the pill doesn't blink off mid-session.
+static LAST_OAUTH_STATUS: OnceLock<Mutex<Option<ClaudeUsageStatus>>> = OnceLock::new();
+
+fn cache_last_oauth_status(status: &ClaudeUsageStatus) {
+    let slot = LAST_OAUTH_STATUS.get_or_init(|| Mutex::new(None));
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(status.clone());
+    }
+}
+
+fn last_oauth_status() -> Option<ClaudeUsageStatus> {
+    let slot = LAST_OAUTH_STATUS.get_or_init(|| Mutex::new(None));
+    slot.lock().ok().and_then(|g| g.clone())
+}
+
+async fn fetch_oauth_usage() -> Option<ClaudeUsageStatus> {
+    let creds = match read_oauth_credentials_from_keychain() {
+        Some(c) => c,
+        // No Claude Code install / no OAuth login. Return cached
+        // value if we have one — covers the case where the token
+        // briefly fails to read but a previous successful response
+        // is still meaningful for the next 30s tick.
+        None => return last_oauth_status(),
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    // Anthropic's OAuth usage endpoint is internal to Claude Code's
+    // own UI plumbing. We send the same User-Agent shape Claude Code
+    // sends (resolved from the locally installed `claude` binary) so
+    // the request looks identical on the wire — third-party UAs risk
+    // 403s if Anthropic ever filters this endpoint.
+    let user_agent = resolve_claude_user_agent().unwrap_or_else(|| "claude-code/1.0".to_string());
+    let resp = client
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .bearer_auth(&creds.access_token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("Accept", "application/json")
+        .header("User-Agent", user_agent)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return last_oauth_status();
+    }
+    let body: OAuthUsageResponse = resp.json().await.ok()?;
+
     let now_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_millis() as i64,
         Err(_) => 0,
     };
-    let lookback_cutoff_ms = now_ms - LOOKBACK_MS;
 
-    // Honor the App Data circuit breaker. Once tripped, we don't
-    // open any files under ~/.claude/ for the rest of the session,
-    // which stops the 5s polling loop from re-spawning the TCC
-    // popup every time Claude creates a new session transcript
-    // with a fresh MACL UUID.
-    if is_app_data_blocked() {
-        return Ok(ClaudeUsageStatus::default());
-    }
-
-    let projects_dir = match dirs::home_dir() {
-        Some(h) => h.join(".claude").join("projects"),
-        None => return Ok(ClaudeUsageStatus::default()),
-    };
-    // Use metadata() rather than exists() — a permission error here
-    // also trips the breaker, so a single "Don't Allow" closes the
-    // door on every downstream open() that would re-prompt.
-    match fs::metadata(&projects_dir) {
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            // Claude Code never installed. Empty status — pill stays hidden.
-            return Ok(ClaudeUsageStatus::default());
-        }
-        Err(e) => {
-            note_app_data_error(&e, &projects_dir);
-            return Ok(ClaudeUsageStatus::default());
-        }
-    }
-
-    let files = collect_transcript_files(&projects_dir, lookback_cutoff_ms);
     let mut status = ClaudeUsageStatus::default();
-    let mut rows: Vec<UsageRow> = Vec::new();
+    status.real_captured_at_ms = Some(now_ms);
 
-    for path in &files {
-        // Stop the moment we hit a permission denial — every
-        // subsequent open() would re-fire the macOS App Data popup
-        // for files with fresh MACL UUIDs.
-        if is_app_data_blocked() {
-            break;
-        }
-        status.scanned_files += 1;
-        let file = match File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                note_app_data_error(&e, path);
-                continue;
-            }
-        };
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let Ok(raw) = line else { continue };
-            if raw.is_empty() {
-                continue;
-            }
-            // Each line is JSON; bad lines are skipped silently —
-            // partial writes can happen at the tail of a live file.
-            let parsed: TranscriptLine = match serde_json::from_str(&raw) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if parsed.line_type != "assistant" {
-                continue;
-            }
-            let Some(ts_iso) = parsed.timestamp.as_deref() else {
-                continue;
-            };
-            let ts_ms = match parse_iso_to_ms(ts_iso) {
-                Some(t) => t,
-                None => continue,
-            };
-            if ts_ms < lookback_cutoff_ms {
-                continue;
-            }
-            let Some(msg) = parsed.message else { continue };
-            let Some(usage) = msg.usage else { continue };
-
-            let input = usage.input_tokens.unwrap_or(0);
-            let output = usage.output_tokens.unwrap_or(0);
-            let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
-            let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
-
-            // Skip empty-usage entries (some transcript variants emit
-            // partial assistant rows during streaming; the final row
-            // for the same message id has the real numbers).
-            if input == 0 && output == 0 && cache_read == 0 && cache_creation == 0 {
-                continue;
-            }
-
-            rows.push(UsageRow {
-                ts_ms,
-                model: msg.model,
-                input,
-                output,
-                cache_read,
-                cache_creation,
-            });
-        }
-    }
-
-    // Aggregate transcript rows ONLY when we have any. The cache-file
-    // path below runs unconditionally — even with zero transcript rows
-    // we still want the pill to appear if the status-line capture hook
-    // wrote real data within the freshness window. This was the bug
-    // that hid the pill the moment the user hit a quiet stretch in
-    // their JSONL (e.g. Claude was idle but the hook kept reporting).
-    if !rows.is_empty() {
-        // Walk chronologically and find the start of the CURRENT session.
-        // Anthropic's "session" is a 5h timer anchored on the first message
-        // after the previous session expired. So we scan forward, and each
-        // time the next message lands more than 5h after the current
-        // session anchor, we treat that message as a new anchor.
-        rows.sort_by_key(|r| r.ts_ms);
-        let mut session_start_ms = rows[0].ts_ms;
-        for r in &rows {
-            if r.ts_ms - session_start_ms > WINDOW_MS {
-                session_start_ms = r.ts_ms;
-            }
-        }
-
-        // Aggregate ONLY rows in the current session: ts >= session_start
-        // AND ts < session_start + 5h. (Future-dated rows shouldn't exist
-        // but we guard the upper bound for safety.)
-        let session_end_ms = session_start_ms + WINDOW_MS;
-        for r in rows.iter().filter(|r| r.ts_ms >= session_start_ms && r.ts_ms < session_end_ms) {
-            status.message_count += 1;
-            status.total_input_tokens += r.input;
-            status.total_output_tokens += r.output;
-            status.total_cache_read_tokens += r.cache_read;
-            status.total_cache_creation_tokens += r.cache_creation;
-            if let Some(model) = &r.model {
-                let entry = status.by_model.entry(model.clone()).or_default();
-                entry.messages += 1;
-                entry.input_tokens += r.input;
-                entry.output_tokens += r.output;
-                entry.cache_read_tokens += r.cache_read;
-                entry.cache_creation_tokens += r.cache_creation;
-            }
-        }
-
-        if status.message_count > 0 {
+    if let Some(fh) = body.five_hour {
+        status.real_five_hour_percent = Some(fh.utilization);
+        let resets_ms = fh.resets_at.as_deref().and_then(parse_iso_to_ms);
+        status.real_five_hour_resets_ms = resets_ms;
+        if let Some(end_ms) = resets_ms {
+            status.window_ends_ms = Some(end_ms);
+            status.window_start_ms = Some(end_ms - WINDOW_MS);
             status.active = true;
-            status.window_start_ms = Some(session_start_ms);
-            status.window_ends_ms = Some(session_end_ms);
         }
     }
-
-    // Layer in the REAL rate-limit numbers when the user has installed
-    // the status-line capture hook. These come straight from Anthropic
-    // (Claude Code feeds them to the statusLine command), so they
-    // exactly match what claude.ai's settings page shows.
-    if let Some(home) = dirs::home_dir() {
-        let cache = home.join(".claude").join("cache").join("gli-usage.json");
-        // Skip the read entirely once the breaker is tripped — same
-        // App Data popup risk as the transcript scan above.
-        let read_result = if is_app_data_blocked() {
-            Err(std::io::Error::from(ErrorKind::PermissionDenied))
-        } else {
-            fs::read(&cache).map_err(|e| {
-                if e.kind() != ErrorKind::NotFound {
-                    note_app_data_error(&e, &cache);
-                }
-                e
-            })
-        };
-        if let Ok(bytes) = read_result {
-            if let Ok(c) = serde_json::from_slice::<CapturedUsage>(&bytes) {
-                // Some capture scripts (older versions, or the one
-                // Claude installs by default) write the rate-limit
-                // body without a `captured_at_ms` field. Fall back to
-                // the file's mtime so the frontend's freshness check
-                // still has a timestamp to compare against — without
-                // this, a perfectly good cache file with a real %
-                // value reads as "stale" and the pill stays hidden.
-                let mtime_ms = fs::metadata(&cache)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as i64);
-                status.real_captured_at_ms = c.captured_at_ms.or(mtime_ms);
-                if let Some(rl) = c.rate_limits {
-                    if let Some(fh) = rl.five_hour {
-                        status.real_five_hour_percent = fh.used_percentage;
-                        // resets_at is epoch SECONDS in the schema; convert.
-                        status.real_five_hour_resets_ms = fh.resets_at.map(|s| s * 1000);
-                    }
-                    if let Some(sd) = rl.seven_day {
-                        status.real_seven_day_percent = sd.used_percentage;
-                    }
-                }
-                // If the real anchor is present, override the
-                // transcript-derived window with it. The pill should
-                // tick down to the actual reset time, not our guess.
-                if let Some(resets_ms) = status.real_five_hour_resets_ms {
-                    status.window_ends_ms = Some(resets_ms);
-                    status.window_start_ms = Some(resets_ms - WINDOW_MS);
-                    // We have data → pill should show even if no
-                    // assistant messages happened to be in our scan
-                    // (e.g. user just installed the capture hook).
-                    status.active = true;
-                }
-            }
-        }
+    if let Some(sd) = body.seven_day {
+        status.real_seven_day_percent = Some(sd.utilization);
     }
 
-    Ok(status)
-}
-
-/// Walk `~/.claude/projects/<*>/<*>.jsonl` and return only files whose
-/// mtime is within the window. Older sessions can't contribute to
-/// "last 5h" usage, so skipping them avoids parsing megabytes of
-/// historical transcripts on every poll.
-fn collect_transcript_files(root: &PathBuf, cutoff_ms: i64) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let top = match fs::read_dir(root) {
-        Ok(it) => it,
-        Err(e) => {
-            note_app_data_error(&e, root);
-            return out;
-        }
-    };
-    for entry in top.flatten() {
-        if is_app_data_blocked() {
-            break;
-        }
-        let p = entry.path();
-        if !p.is_dir() {
-            continue;
-        }
-        let inner = match fs::read_dir(&p) {
-            Ok(it) => it,
-            Err(e) => {
-                note_app_data_error(&e, &p);
-                continue;
-            }
-        };
-        for f in inner.flatten() {
-            let path = f.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Ok(meta) = f.metadata() {
-                if let Ok(mtime) = meta.modified() {
-                    if let Ok(d) = mtime.duration_since(UNIX_EPOCH) {
-                        if (d.as_millis() as i64) < cutoff_ms {
-                            // File hasn't been touched in 5h — every
-                            // assistant message inside is older than
-                            // the window. Skip without opening.
-                            continue;
-                        }
-                    }
-                }
-            }
-            out.push(path);
-        }
-    }
-    out
+    cache_last_oauth_status(&status);
+    Some(status)
 }
 
 /// Convert an ISO-8601 UTC timestamp ("2026-04-28T01:16:32.435Z") to
@@ -506,214 +318,21 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe as i64 - 719_468
 }
 
-/// One conversational turn extracted from the transcript. We keep
-/// just enough text to build a useful summary prompt — full assistant
-/// responses can be many KB; we cap each turn so the LLM call stays
-/// cheap and fast.
-#[derive(Clone, Debug)]
-struct Turn {
-    role: &'static str, // "user" or "assistant"
-    uuid: String,
-    text: String,
-}
-
-/// In-memory cache for the natural-language summary, keyed by the
-/// transcript-file path. We reuse the cached summary as long as the
-/// "fingerprint" of recent turns hasn't changed — that's the uuid of
-/// the latest user turn AND the latest assistant turn. Both being
-/// stable means no new exchange has landed since we last summarized,
-/// so there's nothing for Gemini to update. This is what lets the
-/// frontend poll on a 4s cadence without lighting up the API.
+/// In-memory cache for the natural-language summary, keyed by
+/// "<cwd>:<prompt>". As long as the user hasn't submitted a new
+/// prompt, the cached creative summary stays valid — so the 4s
+/// frontend poll costs zero helper-CLI invocations between turns.
 #[derive(Clone)]
 struct CachedSummary {
+    /// The exact prompt text that produced this summary. Re-checked
+    /// against the live `latest_prompt_for_cwd` value on every hit.
     user_uuid: String,
-    assistant_uuid: String,
     summary: String,
 }
 
 fn summary_cache() -> &'static Mutex<HashMap<String, CachedSummary>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CachedSummary>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Resolve `~/.claude/projects/<encoded-cwd>/` for `project_cwd`. The
-/// encoding rule is "every `/` becomes `-`" — same as Claude Code's
-/// internal one. Returns `None` for an empty cwd, missing home dir,
-/// or a transcript dir that doesn't exist yet.
-fn transcript_dir_for(project_cwd: &str) -> Option<PathBuf> {
-    if project_cwd.is_empty() {
-        return None;
-    }
-    let encoded = project_cwd.replace('/', "-");
-    let dir = dirs::home_dir()?.join(".claude").join("projects").join(&encoded);
-    if !dir.exists() {
-        return None;
-    }
-    Some(dir)
-}
-
-/// Pick the most-recently-modified .jsonl in a transcript dir. Claude
-/// appends to the active session live, so mtime is the right proxy
-/// for "which session is the user currently in".
-fn latest_transcript_in(dir: &Path) -> Option<PathBuf> {
-    let mut best: Option<(SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        let Ok(mtime) = meta.modified() else { continue };
-        if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
-            best = Some((mtime, path));
-        }
-    }
-    best.map(|(_, p)| p)
-}
-
-/// Quick "is Claude actively working in this worktree" check, used to
-/// drive the sidebar / tab-strip spinner. Source of truth: the mtime of
-/// Claude's transcript file. Each turn, tool-call, and tool-result
-/// gets appended as a new line — so mtime advances exactly when Claude
-/// is processing. Between turns / while sitting at the prompt waiting
-/// for user input, mtime stays put.
-///
-/// This replaces the byte-rate heuristic in term.rs, which was
-/// fundamentally ambiguous (couldn't distinguish shell banner output,
-/// window resize repaints, or sub-process noise from actual agent
-/// work). Transcript mtime is the same signal Anthropic's own UI
-/// uses internally; it's the most authoritative answer to "is the
-/// agent doing something right now" that exists outside Claude.
-#[derive(Debug, Serialize)]
-pub struct ClaudeActiveStatus {
-    pub active: bool,
-    /// Milliseconds since the transcript file was last modified.
-    /// `None` if no transcript exists for this worktree yet.
-    pub ms_since_activity: Option<u64>,
-}
-
-/// How recent must the transcript mtime be for us to consider Claude
-/// actively working? 1500 ms is generous enough to span the gap
-/// between an assistant text turn and the subsequent tool-use line
-/// (which can take ~200–800 ms while the SDK decides) without
-/// blinking the spinner off mid-conversation. Anything older is
-/// either between user turns or a finished session.
-const CLAUDE_ACTIVE_WINDOW_MS: u64 = 1500;
-
-#[tauri::command]
-pub fn claude_active_status(project_cwd: String) -> ClaudeActiveStatus {
-    let Some(dir) = transcript_dir_for(&project_cwd) else {
-        return ClaudeActiveStatus { active: false, ms_since_activity: None };
-    };
-    let Some(path) = latest_transcript_in(&dir) else {
-        return ClaudeActiveStatus { active: false, ms_since_activity: None };
-    };
-    let Ok(meta) = fs::metadata(&path) else {
-        return ClaudeActiveStatus { active: false, ms_since_activity: None };
-    };
-    let Ok(mtime) = meta.modified() else {
-        return ClaudeActiveStatus { active: false, ms_since_activity: None };
-    };
-    let now = SystemTime::now();
-    let elapsed_ms = now
-        .duration_since(mtime)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    ClaudeActiveStatus {
-        active: elapsed_ms < CLAUDE_ACTIVE_WINDOW_MS,
-        ms_since_activity: Some(elapsed_ms),
-    }
-}
-
-/// Walk the transcript and pull out the last `n_user` user prompts
-/// plus all assistant turns interleaved with them.
-///
-/// We deliberately skip:
-///   - `type:"user"` rows whose `message.content` is an ARRAY (those are
-///     tool-result echoes, not what the user typed).
-///   - Slash commands and bracketed-paste system messages (start with
-///     `/` or `<`).
-///   - Assistant tool-use blocks (we keep just the `text` blocks — what
-///     the assistant actually said in chat, not which tools it called).
-fn read_recent_turns(path: &Path, n_user: usize) -> Result<Vec<Turn>, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let reader = BufReader::new(file);
-    let mut all: Vec<Turn> = Vec::new();
-    for line in reader.lines() {
-        let Ok(raw) = line else { continue };
-        if raw.is_empty() {
-            continue;
-        }
-        let parsed: serde_json::Value = match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let line_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let uuid = parsed
-            .get("uuid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if line_type == "user" {
-            // Real prompts have content as a string; tool results are arrays.
-            let Some(s) = parsed
-                .pointer("/message/content")
-                .and_then(|v| v.as_str())
-            else {
-                continue;
-            };
-            let trimmed = s.trim();
-            if trimmed.is_empty() || trimmed.starts_with('<') || trimmed.starts_with('/') {
-                continue;
-            }
-            all.push(Turn {
-                role: "user",
-                uuid,
-                text: cap_inline(trimmed, 600),
-            });
-        } else if line_type == "assistant" {
-            let Some(content) = parsed
-                .pointer("/message/content")
-                .and_then(|v| v.as_array())
-            else {
-                continue;
-            };
-            let mut texts: Vec<&str> = Vec::new();
-            for block in content {
-                if block.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                        let t = t.trim();
-                        if !t.is_empty() {
-                            texts.push(t);
-                        }
-                    }
-                }
-            }
-            if texts.is_empty() {
-                continue;
-            }
-            let combined = texts.join(" ");
-            all.push(Turn {
-                role: "assistant",
-                uuid,
-                text: cap_inline(&combined, 600),
-            });
-        }
-    }
-    // Trim to last `n_user` user turns + every assistant turn that
-    // sits between or after them.
-    let mut user_seen = 0;
-    let mut keep_from = all.len();
-    for (i, t) in all.iter().enumerate().rev() {
-        if t.role == "user" {
-            user_seen += 1;
-            keep_from = i;
-            if user_seen >= n_user {
-                break;
-            }
-        }
-    }
-    Ok(all.split_off(keep_from))
 }
 
 /// Collapse internal whitespace and cap to `max` chars. The transcript
@@ -762,88 +381,68 @@ fn normalize_summary(raw: &str) -> String {
 /// exchange, not one per poll.
 ///
 /// Falls back gracefully:
-///   - No transcript dir / no jsonl → `Ok(None)`. Frontend uses
-///     `activeCommand` ("claude") as the subtitle.
-///   - No Gemini key configured / API error → returns the most recent
-///     user prompt verbatim. Still better than just "claude".
+///   - No prompt captured yet for this cwd → `Ok(None)`. Frontend
+///     uses `activeCommand` ("claude") as the subtitle.
+///   - Helper CLI unreachable → returns the prompt verbatim. Still
+///     more informative than just "claude".
+///
+/// Prompt source: the live in-memory map in `agent_hooks` that the
+/// Claude hook script populates on every `UserPromptSubmit` event.
+/// We used to read `~/.claude/projects/<cwd>/<session>.jsonl` here,
+/// but that fired a macOS App Data Isolation popup every time
+/// Claude opened a fresh session (each transcript file carries a
+/// unique MACL xattr). The hook-based path runs inside Claude's
+/// process tree, so the prompt forwarding is TCC-free.
 #[tauri::command]
 pub async fn claude_activity_summary(
     project_cwd: String,
     cli: Option<String>,
 ) -> Result<Option<String>, String> {
-    let Some(dir) = transcript_dir_for(&project_cwd) else {
+    let Some(prompt_text) = crate::agent_hooks::latest_prompt_for_cwd(&project_cwd) else {
         return Ok(None);
     };
-    let Some(path) = latest_transcript_in(&dir) else {
-        return Ok(None);
-    };
-
-    let turns = read_recent_turns(&path, 3)?;
-    if turns.is_empty() {
+    let trimmed = prompt_text.trim();
+    if trimmed.is_empty() {
         return Ok(None);
     }
 
-    // Cache fingerprint = latest user uuid + latest assistant uuid. If
-    // both still match, nothing new has landed in the transcript and
-    // the cached summary is still accurate.
-    let path_key = path.to_string_lossy().to_string();
-    let latest_user_uuid = turns
-        .iter()
-        .rev()
-        .find(|t| t.role == "user")
-        .map(|t| t.uuid.clone())
-        .unwrap_or_default();
-    let latest_assistant_uuid = turns
-        .iter()
-        .rev()
-        .find(|t| t.role == "assistant")
-        .map(|t| t.uuid.clone())
-        .unwrap_or_default();
-    if let Some(cached) = summary_cache().lock().unwrap().get(&path_key).cloned() {
-        if cached.user_uuid == latest_user_uuid
-            && cached.assistant_uuid == latest_assistant_uuid
-        {
+    // Cache fingerprint = the prompt text itself. If the user hasn't
+    // submitted a new prompt since the last summarize, the cached
+    // creative summary is still accurate, so the 4s frontend poll
+    // costs zero helper-CLI invocations.
+    let cache_key = format!("{}:{}", project_cwd, trimmed);
+    if let Some(cached) = summary_cache().lock().unwrap().get(&cache_key).cloned() {
+        if cached.user_uuid == trimmed {
             return Ok(Some(cached.summary));
         }
     }
 
-    // Fallback used when the helper CLI isn't reachable: the most recent
-    // real user prompt verbatim. Always populated when we have any turns.
-    let fallback = turns
-        .iter()
-        .rev()
-        .find(|t| t.role == "user")
-        .map(|t| cap_inline(&t.text, 80))
-        .unwrap_or_default();
-
-    let summary = match summarize_with_helper(&cli.unwrap_or_else(|| "claude".to_string()), &turns).await {
-        Ok(s) => s,
-        Err(_) => fallback.clone(),
+    let fallback = cap_inline(trimmed, 80);
+    let cli_name = cli.unwrap_or_else(|| "claude".to_string());
+    let summary = match summarize_with_helper(&cli_name, trimmed).await {
+        Ok(s) if !s.is_empty() => s,
+        _ => fallback.clone(),
     };
 
     summary_cache().lock().unwrap().insert(
-        path_key,
+        cache_key,
         CachedSummary {
-            user_uuid: latest_user_uuid,
-            assistant_uuid: latest_assistant_uuid,
+            user_uuid: trimmed.to_string(),
             summary: summary.clone(),
         },
     );
     Ok(Some(summary))
 }
 
-/// Ask the helper agent to compress recent turns into a single short
-/// activity summary. CLI defaults to "claude" but can be any of our
-/// supported agents.
-async fn summarize_with_helper(cli: &str, turns: &[Turn]) -> Result<String, String> {
-    let mut convo = String::new();
-    for t in turns {
-        convo.push_str(&format!("[{}]\n{}\n\n", t.role.to_uppercase(), t.text));
-    }
+/// Ask the helper agent to compress the user's prompt into a single
+/// short activity summary. CLI defaults to "claude" but can be any
+/// of our supported agents.
+async fn summarize_with_helper(cli: &str, user_prompt: &str) -> Result<String, String> {
     let prompt = format!(
-        "Recent turns from a Claude Code session in a developer's terminal:\n\n\
-         {convo}\
-         Summarize what the developer is currently working on. One short \
+        "Below is the most recent prompt a developer typed into a Claude Code \
+         session in their terminal:\n\n\
+         [USER]\n{user_prompt}\n\n\
+         Summarize what the developer is asking Claude to do. One short \
          phrase, 8 words or fewer, sentence case, no trailing period, no \
          quotes. Use an active verb. Be specific about the task — not \
          \"working on code\".",
@@ -917,57 +516,4 @@ mod tests {
         assert_eq!(normalize_summary("  refactor.  "), "refactor");
     }
 
-    #[test]
-    fn read_recent_turns_filters_tool_results_and_keeps_text_blocks() {
-        // Build a fake transcript with: prompt, assistant-text+tool_use,
-        // tool-result (user/array), prompt, assistant-text. Should
-        // return the two prompts + two assistant text turns; the
-        // tool-result row is dropped.
-        let dir = std::env::temp_dir().join(format!(
-            "rli-claude-usage-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("session.jsonl");
-        let lines = [
-            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"first prompt"}}"#,
-            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"sure thing"},{"type":"tool_use","name":"Bash"}]}}"#,
-            r#"{"type":"user","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}"#,
-            r#"{"type":"user","uuid":"u3","message":{"role":"user","content":"second prompt"}}"#,
-            r#"{"type":"assistant","uuid":"a2","message":{"content":[{"type":"text","text":"done"}]}}"#,
-        ];
-        std::fs::write(&path, lines.join("\n")).unwrap();
-
-        let turns = read_recent_turns(&path, 3).unwrap();
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
-
-        let roles: Vec<&str> = turns.iter().map(|t| t.role).collect();
-        let texts: Vec<&str> = turns.iter().map(|t| t.text.as_str()).collect();
-        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
-        assert_eq!(texts, vec!["first prompt", "sure thing", "second prompt", "done"]);
-    }
-
-    #[test]
-    fn read_recent_turns_skips_slash_commands_and_system_blocks() {
-        let dir = std::env::temp_dir().join(format!(
-            "rli-claude-usage-test-skip-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("session.jsonl");
-        let lines = [
-            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"/help"}}"#,
-            r#"{"type":"user","uuid":"u2","message":{"role":"user","content":"<system-reminder>nope</system-reminder>"}}"#,
-            r#"{"type":"user","uuid":"u3","message":{"role":"user","content":"the real one"}}"#,
-        ];
-        std::fs::write(&path, lines.join("\n")).unwrap();
-
-        let turns = read_recent_turns(&path, 3).unwrap();
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
-
-        assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].text, "the real one");
-    }
 }

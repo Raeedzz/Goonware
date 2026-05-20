@@ -126,10 +126,9 @@ pub fn run() {
             term::term_close,
             term::term_set_visible_set,
             term::term_running_session_ids,
-            // Claude usage (real, from ~/.claude/projects transcripts)
+            // Claude usage (OAuth API + hook-fed activity summarizer)
             claude_usage::claude_usage_status,
             claude_usage::claude_activity_summary,
-            claude_usage::claude_active_status,
             agent_hooks::agent_sessions,
             // Git (Task #8)
             git::git_status,

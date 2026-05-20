@@ -42,6 +42,14 @@ except Exception:
 # sub-classifier — today only Notification needs one (its
 # notification_type field, e.g. idle_prompt / permission_prompt).
 # The Rust side uses (event, aux) together to derive status.
+#
+# 'prompt' carries the user's typed text for UserPromptSubmit
+# events. We capture it here (the hook runs inside Claude's process
+# tree, so it can read the payload that Claude already piped to
+# stdin) and forward it to GLI's tab-subtitle summarizer — which
+# means GLI never has to read ~/.claude/projects/*.jsonl to learn
+# what the user is working on, avoiding the App Data Isolation
+# prompt that fires for every fresh transcript file.
 out = {
     'provider': 'claude',
     'session_id': payload.get('session_id', ''),
@@ -52,6 +60,7 @@ out = {
     'tool_use_id': payload.get('tool_use_id', ''),
     'permission_mode': payload.get('permission_mode', 'default'),
     'aux': payload.get('notification_type', ''),
+    'prompt': payload.get('prompt', '') or '',
     'gli_session_id': '$GLI_SID',
 }
 
