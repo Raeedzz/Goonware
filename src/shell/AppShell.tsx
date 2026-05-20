@@ -28,6 +28,12 @@ import {
 
 const COLLAPSED_SIDEBAR_W = 40;
 
+/** Floor for the main column. Anything below this and the terminal /
+ *  diff content is unusable, so when the window narrows past
+ *  `sidebar + right + MIN_MAIN_WIDTH` we eat into the side panels
+ *  instead of letting them overflow + clip. */
+const MIN_MAIN_WIDTH = 320;
+
 /**
  * Three-column shell:
  *
@@ -67,20 +73,51 @@ export function AppShell() {
   // invalid CSS length in `grid-template-columns` collapses the whole
   // grid to a single column and stacks every panel vertically. Clamp
   // and fall through to defaults so layout is always sane.
-  const sidebarPx = sidebarCollapsed
+  const storedSidebarPx = sidebarCollapsed
     ? COLLAPSED_SIDEBAR_W
     : clampSidebar(
         typeof sidebarWidth === "number" && Number.isFinite(sidebarWidth)
           ? sidebarWidth
           : SIDEBAR_DEFAULT,
       );
-  const rightPx = rightPanelCollapsed
+  const storedRightPx = rightPanelCollapsed
     ? 0
     : clampRight(
         typeof rightPanelWidth === "number" && Number.isFinite(rightPanelWidth)
           ? rightPanelWidth
           : RIGHT_DEFAULT,
       );
+
+  // Track viewport width so we can clamp the side panels when the
+  // window shrinks. Both sides use `flexShrink: 0` to hold their drag
+  // widths, but that overflows the parent (which has overflow: hidden)
+  // when the window narrows past the sum of the stored widths — the
+  // right panel ends up clipped off-screen and the layout looks
+  // broken. We only clamp at display time; the stored widths in state
+  // are left alone so the user's preference is restored when the
+  // window grows back.
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window === "undefined" ? Infinity : window.innerWidth,
+  );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  let sidebarPx = storedSidebarPx;
+  let rightPx = storedRightPx;
+  const sideBudget = Math.max(0, viewportWidth - MIN_MAIN_WIDTH);
+  const sidesTotal = sidebarPx + rightPx;
+  if (sidesTotal > sideBudget && sidesTotal > 0) {
+    // Shrink both side panels proportionally so neither goes to 0
+    // while the other holds its full size. Floor + adjust so we
+    // don't end up off by a pixel that retriggers overflow.
+    const ratio = sideBudget / sidesTotal;
+    sidebarPx = Math.floor(sidebarPx * ratio);
+    rightPx = Math.max(0, sideBudget - sidebarPx);
+  }
 
   return (
     <div
@@ -115,7 +152,13 @@ export function AppShell() {
           }}
         >
           <Sidebar />
-          {!sidebarCollapsed && <ResizeHandle side="left" />}
+          {!sidebarCollapsed && (
+            <ResizeHandle
+              side="left"
+              effectiveWidth={sidebarPx}
+              otherSideWidth={rightPx}
+            />
+          )}
         </aside>
 
         <main
@@ -139,7 +182,13 @@ export function AppShell() {
             position: "relative",
           }}
         >
-          {!rightPanelCollapsed && <ResizeHandle side="right" />}
+          {!rightPanelCollapsed && (
+            <ResizeHandle
+              side="right"
+              effectiveWidth={rightPx}
+              otherSideWidth={sidebarPx}
+            />
+          )}
           <RightPanel />
         </aside>
       </div>
@@ -158,9 +207,23 @@ export function AppShell() {
    the document during drag.
    ------------------------------------------------------------------ */
 
-function ResizeHandle({ side }: { side: "left" | "right" }) {
+function ResizeHandle({
+  side,
+  effectiveWidth,
+  otherSideWidth,
+}: {
+  side: "left" | "right";
+  /** The currently-rendered width of this panel (post viewport
+   *  clamp). Used as the drag baseline so the handle moves 1:1 with
+   *  the cursor instead of starting from a possibly-larger stored
+   *  width. */
+  effectiveWidth: number;
+  /** Currently-rendered width of the opposite side panel. Drives the
+   *  dynamic max so the drag never writes a width that would force
+   *  the main column below MIN_MAIN_WIDTH. */
+  otherSideWidth: number;
+}) {
   const dispatch = useAppDispatch();
-  const state = useAppState();
   const startXRef = useRef(0);
   const startWRef = useRef(0);
   const draggingRef = useRef(false);
@@ -168,22 +231,19 @@ function ResizeHandle({ side }: { side: "left" | "right" }) {
   const [active, setActive] = useState(false);
 
   const min = side === "left" ? SIDEBAR_MIN : RIGHT_MIN;
-  const max = side === "left" ? SIDEBAR_MAX : RIGHT_MAX;
-  const widthSelector = side === "left"
-    ? state.sidebarWidth
-    : state.rightPanelWidth;
+  const baseMax = side === "left" ? SIDEBAR_MAX : RIGHT_MAX;
 
   const onMouseDown = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
       draggingRef.current = true;
       startXRef.current = e.clientX;
-      startWRef.current = widthSelector;
+      startWRef.current = effectiveWidth;
       setActive(true);
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
     },
-    [widthSelector],
+    [effectiveWidth],
   );
 
   useEffect(() => {
@@ -212,12 +272,24 @@ function ResizeHandle({ side }: { side: "left" | "right" }) {
     const onMove = (e: MouseEvent) => {
       if (!draggingRef.current) return;
       const dx = e.clientX - startXRef.current;
+      // Dynamic max: leave at least MIN_MAIN_WIDTH for the center
+      // column, accounting for the opposite side panel's current
+      // rendered width. Without this, dragging past the viewport's
+      // capacity grows the stored value while the rendered width
+      // clamps — which feels like the panel "got stuck" because the
+      // cursor keeps moving but the boundary doesn't.
+      const viewport =
+        typeof window === "undefined" ? Infinity : window.innerWidth;
+      const dynamicMax = Math.max(
+        min,
+        Math.min(baseMax, viewport - MIN_MAIN_WIDTH - otherSideWidth),
+      );
       // Sidebar grows to the right (positive dx → wider).
       // Right panel grows to the left (positive dx → narrower).
       pendingWidth =
         side === "left"
-          ? Math.min(max, Math.max(min, startWRef.current + dx))
-          : Math.min(max, Math.max(min, startWRef.current - dx));
+          ? Math.min(dynamicMax, Math.max(min, startWRef.current + dx))
+          : Math.min(dynamicMax, Math.max(min, startWRef.current - dx));
       if (rafId === null) {
         rafId = window.requestAnimationFrame(flush);
       }
@@ -243,7 +315,7 @@ function ResizeHandle({ side }: { side: "left" | "right" }) {
       window.removeEventListener("mouseup", onUp);
       if (rafId !== null) window.cancelAnimationFrame(rafId);
     };
-  }, [side, min, max, dispatch]);
+  }, [side, min, baseMax, otherSideWidth, dispatch]);
 
   const lit = hover || active;
   return (
