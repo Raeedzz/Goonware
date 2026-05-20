@@ -47,9 +47,22 @@ fetch() {
 
 case "$(uname -s)" in
   Darwin)
-    # Universal bundle declares both targets — always fetch both.
+    # Universal bundle declares both targets — fetch each arch...
     fetch "ripgrep-${VERSION}-aarch64-apple-darwin.tar.gz" "aarch64-apple-darwin"
     fetch "ripgrep-${VERSION}-x86_64-apple-darwin.tar.gz"  "x86_64-apple-darwin"
+    # ...and lipo them into a fat binary so a `tauri build --target
+    # universal-apple-darwin` finds `binaries/rg-universal-apple-darwin`.
+    univ="$BIN_DIR/rg-universal-apple-darwin"
+    if [[ ! -x "$univ" ]]; then
+      lipo -create \
+        "$BIN_DIR/rg-aarch64-apple-darwin" \
+        "$BIN_DIR/rg-x86_64-apple-darwin" \
+        -output "$univ"
+      chmod +x "$univ"
+      echo "[download-rg] lipo'd → $univ"
+    else
+      echo "[download-rg] already present → $univ"
+    fi
     ;;
   Linux)
     case "$(uname -m)" in
