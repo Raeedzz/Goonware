@@ -52,6 +52,14 @@ jobs:
       - name: Install JS deps
         run: bun install --frozen-lockfile
 
+      - name: Download `rg` sidecar binaries
+        # tauri-build's build.rs refuses to run if any `externalBin`
+        # path declared in tauri.conf.json is missing — and *every*
+        # cargo invocation under src-tauri (including `cargo test`)
+        # runs that build.rs. Without this step `bun run test:rs`
+        # exits 101 before a single test compiles.
+        run: bun run download-rg
+
       - name: TypeScript build
         run: bun run typecheck
 
