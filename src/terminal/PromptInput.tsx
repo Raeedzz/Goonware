@@ -10,6 +10,7 @@ import {
 } from "react";
 import { fs, system, type DirEntry } from "@/lib/fs";
 import { shellQuotePath } from "@/lib/shellQuote";
+import { decideCtrlCAction } from "./ctrlCEscalation";
 
 export interface PromptInputHandle {
   focus: () => void;
@@ -27,6 +28,18 @@ interface Props {
   onSubmit: (text: string) => void;
   /** Send raw bytes (e.g. ⌃C → 0x03) without committing a block. */
   onSendBytes: (bytes: Uint8Array) => void;
+  /**
+   * Double-tap Ctrl+C escape hatch. Called instead of `onSendBytes`
+   * when the user presses Ctrl+C twice in rapid succession while a
+   * command is still running — see {@link decideCtrlCAction}. The
+   * parent's wiring routes this to `term_kill_foreground` which
+   * SIGKILLs the foreground process group via tcgetpgrp+kill.
+   * Required so trapped-SIGINT processes (bun, dev watchers) can
+   * still be killed from the keyboard.
+   */
+  onForceKill: () => void;
+  /** True while a foreground command is running (OSC 133 C…D). */
+  commandRunning: boolean;
   /**
    * Wrap a paste in OSC 200/201 and send it directly to the PTY. Lets
    * zsh's bracketed-paste handler treat multi-line pastes literally
@@ -332,6 +345,8 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
     {
       onSubmit,
       onSendBytes,
+      onForceKill,
+      commandRunning,
       onPaste,
       historyLength,
       historyAt,
@@ -341,6 +356,21 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
     },
     ref,
   ) {
+    // Timestamp of the last Ctrl+C we handled — used by
+    // {@link decideCtrlCAction} to spot the double-tap that
+    // escalates a stuck SIGINT into a SIGKILL on the foreground
+    // process group. Refs (not state) because the value is only
+    // ever read inside the keydown handler; a re-render would just
+    // waste work and re-create the textarea's closure.
+    const lastCtrlCAtRef = useRef<number | null>(null);
+    // `commandRunning` is captured by the keydown closure once per
+    // render; the ref keeps the decision against the freshest
+    // running-state without forcing the textarea to rebind
+    // onKeyDown on every OSC 133 transition.
+    const commandRunningRef = useRef(commandRunning);
+    useEffect(() => {
+      commandRunningRef.current = commandRunning;
+    }, [commandRunning]);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const [value, setValue] = useState("");
     // Track the newline count of the last value so the height-resize
@@ -537,12 +567,28 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
         onAgentNewLine?.();
         return;
       }
-      // ⌃C → send 0x03 to the PTY (interrupt running command). Goes
-      // before the meta bubble-out because we want to handle it here,
-      // not let it bubble to "copy" elsewhere.
+      // ⌃C — escalating interrupt. First press sends 0x03 (normal
+      // SIGINT via the tty driver, matches every other terminal).
+      // A second press within ESCALATION_WINDOW_MS while a command
+      // is still running escalates to SIGKILL on the foreground
+      // process group via `onForceKill` — the only way to clear a
+      // stuck `bun run` / dev watcher that traps SIGINT and refuses
+      // to die. Goes before the meta bubble-out because we want to
+      // handle it here, not let it bubble to "copy" elsewhere.
       if (e.ctrlKey && e.key.toLowerCase() === "c") {
         e.preventDefault();
-        onSendBytes(new Uint8Array([0x03]));
+        const decision = decideCtrlCAction({
+          now: Date.now(),
+          lastCtrlCAt: lastCtrlCAtRef.current,
+          commandRunning: commandRunningRef.current,
+        });
+        lastCtrlCAtRef.current =
+          decision.newLastCtrlCAt === 0 ? null : decision.newLastCtrlCAt;
+        if (decision.action === "sigkill") {
+          onForceKill();
+        } else {
+          onSendBytes(new Uint8Array([0x03]));
+        }
         setValue("");
         setCompletions([]);
         return;

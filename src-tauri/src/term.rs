@@ -2227,6 +2227,70 @@ pub fn term_close(
     Ok(())
 }
 
+/// SIGKILL the PTY's foreground process group. The escape hatch when
+/// a single Ctrl+C didn't take — bun's run wrapper, some node/python
+/// dev servers, and certain build watchers trap SIGINT and refuse to
+/// exit. Sending 0x03 to the PTY just echoes more `^C`s; this bypasses
+/// the signal handler entirely by reading the foreground pgrp out of
+/// the PTY master (`tcgetpgrp`) and `kill(-pgrp, SIGKILL)`-ing it.
+///
+/// The shell process itself is NOT touched: it's the SESSION leader,
+/// not the foreground pgrp leader, so the PTY stays alive and the
+/// user is dumped back at the prompt the moment the stuck job dies.
+/// On non-unix targets (we don't build for any today, but the cfg
+/// makes future cross-compile attempts honest) this is a no-op that
+/// returns an explanatory error.
+#[tauri::command]
+pub fn term_kill_foreground(
+    state: State<TerminalState>,
+    id: String,
+) -> Result<(), String> {
+    let arc = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.get(&id).cloned().ok_or("unknown term session")?
+    };
+    let s = arc.lock().map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        // process_group_leader() returns the foreground pgrp's pid via
+        // tcgetpgrp(master_fd). If no foreground job is set (shell is
+        // idle at a prompt and zsh hasn't re-claimed fg, exotic shells
+        // that don't do job control, etc.) we get None — there's
+        // nothing to kill, so just succeed quietly.
+        let Some(pgrp) = s.pty_master.process_group_leader() else {
+            return Ok(());
+        };
+        // Refuse to signal pgrp 0 (broadcast to every process in the
+        // session) or 1 (init). Both indicate the tcgetpgrp returned a
+        // suspicious value and we'd be punching well outside the
+        // user's PTY. Real foreground pgrps are always >1.
+        if pgrp <= 1 {
+            return Err(format!("refusing to signal pgrp {pgrp}"));
+        }
+        // Negate the pid to address the whole process group — that's
+        // POSIX `kill(2)`'s contract for `pid < -1`. SIGKILL cannot be
+        // caught, blocked, or ignored, so trapped-SIGINT processes
+        // (bun et al) die immediately.
+        let rc = unsafe { libc::kill(-pgrp, libc::SIGKILL) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            // ESRCH = the pgrp already exited between the tcgetpgrp
+            // read and the kill call — a benign race, the user got
+            // what they wanted.
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(format!("kill(-{pgrp}, SIGKILL) failed: {err}"));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = s;
+        Err("term_kill_foreground is unix-only".to_string())
+    }
+}
+
 /* ------------------------------------------------------------------
    Frame flush — throttled to ~60 Hz, only sends dirty rows.
    ------------------------------------------------------------------ */
@@ -2413,6 +2477,20 @@ mod tests {
             tauri::State<TerminalState>,
             Vec<String>,
         ) -> Result<(), String> = term_set_visible_set;
+    }
+
+    /// `term_kill_foreground` is the double-tap-Ctrl+C escape hatch.
+    /// Its wire shape is `{ id: string }` and the JS wrapper
+    /// (`termKillForeground` in `src/lib/tauri/term.ts`) calls
+    /// `invoke("term_kill_foreground", { id })`. The signature MUST
+    /// stay `(State<TerminalState>, String) -> Result<(), String>` —
+    /// adding a required field or renaming `id` would silently
+    /// break the kill path the moment a user mashes Ctrl+C and ship
+    /// the regression to anyone with a stuck dev server.
+    #[test]
+    fn term_kill_foreground_signature_is_stable() {
+        let _f: fn(tauri::State<TerminalState>, String) -> Result<(), String> =
+            term_kill_foreground;
     }
 
     /* ---------- BlockSegmenter ---------- */

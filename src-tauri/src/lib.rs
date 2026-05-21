@@ -137,6 +137,7 @@ pub fn run() {
             term::term_resize,
             term::term_reset_grid,
             term::term_close,
+            term::term_kill_foreground,
             term::term_set_visible_set,
             term::term_running_session_ids,
             // Claude usage (OAuth API + hook-fed activity summarizer)

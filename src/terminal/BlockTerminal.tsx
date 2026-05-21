@@ -29,7 +29,8 @@ import {
   clearTerminalRunning,
 } from "./terminalActivityStore";
 import { detectClaude } from "@/lib/claudeUsage";
-import { termResetGrid } from "@/lib/tauri/term";
+import { termKillForeground, termResetGrid } from "@/lib/tauri/term";
+import { decideCtrlCAction } from "./ctrlCEscalation";
 import {
   agentScrollContainerStyle,
   shouldRenderBlockList,
@@ -830,6 +831,25 @@ export function BlockTerminal({
     [sendBytes],
   );
 
+  // Double-tap Ctrl+C escape hatch — see {@link decideCtrlCAction}.
+  // Called by PromptInput / PtyPassthrough when the user mashes
+  // Ctrl+C and a single SIGINT didn't take. The Rust side reads the
+  // foreground process group via tcgetpgrp(master_fd) and SIGKILLs
+  // it, bypassing whatever signal trap the running process installed.
+  const onForceKill = useCallback(() => {
+    void termKillForeground(ptyId).catch(() => {
+      // Backend may have torn the session down between the read and
+      // the kill (rare race on tab close). Nothing useful to do; the
+      // next Ctrl+C will start a fresh single-tap cycle anyway.
+    });
+  }, [ptyId]);
+
+  // Window-level Ctrl+C path (fallback for focus-drifted-to-body) has
+  // its own escalation state because the window listener never runs
+  // PromptInput's keydown. Keep them independent so a mash that
+  // ricochets through both paths still escalates cleanly.
+  const fallbackLastCtrlCAtRef = useRef<number | null>(null);
+
   const onSubmit = useCallback(
     (text: string) => {
       setActiveCommand(text);
@@ -1103,12 +1123,20 @@ export function BlockTerminal({
 
   // Window-level Ctrl+C fallback — handles the "focus drifted to
   // document.body after a drag-selection" case. Encoding is pinned
-  // by keyEncoding.test.ts; this pins the delivery path.
+  // by keyEncoding.test.ts; this pins the delivery path. Same
+  // double-tap escalation as the textarea-focused path: second press
+  // within ESCALATION_WINDOW_MS escalates SIGINT → SIGKILL on the
+  // foreground process group.
   //
   // Gates:
   //   - No text currently selected (don't compete with copy paths).
   //   - Focus is on body or non-editable (not stealing from real inputs).
   //   - This terminal was most-recently interacted with (multi-pane).
+  const liveCommandRunning = liveFrame?.command_running ?? false;
+  const liveCommandRunningRef = useRef(liveCommandRunning);
+  useEffect(() => {
+    liveCommandRunningRef.current = liveCommandRunning;
+  }, [liveCommandRunning]);
   useEffect(() => {
     if (!isVisible) return;
     const onKey = (e: KeyboardEvent) => {
@@ -1129,7 +1157,18 @@ export function BlockTerminal({
       }
       if (getLastInteractedTerminal() !== id) return;
       e.preventDefault();
-      void sendBytes(new Uint8Array([0x03]));
+      const decision = decideCtrlCAction({
+        now: Date.now(),
+        lastCtrlCAt: fallbackLastCtrlCAtRef.current,
+        commandRunning: liveCommandRunningRef.current,
+      });
+      fallbackLastCtrlCAtRef.current =
+        decision.newLastCtrlCAt === 0 ? null : decision.newLastCtrlCAt;
+      if (decision.action === "sigkill") {
+        onForceKill();
+      } else {
+        void sendBytes(new Uint8Array([0x03]));
+      }
       if (foregroundIsAgentRef.current) {
         passthroughRef.current?.focus();
       } else {
@@ -1138,7 +1177,7 @@ export function BlockTerminal({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [id, isVisible, sendBytes]);
+  }, [id, isVisible, sendBytes, onForceKill]);
 
   // Window-level Cmd+C copy. Closed blocks are plain divs with
   // userSelect: "text"; users can drag-select inside them. But our
@@ -1341,6 +1380,8 @@ export function BlockTerminal({
           ref={promptRef}
           onSubmit={onSubmit}
           onSendBytes={onSendBytesVoid}
+          onForceKill={onForceKill}
+          commandRunning={liveCommandRunning}
           onPaste={onPaste}
           historyLength={history.length}
           historyAt={historyAt}
@@ -1352,6 +1393,8 @@ export function BlockTerminal({
         <PtyPassthrough
           ref={passthroughRef}
           onSendBytes={onSendBytesVoid}
+          onForceKill={onForceKill}
+          commandRunning={liveCommandRunning}
           appCursor={liveFrame?.app_cursor ?? false}
           bracketedPaste={liveFrame?.bracketed_paste ?? false}
           autoFocus={autoFocus}

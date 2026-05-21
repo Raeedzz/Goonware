@@ -10,6 +10,7 @@ import {
 import { system } from "@/lib/fs";
 import { shellQuotePath } from "@/lib/shellQuote";
 import { isGlobalChord, keyToBytes } from "./keyEncoding";
+import { decideCtrlCAction } from "./ctrlCEscalation";
 
 export interface PtyPassthroughHandle {
   focus: () => void;
@@ -18,6 +19,15 @@ export interface PtyPassthroughHandle {
 interface Props {
   /** Forward raw keystrokes to the PTY. */
   onSendBytes: (bytes: Uint8Array) => void;
+  /**
+   * Double-tap Ctrl+C escape hatch — see PromptInput's Props for the
+   * full rationale. Required here because alt-screen agents (claude,
+   * vim, htop) route every keystroke through this textarea, including
+   * the user's "kill the stuck thing" mash.
+   */
+  onForceKill: () => void;
+  /** True while a foreground command is running (OSC 133 C…D). */
+  commandRunning: boolean;
   /**
    * DECCKM (application cursor mode). When the running program has
    * issued `ESC[?1h` (claude, vim insert mode, readline TUIs all do
@@ -64,10 +74,25 @@ const PASTE_END = encoder.encode("\x1b[201~");
  */
 export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
   function PtyPassthrough(
-    { onSendBytes, appCursor, bracketedPaste, autoFocus = true },
+    {
+      onSendBytes,
+      onForceKill,
+      commandRunning,
+      appCursor,
+      bracketedPaste,
+      autoFocus = true,
+    },
     ref,
   ) {
     const inputRef = useRef<HTMLTextAreaElement>(null);
+    // Mirror of PromptInput's escalation state. Agent-mode terminals
+    // (claude, codex, vim, htop) all funnel through this textarea, so
+    // a stuck agent gets the same double-tap-Ctrl+C escape as a shell.
+    const lastCtrlCAtRef = useRef<number | null>(null);
+    const commandRunningRef = useRef(commandRunning);
+    useEffect(() => {
+      commandRunningRef.current = commandRunning;
+    }, [commandRunning]);
     // Set on paste; cleared on the next onChange. Lets the input
     // handler wrap the value in OSC 200/201 markers without re-reading
     // clipboard data (which the browser only exposes on the paste
@@ -178,6 +203,33 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
           }
         })();
         return;
+      }
+      // ⌃C escalation — agent TUIs (claude, codex, aider) sometimes
+      // trap SIGINT to wind down a turn, and the same trapped-SIGINT
+      // stall the shell-mode handler covers can pin an agent here
+      // too. A second Ctrl+C within ESCALATION_WINDOW_MS asks the
+      // backend to SIGKILL the foreground process group instead.
+      if (
+        e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "c"
+      ) {
+        const decision = decideCtrlCAction({
+          now: Date.now(),
+          lastCtrlCAt: lastCtrlCAtRef.current,
+          commandRunning: commandRunningRef.current,
+        });
+        lastCtrlCAtRef.current =
+          decision.newLastCtrlCAt === 0 ? null : decision.newLastCtrlCAt;
+        if (decision.action === "sigkill") {
+          e.preventDefault();
+          onForceKill();
+          return;
+        }
+        // SIGINT path falls through to keyToBytes below so the byte
+        // (0x03) lands on the PTY through the normal encoding.
       }
       const seq = keyToBytes(e, appCursor);
       if (seq) {
