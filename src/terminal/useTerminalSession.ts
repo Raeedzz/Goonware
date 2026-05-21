@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { termResize, termStart } from "@/lib/tauri/term";
@@ -155,22 +155,69 @@ export function useTerminalSession(opts: Args): SessionApi {
   // Mirror of the `isVisible` prop into a ref so the long-lived
   // onFrame closure inside the main effect can read the latest
   // value without re-mounting. The visibility-flip effect (right
-  // below) keeps this in sync and schedules a flush on the
-  // `false → true` edge.
+  // below) keeps this in sync and flushes on the `false → true`
+  // edge.
   const isVisible = opts.isVisible ?? true;
   const isVisibleRef = useRef(isVisible);
-  // Bridge into the main effect's flushFrame closure so the
-  // visibility-flip effect can request a flush. The main effect
-  // assigns this on each run.
+  // Bridges into the main effect's flushFrame closure. The main
+  // effect assigns these on each run.
+  //   - requestFlushRef: rAF-coalesced flush (used by onFrame for
+  //     normal frame events while visible).
+  //   - flushNowRef: synchronous flush (used by the visibility-flip
+  //     layout effect to push cached state into React BEFORE the
+  //     next paint, so the child CanvasGrid's visibility-restore
+  //     useEffect reads a fresh frame instead of the stale one
+  //     left over from before the hide).
   const requestFlushRef = useRef<() => void>(() => {});
+  const flushNowRef = useRef<() => void>(() => {});
 
-  useEffect(() => {
+  // Visibility-flip flush. Implemented as a LAYOUT effect (not
+  // useEffect) so it fires synchronously during the commit phase,
+  // BEFORE the browser paints AND BEFORE child useEffects run.
+  //
+  // Why this matters (the bug class this guards against):
+  //
+  //   When the keepalive layer flips us from display:none → flex,
+  //   two effects race for the same render commit:
+  //
+  //     a) This visibility-flip — needs to push the cached
+  //        pendingFrameRef / rowsRef into liveFrame state so the
+  //        canvas re-renders with the latest agent output.
+  //     b) CanvasGrid's visibility-restore useEffect — calls the
+  //        GPU paint sequence (reconfigure → resize → invalidate
+  //        → paint) and reads `frameRef.current` for the paint
+  //        data.
+  //
+  //   React fires effects child → parent. (b) lives in CanvasGrid
+  //   (deep child); (a) lives in BlockTerminal (the parent that
+  //   instantiates this hook). So (b) ALWAYS fires before (a)
+  //   would if both used useEffect. Worse, the previous code
+  //   wrapped (a) in `requestAnimationFrame(flushFrame)` —
+  //   pushing the React state update yet another tick out.
+  //
+  //   Result: child paints with stale (or null) frame data while
+  //   the parent's flush is still queued for next frame. User
+  //   sees a black or stale agent shell on tab switch back.
+  //
+  //   The previous c7ca66b fix handled WKWebView surface release
+  //   correctly but assumed CanvasGrid's frame ref was current at
+  //   restore time. For shells running an agent (rendered through
+  //   the read-only CanvasGrid inside LiveBlock), that
+  //   assumption broke — the frame ref carried the last frame
+  //   from before the hide (or null for a freshly-hidden tab).
+  //
+  // The fix: use useLayoutEffect + synchronous flush. State
+  // updates inside a layout effect cause React to immediately
+  // process the pending render before paint, propagating the
+  // fresh liveFrame down through LiveBlock → CanvasGrid (and
+  // updating LiveBlock's frameRef.current as a side effect of
+  // its render). By the time CanvasGrid's regular useEffect
+  // fires (after paint), the canvas reads the fresh frame.
+  useLayoutEffect(() => {
     const wasVisible = isVisibleRef.current;
     isVisibleRef.current = isVisible;
-    // On false → true, push whatever's in the refs into React state
-    // so the freshly-visible terminal catches up in a single commit.
     if (isVisible && !wasVisible) {
-      requestFlushRef.current();
+      flushNowRef.current();
     }
   }, [isVisible]);
 
@@ -276,11 +323,27 @@ export function useTerminalSession(opts: Args): SessionApi {
       memSetScrollback(opts.id, scrollbackRows);
     };
 
-    // Expose the flush trigger to the outer visibility-flip effect.
+    // Expose the flush triggers to the outer visibility-flip layout
+    // effect. The rAF variant is used by the regular onFrame path
+    // (batching multiple events per paint into one React commit).
+    // The synchronous variant is reserved for the visibility-flip
+    // layout effect — see the long comment above its declaration
+    // for why a deferred flush black-screens the agent canvas.
     requestFlushRef.current = () => {
       if (cancelled) return;
       if (rafIdRef.current !== null) return;
       rafIdRef.current = requestAnimationFrame(flushFrame);
+    };
+    flushNowRef.current = () => {
+      if (cancelled) return;
+      // Cancel any pending rAF — we're flushing now and the rAF
+      // would re-run the same work next frame against an already-
+      // committed state (a no-op, but wastes the rAF slot).
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      flushFrame();
     };
 
     const onFrame = (frame: RenderFrame) => {
