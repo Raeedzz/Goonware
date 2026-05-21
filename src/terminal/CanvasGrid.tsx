@@ -342,6 +342,15 @@ export function CanvasGrid({
   useEffect(() => {
     const renderer = rendererRef.current;
     const wrapper = wrapperRef.current;
+    // On the visible→hidden edge, signal the renderer that its
+    // swapchain may be released while we sit behind `display: none`.
+    // Without this signal, `resize()`'s dimensions-unchanged fast
+    // path would happily skip the reconfigure when we come back
+    // (because the wrapper's box geometry doesn't change with
+    // display), landing the user on a dead GPU surface = black pane.
+    if (renderer && wasVisibleRef.current && !isVisible) {
+      renderer.markHidden();
+    }
     const rect = wrapper?.getBoundingClientRect();
     const rectWidth = rect?.width ?? 0;
     const rectHeight = rect?.height ?? 0;
@@ -370,6 +379,90 @@ export function CanvasGrid({
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isVisible]);
+
+  // Page-level visibility tracking. WKWebView can release a canvas's
+  // GPU surface when the host window becomes occluded — user switches
+  // to another macOS app, the Goonware window slides behind another
+  // window, the system enters App Nap, etc. None of these fire
+  // `device.lost` or change our `isVisible` prop (which only tracks
+  // the keepalive layer's intra-app visibility), but the surface is
+  // dead all the same. The next paint after the window comes back
+  // lands on a dead swapchain and the user sees the canvas as black
+  // until something else (tab switch, resize) triggers a reconfigure.
+  //
+  // The bug class users describe as "agent was running, I came back
+  // from a Zoom call and the terminal was black" lives here. The
+  // visibility-restore state machine elsewhere in this file covers
+  // the in-app `display: none ↔ flex` flip but is blind to OS-level
+  // window occlusion.
+  //
+  // On `visibilitychange` → visible we reconfigure + force a paint.
+  // On → hidden we signal markHidden so the next come-back resize
+  // takes the slow path even at unchanged dimensions (mirrors the
+  // isVisible-driven path's contract).
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const onVisibilityChange = () => {
+      const renderer = rendererRef.current;
+      if (!renderer) return;
+      if (document.visibilityState === "visible") {
+        renderer.reconfigure();
+        renderRequest(renderer);
+      } else {
+        renderer.markHidden();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Viewport-intersection guard. The `isVisible` prop is driven by the
+  // keepalive layer's intra-app visibility (which tab is active). But
+  // upstream UI can hide / reveal the canvas without flipping that
+  // prop — collapsing a side panel, opening a modal, scrolling the
+  // canvas off-screen inside an overflow container. WebKit may release
+  // the GPU surface during any such hide; the next render after the
+  // canvas re-enters the viewport lands on a dead swapchain.
+  //
+  // IntersectionObserver fires whenever the wrapper crosses 0% / 100%
+  // intersection with the viewport. On a re-entry we reconfigure +
+  // paint, same recovery as the keepalive-layer restore. The leave
+  // edge flips needsReconfigure via markHidden so the next entry
+  // still takes the configure path even if the dimensions never
+  // changed in between.
+  //
+  // Gated by `if (typeof IntersectionObserver !== 'undefined')` — Bun
+  // / jsdom test environments don't ship it and we'd crash on import
+  // otherwise.
+  const wrapperVisibleRef = useRef(true);
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
+    if (typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        const renderer = rendererRef.current;
+        if (!renderer) return;
+        const nowVisible = entry.isIntersecting;
+        const wasVisible = wrapperVisibleRef.current;
+        if (nowVisible && !wasVisible) {
+          renderer.reconfigure();
+          renderRequest(renderer);
+        } else if (!nowVisible && wasVisible) {
+          renderer.markHidden();
+        }
+        wrapperVisibleRef.current = nowVisible;
+      },
+      { threshold: 0 },
+    );
+    observer.observe(wrapper);
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Repaint at the new DPR when the user drags Goonware between a Retina
   // and an external 1x monitor mid-session. Without this, the canvas

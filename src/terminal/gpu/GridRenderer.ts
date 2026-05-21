@@ -213,6 +213,35 @@ const FLAG_STRIKE = 2;
 const FLAG_CURSOR = 4;
 const FLAG_SELECTED = 8;
 
+/**
+ * Number of consecutive successful draws between forced
+ * `context.configure(...)` heartbeats.
+ *
+ * Why a heartbeat exists: WKWebView can silently release the canvas's
+ * GPU surface mid-session — not just on hide/show — without firing
+ * `device.lost` or any ResizeObserver tick. `getCurrentTexture()` then
+ * returns a texture that draws nowhere (or throws on the next call);
+ * the user reports it as "the terminal went black WHILE the agent was
+ * running, I hadn't switched tabs." The existing visibility-restore +
+ * resize-time reconfigure can't help here because nothing on the
+ * wrapper / visibility side actually changed.
+ *
+ * The heartbeat is the load-bearing safety net for that class. Every
+ * HEARTBEAT_FRAMES successful paints, the next `draw()` pre-emptively
+ * reconfigures the swapchain. Configure on a healthy surface is
+ * idempotent (the browser short-circuits when the descriptor is
+ * unchanged), so the ongoing cost is negligible. The cost of NOT
+ * having it is "agent shell stuck on black until the user switches
+ * tabs back and forth," which is the user-reported symptom this guards.
+ *
+ * Threshold choice: 60 frames ≈ 1 second at the renderer's 60Hz
+ * cadence. A surface-death window of up to 1 second of black-out before
+ * auto-recovery. Smaller than the user's perceptual stuck threshold
+ * (which feels like several seconds) and big enough that the
+ * reconfigure cost stays sub-percent of frame time.
+ */
+const HEARTBEAT_FRAMES = 60;
+
 export class GridRenderer {
   private device: GPUDevice;
   private context: GPUCanvasContext;
@@ -247,6 +276,13 @@ export class GridRenderer {
    * next render call calls `reconfigure()` before attempting the draw
    * again. Resets to false after a successful draw.
    *
+   * Also set by `markHidden()` so the next `resize()` after a
+   * `display: none → flex` flip takes the full configure path even
+   * when the wrapper dimensions didn't change. Without this signal
+   * the resize() fast path (dimensions unchanged → no-op) would
+   * skip the reconfigure and the user would land on a dead
+   * swapchain.
+   *
    * Why: WKWebView can release the canvas's GPU surface during a
    * `display: none` window without firing `device.lost` — the
    * device is fine, but the swapchain is dead. The next paint
@@ -256,6 +292,33 @@ export class GridRenderer {
    * the user.
    */
   private needsReconfigure = false;
+  /**
+   * Last physical canvas dimensions we resized to. Used by `resize()`
+   * to skip the canvas.width/height + configure() driver round-trip
+   * when the wrapper fires a ResizeObserver tick with the same size
+   * (the common case for keepalive layer visibility flips — the
+   * absolute-positioned wrapper has the same inset:0 rect before and
+   * after the display flip).
+   *
+   * Was the dominant contributor to "switching cells is super slow"
+   * once a project accumulated more than a couple of agent shells —
+   * every show-hide cycle paid a configure() driver call per cell
+   * just to land on identical dimensions.
+   */
+  private lastPhysWidth = 0;
+  private lastPhysHeight = 0;
+  /**
+   * Successful `draw()` paints since the last `reconfigure()`. Drives
+   * the heartbeat — see `HEARTBEAT_FRAMES` above for the full WHY.
+   *
+   * Only incremented on the post-submit path so a skipped frame
+   * (getCurrentTexture failed twice → bail) does NOT count toward the
+   * threshold. Otherwise a stuck-dead surface would trip the
+   * heartbeat almost immediately and the reconfigure would land too
+   * often during real failure conditions (where the visibility-
+   * restore + draw-retry paths are already trying to recover).
+   */
+  private framesSinceReconfigure = 0;
 
   constructor(
     device: GPUDevice,
@@ -386,6 +449,14 @@ export class GridRenderer {
       });
       this.needsReconfigure = false;
       this.lastSeq = -1;
+      // Heartbeat counter resets every time we successfully
+      // re-acquire the swapchain — including the resize-time path,
+      // which routes through here implicitly via the configure call.
+      // Resetting here (instead of at draw time) means a successful
+      // reconfigure ALWAYS restarts the heartbeat clock, even if the
+      // caller routed through `resize()` rather than this method
+      // directly.
+      this.framesSinceReconfigure = 0;
     } catch (err) {
       // configure() can throw if the canvas is detached from the DOM
       // or the context is already in a bad state. We can't do
@@ -414,14 +485,40 @@ export class GridRenderer {
     // with, so an extra pixel of vertical headroom is invisible.
     const physWidth = Math.max(1, Math.floor(cssWidth * dpr));
     const physHeight = Math.max(1, Math.ceil(cssHeight * dpr));
-    // 2. Pin the canvas's CSS size to physWidth/dpr (instead of letting
-    //    the layout pick a fractional CSS size). This avoids browser
-    //    resampling between the pixel buffer and the displayed CSS box
-    //    — the dominant source of "fuzzy text" in WebGPU terminals.
-    //    Ceiling here may push the canvas CSS size to be at most one
-    //    device pixel wider/taller than the wrapper asked for; the
-    //    extra row of pixels is unfilled (cleared to background) and
-    //    invisible.
+    // Fast path: dimensions unchanged AND we have no reason to
+    // believe the surface is dead. ResizeObserver fires once per
+    // frame, and a keepalive-layer display:none → flex flip will
+    // re-emit the SAME contentRect we resized to before the hide
+    // (the absolute-positioned wrapper's box geometry doesn't
+    // change with `display`). Doing the canvas.width/height
+    // assignments + a `context.configure()` driver round-trip
+    // here on every such tick is what the user feels as "switching
+    // cells is super slow" once a project has more than a handful
+    // of agent shells in the keepalive layer.
+    //
+    // `needsReconfigure` is the surface-may-be-dead signal — it's
+    // set by `markHidden()` on visibility-flip-to-hidden and by
+    // the `draw()` retry path. When it's TRUE we MUST take the
+    // slow path (canvas reset + configure) even when dimensions
+    // match, because the WKWebView swapchain might have been
+    // silently released while we were `display: none`. Skipping
+    // the configure here would land the user on a dead surface =
+    // back to the original "switch tab → black pane" bug.
+    if (
+      physWidth === this.lastPhysWidth &&
+      physHeight === this.lastPhysHeight &&
+      !this.needsReconfigure
+    ) {
+      return;
+    }
+    // Pin the canvas's CSS size to physWidth/dpr (instead of letting
+    // the layout pick a fractional CSS size). This avoids browser
+    // resampling between the pixel buffer and the displayed CSS box
+    // — the dominant source of "fuzzy text" in WebGPU terminals.
+    // Ceiling here may push the canvas CSS size to be at most one
+    // device pixel wider/taller than the wrapper asked for; the
+    // extra row of pixels is unfilled (cleared to background) and
+    // invisible.
     const canvas = this.context.canvas as HTMLCanvasElement;
     canvas.width = physWidth;
     canvas.height = physHeight;
@@ -432,7 +529,8 @@ export class GridRenderer {
     // succeed in CSS but still hit a dead GPU surface on the next
     // getCurrentTexture() — exactly the "switch tabs → black pane"
     // user report. configure() is idempotent on a healthy surface,
-    // so calling it on every resize is cheap insurance.
+    // so calling it here is cheap insurance — and the fast-path
+    // short-circuit above keeps it from running on no-op resizes.
     try {
       this.context.configure({
         device: this.device,
@@ -440,6 +538,12 @@ export class GridRenderer {
         alphaMode: "premultiplied",
       });
       this.needsReconfigure = false;
+      // Reset the heartbeat clock on every successful resize-time
+      // reconfigure. Otherwise a busy ResizeObserver burst (e.g. an
+      // agent streaming output that grows scrollback row by row)
+      // would each immediately tally toward HEARTBEAT_FRAMES and we'd
+      // double-reconfigure every second of agent output.
+      this.framesSinceReconfigure = 0;
     } catch (err) {
       // Same fallback as in `reconfigure()` — if configure() throws
       // we can't usefully recover from inside resize; flag for the
@@ -448,8 +552,29 @@ export class GridRenderer {
       // eslint-disable-next-line no-console
       console.warn("[GridRenderer] resize-time configure failed:", err);
     }
+    // Remember the new dimensions so the next no-op resize tick
+    // takes the fast path above.
+    this.lastPhysWidth = physWidth;
+    this.lastPhysHeight = physHeight;
     // Force the next render to repaint regardless of seq dedupe.
     this.lastSeq = -1;
+  }
+
+  /**
+   * Signal that the canvas is about to be hidden (parent went
+   * `display: none`). Sets `needsReconfigure` so the next `resize()`
+   * — which typically fires the moment we come back visible and
+   * ResizeObserver re-emits the same contentRect — does NOT take
+   * the dimensions-unchanged fast path. The WKWebView swapchain may
+   * have been silently released while we were hidden; we need a
+   * fresh `context.configure(...)` to land on a live surface.
+   *
+   * Cheap (one boolean write). Safe to call repeatedly. Has no
+   * effect on the renderer's current frame — it only changes what
+   * the NEXT resize does.
+   */
+  markHidden(): void {
+    this.needsReconfigure = true;
   }
 
   /**
@@ -742,6 +867,25 @@ export class GridRenderer {
   }
 
   private draw(instanceCount: number): void {
+    // Heartbeat: every HEARTBEAT_FRAMES successful paints, force a
+    // pre-emptive reconfigure of the swapchain. The user-visible bug
+    // this catches is "agent shell goes black mid-run, no tab switch,
+    // no resize" — WKWebView can silently release the GPU surface
+    // and the next `getCurrentTexture()` returns a texture that
+    // paints into the void (no throw, no device.lost, nothing to
+    // hook). The visibility-restore + resize-time reconfigure paths
+    // only fire on a state change; if the page is sitting still
+    // while frames flow in, neither helps. The heartbeat is the
+    // safety net.
+    //
+    // Cheap by design: at sustained 60Hz the cost is one configure
+    // every HEARTBEAT_FRAMES frames (≈ 1 Hz at the default). On a
+    // healthy surface the browser short-circuits configure() with
+    // the same descriptor, so the wall-clock impact is sub-percent
+    // of frame time.
+    if (this.framesSinceReconfigure >= HEARTBEAT_FRAMES) {
+      this.needsReconfigure = true;
+    }
     // If the previous draw flagged a dead swapchain, reconfigure
     // BEFORE attempting another getCurrentTexture(). Skipping the
     // reconfigure would just re-throw and leave the canvas black.
@@ -793,6 +937,12 @@ export class GridRenderer {
     }
     pass.end();
     this.device.queue.submit([encoder.finish()]);
+    // Heartbeat tally: only count frames we actually submitted to
+    // the GPU. Skipped frames (the early `return` paths in the
+    // try/catch above) deliberately don't tick the counter so a
+    // pathological dead-surface run doesn't trip the heartbeat
+    // before the draw-retry path has had a chance to recover.
+    this.framesSinceReconfigure++;
   }
 }
 
