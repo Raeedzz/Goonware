@@ -79,6 +79,9 @@ export function MainColumn() {
       setPendingClose(tab);
       return;
     }
+    // Explicit shell close: cascade-delete the PTY's SQLite history so
+    // it doesn't outlive the session the user just dismissed.
+    if (tab.kind === "terminal") forgetPtys([tab.ptyId]);
     dispatch({ type: "close-tab", id: tab.id });
   };
 
@@ -120,7 +123,12 @@ export function MainColumn() {
         tab={pendingClose}
         onCancel={() => setPendingClose(null)}
         onDiscard={() => {
-          if (pendingClose) dispatch({ type: "close-tab", id: pendingClose.id });
+          if (pendingClose) {
+            if (pendingClose.kind === "terminal") {
+              forgetPtys([pendingClose.ptyId]);
+            }
+            dispatch({ type: "close-tab", id: pendingClose.id });
+          }
           setPendingClose(null);
         }}
         onSave={async () => {
