@@ -229,8 +229,18 @@ fn should_drop_envelope(envelope: &HookEnvelope) -> bool {
 ///   * Turn-start (UserPromptSubmit / BeforeAgent) → Working, set turn
 ///   * Turn-end   (Stop / AfterAgent / SessionStart / SessionEnd /
 ///                 Notification[idle_prompt]) → Idle, clear turn
-///   * In-turn   (PreToolUse / PostToolUse / BeforeTool / etc.) →
-///                 Working only if a turn is active; otherwise ignored.
+///   * In-turn   (PreToolUse / PostToolUse / SubagentStart /
+///                 SubagentStop / BeforeTool / etc.) → Working only
+///                 if a turn is active; otherwise ignored.
+///
+/// SubagentStop is in-turn, NOT turn-end: Claude's Task tool spawns
+/// a subagent whose completion fires SubagentStop, but the parent
+/// agent is still working (it's about to consume the subagent's
+/// result and continue tool-calling). Classifying SubagentStop as a
+/// turn-end event was the source of the recurring "spinner stops
+/// mid-task" bug — it cleared the turn flag and every following
+/// PreToolUse from the parent agent got dropped by the in-turn
+/// gate, so the spinner stayed dark until the FINAL Stop.
 ///
 /// Compaction events keep the existing turn state — auto-compact can
 /// fire while idle (preserving idle) or mid-turn (preserving working).
@@ -248,7 +258,18 @@ fn classify_event(
             | "PostToolUse"
             | "PostToolUseFailure"
             | "PostToolBatch"
-            | "SubagentStart" => {
+            | "SubagentStart"
+            // SubagentStop fires when a Task-tool subagent finishes —
+            // the MAIN agent is still mid-turn and about to consume
+            // the subagent's result. Treating it like `Stop` (clearing
+            // in_user_turn and dropping to Idle) extinguishes the
+            // spinner while real work continues, AND causes every
+            // subsequent PreToolUse/PostToolUse from the main agent to
+            // be dropped by the in-turn gate below. So classify it as
+            // an in-turn event: Working when a turn is active, ignored
+            // otherwise (defensive — a stray SubagentStop arriving
+            // after Stop must not reignite the spinner).
+            | "SubagentStop" => {
                 if in_user_turn {
                     Some((SessionStatus::Working, true))
                 } else {
@@ -267,7 +288,7 @@ fn classify_event(
                 _ => None,
             },
 
-            "Stop" | "SubagentStop" => Some((SessionStatus::Idle, false)),
+            "Stop" => Some((SessionStatus::Idle, false)),
             "SessionStart" => Some((SessionStatus::Idle, false)),
             "SessionEnd" => Some((SessionStatus::Ended, false)),
             _ => None,
@@ -1172,6 +1193,12 @@ mod tests {
             classify_event(Provider::Claude, "SubagentStart", "", false),
             None
         );
+        // SubagentStop is in the same in-turn group — a stray one
+        // arriving after the real Stop must not reignite the spinner.
+        assert_eq!(
+            classify_event(Provider::Claude, "SubagentStop", "", false),
+            None
+        );
     }
 
     /// Same gating applies to Gemini's tool / model events. Without
@@ -1243,16 +1270,15 @@ mod tests {
     /// Turn-end events clear the flag so a subsequent stray tool
     /// event (rare, but possible from a buggy agent) doesn't reignite
     /// the spinner.
+    ///
+    /// SubagentStop is deliberately NOT in this set — see
+    /// `subagent_stop_does_not_end_user_turn` for the regression test
+    /// that locks the correct behavior in.
     #[test]
     fn turn_end_events_clear_in_user_turn() {
         // After Stop, in_user_turn is false → subsequent tool event drops.
         let (status, in_turn) =
             classify_event(Provider::Claude, "Stop", "", true).unwrap();
-        assert_eq!(status, SessionStatus::Idle);
-        assert!(!in_turn);
-
-        let (status, in_turn) =
-            classify_event(Provider::Claude, "SubagentStop", "", true).unwrap();
         assert_eq!(status, SessionStatus::Idle);
         assert!(!in_turn);
 
@@ -1265,6 +1291,63 @@ mod tests {
             classify_event(Provider::Claude, "SessionStart", "", true).unwrap();
         assert_eq!(status, SessionStatus::Idle);
         assert!(!in_turn);
+    }
+
+    /// Regression: SubagentStop (fires when Claude's Task tool
+    /// subagent completes) used to be classified identically to Stop,
+    /// which extinguished the spinner mid-turn and — because it also
+    /// cleared in_user_turn — caused every subsequent PreToolUse from
+    /// the parent agent to be dropped by the in-turn gate. Net effect:
+    /// the spinner went dark for the rest of the turn while Claude was
+    /// still searching files and writing code. The user-facing symptom
+    /// was "the Claude spinner just stopped working even though it's
+    /// still going."
+    ///
+    /// Correct behavior: SubagentStop is an IN-TURN event. It must
+    /// keep the spinner on (status Working) and preserve the turn
+    /// flag so the parent agent's continuing PreToolUse events get
+    /// classified instead of dropped.
+    #[test]
+    fn subagent_stop_does_not_end_user_turn() {
+        // SubagentStop mid-turn: still Working, turn flag preserved.
+        let (status, in_turn) =
+            classify_event(Provider::Claude, "SubagentStop", "", true).unwrap();
+        assert_eq!(status, SessionStatus::Working);
+        assert!(in_turn);
+
+        // The exact sequence that produced the visible bug: prompt →
+        // PreToolUse(Task) → SubagentStop → PreToolUse(Bash). Step 4
+        // must remain classified as Working, NOT dropped by the gate.
+        let mut in_turn = false;
+        let (s, t) =
+            classify_event(Provider::Claude, "UserPromptSubmit", "", in_turn).unwrap();
+        in_turn = t;
+        assert_eq!(s, SessionStatus::Working);
+        assert!(in_turn);
+
+        let (s, t) =
+            classify_event(Provider::Claude, "PreToolUse", "", in_turn).unwrap();
+        in_turn = t;
+        assert_eq!(s, SessionStatus::Working);
+        assert!(in_turn);
+
+        let (s, t) =
+            classify_event(Provider::Claude, "SubagentStop", "", in_turn).unwrap();
+        in_turn = t;
+        assert_eq!(s, SessionStatus::Working, "spinner must stay on after SubagentStop");
+        assert!(in_turn, "turn must persist past SubagentStop so further tool events are not dropped");
+
+        let post_subagent = classify_event(Provider::Claude, "PreToolUse", "", in_turn);
+        assert_eq!(
+            post_subagent,
+            Some((SessionStatus::Working, true)),
+            "PreToolUse after SubagentStop must NOT be dropped — that's how the spinner went dark mid-task"
+        );
+
+        // The real turn end still works.
+        let (s, t) = classify_event(Provider::Claude, "Stop", "", in_turn).unwrap();
+        assert_eq!(s, SessionStatus::Idle);
+        assert!(!t);
     }
 
     /// PreCompact / PreCompress preserve the existing turn state.
