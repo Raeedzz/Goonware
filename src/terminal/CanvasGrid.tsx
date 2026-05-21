@@ -614,14 +614,54 @@ export function CanvasGrid({
   // AND no DOM selection is competing, copy the selection text
   // directly. The textarea-level handler still runs first when the
   // grid IS interactive, so this doesn't double-copy.
+  //
+  // Guardrails — we must NEVER intercept Cmd+C while the user has
+  // focus inside a real editable surface (code editor, markdown view,
+  // commit composer, branch switcher input, …). Without these gates a
+  // *stale* `selectionRef.current` (user dragged-selected in the
+  // canvas earlier, then clicked away to a different pane) would let
+  // this handler steal Cmd+C *in the editor* and write the stale
+  // canvas selection to the clipboard. That regression is invisible
+  // to the user — Cmd+C just "doesn't work" anywhere outside the
+  // canvas. The active-element check below is the load-bearing one
+  // that keeps this handler from leaking outside the grid.
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.defaultPrevented) return;
       if (!e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
       if (e.key.toLowerCase() !== "c") return;
       if (!selectionRef.current) return;
+      // If focus is on a real editable element (textarea, input, or
+      // any contenteditable surface like CodeMirror / TipTap), let
+      // the native Cmd+C path run — the user is trying to copy from
+      // that input, not from a stale canvas selection.
+      const active = document.activeElement;
+      if (active && active !== document.body) {
+        if (
+          active instanceof HTMLTextAreaElement ||
+          active instanceof HTMLInputElement
+        ) {
+          return;
+        }
+        if (active instanceof HTMLElement && active.isContentEditable) {
+          return;
+        }
+      }
       const docSel = window.getSelection();
       if (docSel && !docSel.isCollapsed && docSel.toString().length > 0) {
+        // A live DOM selection exists somewhere on the page (e.g. the
+        // user dragged across markdown rendered text). If that
+        // selection is inside an editable, also bail — Cmd+C must
+        // copy what the user just highlighted, not our stale state.
+        const anchor = docSel.anchorNode;
+        const anchorEl =
+          anchor instanceof Element ? anchor : anchor?.parentElement ?? null;
+        if (anchorEl) {
+          if (anchorEl.closest("textarea, input")) return;
+          if (anchorEl instanceof HTMLElement && anchorEl.isContentEditable) {
+            return;
+          }
+        }
         return;
       }
       const text = extractSelectionText();

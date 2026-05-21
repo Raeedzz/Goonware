@@ -203,4 +203,85 @@ describe("clipboard chords — Cmd+C / Cmd+V / Cmd+X / Cmd+A all pass through", 
       keyToBytes(ke({ key: "C", metaKey: true, shiftKey: true }), false),
     ).toBeNull();
   });
+
+  // Additional edge-case coverage for the clipboard chord contract.
+  // The regression in 0.0.22/0.0.23 was not about encoding — it was
+  // about handler ordering and `preventDefault()` placement — but a
+  // future "simplification" that flattens these guards could easily
+  // recreate the symptom. Each test below pins one specific case
+  // that, if it ever started returning non-null, would silently
+  // break Cmd+C/V/X/A somewhere in the app.
+  describe("uppercase + caps-lock variants pass through", () => {
+    // Some keyboard layouts and OS configurations report Cmd+C as
+    // `e.key === "C"` (uppercase) when caps-lock is engaged. The
+    // textarea and OS handle that fine, but if our `toLowerCase()`
+    // call ever moved up the call chain in a way that changed the
+    // switch-on-key behavior, uppercase variants could silently fall
+    // into a different branch. Pin the pass-through.
+    for (const letter of ["C", "V", "X", "A"]) {
+      test(`Cmd+${letter} (uppercase) is not encoded`, () => {
+        expect(keyToBytes(ke({ key: letter, metaKey: true }), false)).toBeNull();
+      });
+    }
+  });
+
+  describe("Cmd+Z (undo) and Cmd+Shift+Z (redo) pass through", () => {
+    // Both are part of the standard macOS Edit menu (undo + redo via
+    // PredefinedMenuItem). Treat them with the same care as Cmd+C/V
+    // because the same `Menu::default(app)` path wires them in. If
+    // keyToBytes ever encoded Cmd+Z to a PTY byte, the textarea's
+    // undo-stack would lock up.
+    test("Cmd+Z is not encoded", () => {
+      expect(keyToBytes(ke({ key: "z", metaKey: true }), false)).toBeNull();
+    });
+    test("Cmd+Shift+Z is not encoded", () => {
+      expect(
+        keyToBytes(ke({ key: "z", metaKey: true, shiftKey: true }), false),
+      ).toBeNull();
+    });
+    test("Cmd+Z and Cmd+Shift+Z are not flagged as global chords", () => {
+      // The textarea's native undo path needs the keystroke to reach
+      // it — bubbling to useKeyboardShortcuts would steal it.
+      expect(isGlobalChord(ke({ key: "z", metaKey: true }))).toBe(false);
+      expect(
+        isGlobalChord(ke({ key: "z", metaKey: true, shiftKey: true })),
+      ).toBe(false);
+    });
+  });
+
+  describe("Cmd-only modifier does NOT collide with Ctrl-letter encoding", () => {
+    // The PTY-byte encoding for Ctrl+letter (line 86-91 in
+    // keyEncoding.ts) gates on `ctrl && !alt`. It would be very easy
+    // for a refactor to drop the `!meta` implicit guard (the meta
+    // case is handled earlier and returns) and start encoding
+    // Cmd+letter as if it were Ctrl+letter — that would send 0x03
+    // to the PTY on Cmd+C, blowing away the clipboard chord. Pin
+    // that Cmd-only (no Ctrl) on letter keys returns null.
+    for (const letter of ["c", "v", "x", "a", "z"]) {
+      test(`Cmd+${letter.toUpperCase()} with ctrlKey=false is not encoded`, () => {
+        expect(
+          keyToBytes(
+            ke({ key: letter, metaKey: true, ctrlKey: false }),
+            false,
+          ),
+        ).toBeNull();
+      });
+    }
+  });
+
+  describe("Ctrl+V on macOS still encodes to PTY (literal-next-char)", () => {
+    // Ctrl+V in Unix terminals is "insert next char verbatim" — the
+    // PTY needs to see 0x16 for vim, less, and shell line editors to
+    // handle it correctly. macOS clipboard paste is Cmd+V, NOT
+    // Ctrl+V. We must keep encoding Ctrl+V → 0x16 so the terminal
+    // experience matches every other terminal app. If a future
+    // change broadens "don't encode Ctrl+letter on macOS" — to fix
+    // a non-existent paste issue, say — it would break literal-next
+    // in every TUI we ship with.
+    test("Ctrl+V → [0x16] (literal next char in terminals)", () => {
+      const bytes = keyToBytes(ke({ key: "v", ctrlKey: true }), false);
+      expect(bytes).not.toBeNull();
+      expect(Array.from(bytes!)).toEqual([0x16]);
+    });
+  });
 });
