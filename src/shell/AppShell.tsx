@@ -128,9 +128,33 @@ export function AppShell() {
   );
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const onResize = () => setViewportWidth(window.innerWidth);
+    // rAF-coalesce the window-resize signal. macOS fires `resize`
+    // continuously during a live window-drag (often >120 Hz on
+    // high-refresh displays). Calling `setViewportWidth` on every
+    // event forces a React commit per OS sample, which cascades into
+    // a flex relayout → CanvasGrid ResizeObserver → WebGPU backbuffer
+    // realloc per sample. That's the dominant jitter source in the
+    // bundled DMG. Warp's resize stream uses a Debounce/Throttle
+    // combinator for the same reason (see warpdotdev/warp
+    // `app/src/throttle.rs`); on the web side rAF gives us a free
+    // throttle aligned to the compositor's frame cadence.
+    let rafId: number | null = null;
+    let pending: number | null = null;
+    const flush = () => {
+      rafId = null;
+      const next = pending;
+      pending = null;
+      if (next != null) setViewportWidth(next);
+    };
+    const onResize = () => {
+      pending = window.innerWidth;
+      if (rafId === null) rafId = window.requestAnimationFrame(flush);
+    };
     window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+    };
   }, []);
 
   let sidebarPx = storedSidebarPx;
