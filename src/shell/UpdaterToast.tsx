@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import type { Update } from "@tauri-apps/plugin-updater";
-import { Download04Icon, Cancel01Icon } from "hugeicons-react";
+import {
+  Download04Icon,
+  Cancel01Icon,
+  Loading03Icon,
+  AlertCircleIcon,
+} from "hugeicons-react";
 import {
   checkForUpdate,
   downloadAndInstall,
@@ -10,25 +15,22 @@ import {
 } from "@/lib/updater";
 
 /**
- * Bottom-left "update available" toast.
+ * Bottom-left single-line update strip.
  *
- * Lifecycle the user sees:
- *   1. App boot → silent `check`. If nothing, the toast stays hidden.
- *   2. New version found → slide in from below-left, "Install" button.
- *   3. Click Install → progress bar fills with downloaded bytes.
- *   4. Download done → "Restart now" button replaces the progress bar.
- *   5. Click Restart → app relaunches into the new binary.
+ *   1. Boot → silent check; hidden if up-to-date.
+ *   2. New version → "Update to v0.4.2 · Install".
+ *   3. Click Install → version + percent in the row, 2px progress fill on the bottom edge.
+ *   4. Download done → ~800ms "Restarting…" beat, then relaunch automatically.
+ *   5. × dismisses for this session; the periodic re-check resurfaces it later.
  *
- * The X icon dismisses the toast for this session — the next launch
- * (or the periodic re-check below) will surface it again.
- *
- * Checks run on startup and every `RECHECK_INTERVAL_MS` after that,
- * so a long-running session still picks up new releases.
+ * Release notes don't fit on one line and live on the GitHub release page —
+ * the user can read them there if they care, or just trust the patch.
  */
 
-const RECHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
-const STARTUP_DELAY_MS = 5 * 1000; // wait 5s after mount so we don't race app boot
-const TOAST_WIDTH = 320;
+const RECHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+const STARTUP_DELAY_MS = 5 * 1000;
+const AUTO_RESTART_DELAY_MS = 800;
+const TOAST_WIDTH = 340;
 
 export function UpdaterToast() {
   const [phase, setPhase] = useState<UpdaterPhase>({ kind: "idle" });
@@ -36,9 +38,6 @@ export function UpdaterToast() {
   const updateRef = useRef<Update | null>(null);
 
   const runCheck = useCallback(async () => {
-    // Don't re-check while we're already in a non-idle flow — the
-    // caller is mid-install or showing an error; trampling that with
-    // a fresh "available" state would confuse the UI.
     if (phase.kind !== "idle") return;
     setPhase({ kind: "checking" });
     try {
@@ -55,8 +54,6 @@ export function UpdaterToast() {
       });
       setDismissed(false);
     } catch (err) {
-      // Network blip / endpoint 404 / signature mismatch — keep the
-      // session quiet and try again on the next tick.
       setPhase({ kind: "idle" });
       // eslint-disable-next-line no-console
       console.warn("[updater] check failed", err);
@@ -99,17 +96,23 @@ export function UpdaterToast() {
     }
   }, []);
 
-  const onRestart = useCallback(async () => {
-    setPhase({ kind: "applying" });
-    try {
-      await relaunchApp();
-    } catch (err) {
-      setPhase({
-        kind: "error",
-        message: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }, []);
+  // Auto-restart once the download finishes. Brief beat so the user
+  // reads "Restarting…" before the process is yanked out from under them.
+  useEffect(() => {
+    if (phase.kind !== "ready") return;
+    const t = window.setTimeout(async () => {
+      setPhase({ kind: "applying" });
+      try {
+        await relaunchApp();
+      } catch (err) {
+        setPhase({
+          kind: "error",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }, AUTO_RESTART_DELAY_MS);
+    return () => window.clearTimeout(t);
+  }, [phase.kind]);
 
   const visible =
     !dismissed &&
@@ -124,10 +127,10 @@ export function UpdaterToast() {
       {visible && (
         <motion.div
           key="updater-toast"
-          initial={{ opacity: 0, x: -12, y: 8 }}
-          animate={{ opacity: 1, x: 0, y: 0 }}
-          exit={{ opacity: 0, x: -8, y: 4, transition: { duration: 0.16 } }}
-          transition={{ duration: 0.26, ease: [0.16, 1, 0.3, 1] }}
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: 4, transition: { duration: 0.14 } }}
+          transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
           role="status"
           aria-live="polite"
           style={{
@@ -135,262 +138,171 @@ export function UpdaterToast() {
             left: 16,
             bottom: 16,
             width: TOAST_WIDTH,
+            height: 32,
             zIndex: "var(--z-toast)" as unknown as number,
             backgroundColor: "var(--surface-2)",
-            border: "1px solid var(--border-strong)",
+            border: "1px solid var(--border-default)",
             borderRadius: "var(--radius-md)",
             boxShadow:
-              "0 10px 30px oklch(0% 0 0 / 0.45), 0 1px 2px oklch(0% 0 0 / 0.4)",
-            padding: "12px 14px 12px 12px",
+              "0 8px 24px oklch(0% 0 0 / 0.40), 0 1px 2px oklch(0% 0 0 / 0.35)",
+            paddingLeft: 10,
+            paddingRight: 4,
             fontFamily: "var(--font-sans)",
             color: "var(--text-primary)",
             display: "flex",
-            flexDirection: "column",
-            gap: 10,
+            alignItems: "center",
+            gap: 8,
+            overflow: "hidden",
           }}
         >
-          <Header phase={phase} onDismiss={() => setDismissed(true)} />
-          <Body phase={phase} onInstall={onInstall} onRestart={onRestart} />
+          <PhaseIcon phase={phase} />
+          <Label phase={phase} />
+          <Actions
+            phase={phase}
+            onInstall={onInstall}
+            onDismiss={() => setDismissed(true)}
+          />
+          <ProgressStrip phase={phase} />
         </motion.div>
       )}
     </AnimatePresence>
   );
 }
 
-function Header({
-  phase,
-  onDismiss,
-}: {
-  phase: UpdaterPhase;
-  onDismiss: () => void;
-}) {
-  const title = (() => {
-    switch (phase.kind) {
-      case "available":
-        return "Update available";
-      case "downloading":
-        return "Downloading update";
-      case "ready":
-        return "Update ready";
-      case "applying":
-        return "Restarting…";
-      case "error":
-        return "Update failed";
-      default:
-        return "";
-    }
-  })();
-  const version =
-    phase.kind === "available" ||
-    phase.kind === "downloading" ||
-    phase.kind === "ready"
-      ? phase.version
-      : null;
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <span
-        aria-hidden
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: "center",
-          width: 22,
-          height: 22,
-          borderRadius: "var(--radius-sm)",
-          backgroundColor:
-            phase.kind === "error"
-              ? "var(--surface-error-soft)"
-              : "color-mix(in oklch, var(--surface-3), var(--accent) 14%)",
-          color:
-            phase.kind === "error" ? "var(--state-error)" : "var(--accent)",
-          flexShrink: 0,
-        }}
-      >
-        <Download04Icon size={14} />
-      </span>
-      <div
-        style={{
-          flex: 1,
-          minWidth: 0,
-          display: "flex",
-          flexDirection: "column",
-          gap: 1,
-        }}
-      >
-        <div
-          style={{
-            fontSize: "var(--text-sm)",
-            fontWeight: "var(--weight-semibold)",
-            letterSpacing: "var(--tracking-tight)",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-          }}
-        >
-          {title}
-        </div>
-        {version && (
-          <div
-            style={{
-              fontSize: "var(--text-2xs)",
-              color: "var(--text-tertiary)",
-              fontFamily: "var(--font-mono)",
-            }}
-          >
-            v{version}
-          </div>
-        )}
-      </div>
-      <button
-        type="button"
-        title="Dismiss"
-        onClick={onDismiss}
-        style={{
-          width: 22,
-          height: 22,
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: "center",
-          borderRadius: "var(--radius-sm)",
-          backgroundColor: "transparent",
-          color: "var(--text-tertiary)",
-          border: "none",
-          cursor: "pointer",
-          transition:
-            "background-color var(--motion-instant) var(--ease-out-quart)," +
-            "color var(--motion-instant) var(--ease-out-quart)",
-        }}
-        onMouseEnter={(e) => {
-          e.currentTarget.style.backgroundColor = "var(--surface-3)";
-          e.currentTarget.style.color = "var(--text-primary)";
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.backgroundColor = "transparent";
-          e.currentTarget.style.color = "var(--text-tertiary)";
-        }}
-      >
-        <Cancel01Icon size={12} />
-      </button>
-    </div>
-  );
-}
-
-function Body({
-  phase,
-  onInstall,
-  onRestart,
-}: {
-  phase: UpdaterPhase;
-  onInstall: () => void;
-  onRestart: () => void;
-}) {
-  if (phase.kind === "available") {
+function PhaseIcon({ phase }: { phase: UpdaterPhase }) {
+  if (phase.kind === "error") {
     return (
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          gap: 10,
-        }}
-      >
-        {phase.notes && (
-          <p
-            style={{
-              margin: 0,
-              fontSize: "var(--text-xs)",
-              color: "var(--text-secondary)",
-              lineHeight: 1.45,
-              maxHeight: 60,
-              overflow: "hidden",
-              display: "-webkit-box",
-              WebkitLineClamp: 3,
-              WebkitBoxOrient: "vertical",
-              textOverflow: "ellipsis",
-            }}
-          >
-            {phase.notes}
-          </p>
-        )}
-        <div style={{ display: "flex", justifyContent: "flex-end" }}>
-          <PrimaryButton onClick={onInstall}>Install</PrimaryButton>
-        </div>
-      </div>
-    );
-  }
-  if (phase.kind === "downloading") {
-    const pct =
-      phase.total && phase.total > 0
-        ? Math.min(100, Math.round((phase.downloaded / phase.total) * 100))
-        : null;
-    return (
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        <ProgressBar value={pct} />
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            fontSize: "var(--text-2xs)",
-            fontFamily: "var(--font-mono)",
-            color: "var(--text-tertiary)",
-          }}
-        >
-          <span>{formatBytes(phase.downloaded)}</span>
-          <span>
-            {phase.total ? formatBytes(phase.total) : "…"}
-            {pct != null ? `  ·  ${pct}%` : ""}
-          </span>
-        </div>
-      </div>
-    );
-  }
-  if (phase.kind === "ready") {
-    return (
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 10,
-        }}
-      >
-        <span
-          style={{
-            fontSize: "var(--text-xs)",
-            color: "var(--text-secondary)",
-          }}
-        >
-          Restart to apply.
-        </span>
-        <PrimaryButton onClick={onRestart}>Restart now</PrimaryButton>
-      </div>
+      <AlertCircleIcon
+        size={13}
+        style={{ color: "var(--state-error)", flexShrink: 0 }}
+      />
     );
   }
   if (phase.kind === "applying") {
     return (
-      <div
+      <motion.span
+        aria-hidden
         style={{
-          fontSize: "var(--text-xs)",
-          color: "var(--text-tertiary)",
+          display: "inline-flex",
+          color: "var(--accent)",
+          flexShrink: 0,
         }}
+        animate={{ rotate: 360 }}
+        transition={{ duration: 1.1, ease: "linear", repeat: Infinity }}
       >
-        Hold on…
-      </div>
+        <Loading03Icon size={13} />
+      </motion.span>
     );
   }
-  if (phase.kind === "error") {
-    return (
-      <div
-        style={{
-          fontSize: "var(--text-xs)",
-          color: "var(--text-secondary)",
-          lineHeight: 1.45,
-        }}
-      >
-        {phase.message}
-      </div>
-    );
-  }
-  return null;
+  return (
+    <Download04Icon
+      size={13}
+      style={{ color: "var(--accent)", flexShrink: 0 }}
+    />
+  );
+}
+
+function Label({ phase }: { phase: UpdaterPhase }) {
+  const text = (() => {
+    switch (phase.kind) {
+      case "available":
+        return (
+          <>
+            Update to <Mono>v{phase.version}</Mono>
+          </>
+        );
+      case "downloading": {
+        const pct =
+          phase.total && phase.total > 0
+            ? Math.min(100, Math.round((phase.downloaded / phase.total) * 100))
+            : null;
+        return (
+          <>
+            Updating <Mono>v{phase.version}</Mono>
+            {pct != null && (
+              <>
+                <Sep />
+                <Mono>{pct}%</Mono>
+              </>
+            )}
+          </>
+        );
+      }
+      case "ready":
+      case "applying":
+        return <>Restarting…</>;
+      case "error":
+        return <span style={{ color: "var(--text-secondary)" }}>{phase.message}</span>;
+      default:
+        return null;
+    }
+  })();
+  return (
+    <div
+      style={{
+        flex: 1,
+        minWidth: 0,
+        fontSize: "var(--text-xs)",
+        letterSpacing: "var(--tracking-tight)",
+        whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+      }}
+    >
+      {text}
+    </div>
+  );
+}
+
+function Mono({ children }: { children: React.ReactNode }) {
+  return (
+    <span
+      style={{
+        fontFamily: "var(--font-mono)",
+        color: "var(--text-secondary)",
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+function Sep() {
+  return (
+    <span
+      aria-hidden
+      style={{ color: "var(--text-tertiary)", margin: "0 6px" }}
+    >
+      ·
+    </span>
+  );
+}
+
+function Actions({
+  phase,
+  onInstall,
+  onDismiss,
+}: {
+  phase: UpdaterPhase;
+  onInstall: () => void;
+  onDismiss: () => void;
+}) {
+  const showInstall = phase.kind === "available";
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 2,
+        flexShrink: 0,
+      }}
+    >
+      {showInstall && <PrimaryButton onClick={onInstall}>Install</PrimaryButton>}
+      {phase.kind !== "applying" && (
+        <DismissButton onClick={onDismiss} />
+      )}
+    </div>
+  );
 }
 
 function PrimaryButton({
@@ -407,9 +319,9 @@ function PrimaryButton({
       style={{
         display: "inline-flex",
         alignItems: "center",
-        gap: 6,
-        height: 28,
-        padding: "0 14px",
+        height: 22,
+        padding: "0 10px",
+        marginRight: 2,
         borderRadius: "var(--radius-sm)",
         backgroundColor: "var(--accent)",
         color: "var(--text-inverse)",
@@ -434,61 +346,92 @@ function PrimaryButton({
   );
 }
 
-function ProgressBar({ value }: { value: number | null }) {
-  // Two modes: known total → fill from 0..100, unknown → indeterminate
-  // shimmer (a tinted bar sliding back and forth).
+function DismissButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      title="Dismiss"
+      onClick={onClick}
+      style={{
+        width: 22,
+        height: 22,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        borderRadius: "var(--radius-sm)",
+        backgroundColor: "transparent",
+        color: "var(--text-tertiary)",
+        border: "none",
+        cursor: "pointer",
+        transition:
+          "background-color var(--motion-instant) var(--ease-out-quart)," +
+          "color var(--motion-instant) var(--ease-out-quart)",
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.backgroundColor = "var(--surface-3)";
+        e.currentTarget.style.color = "var(--text-primary)";
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.backgroundColor = "transparent";
+        e.currentTarget.style.color = "var(--text-tertiary)";
+      }}
+    >
+      <Cancel01Icon size={11} />
+    </button>
+  );
+}
+
+function ProgressStrip({ phase }: { phase: UpdaterPhase }) {
+  // Sits along the bottom edge of the toast. Determinate fill when the
+  // server told us the content length; otherwise a sliding indeterminate
+  // bar so the user knows something is happening.
+  const visible = phase.kind === "downloading" || phase.kind === "applying";
+  if (!visible) return null;
+
+  const pct =
+    phase.kind === "downloading" && phase.total && phase.total > 0
+      ? Math.min(100, (phase.downloaded / phase.total) * 100)
+      : null;
+
   return (
     <div
+      aria-hidden
       style={{
-        position: "relative",
-        height: 6,
-        borderRadius: "var(--radius-pill)",
+        position: "absolute",
+        left: 0,
+        right: 0,
+        bottom: 0,
+        height: 2,
         backgroundColor: "var(--surface-3)",
         overflow: "hidden",
       }}
     >
-      {value != null ? (
+      {pct != null ? (
         <motion.div
-          animate={{ width: `${value}%` }}
+          animate={{ width: `${pct}%` }}
           transition={{ duration: 0.2, ease: [0.25, 1, 0.5, 1] }}
           style={{
             position: "absolute",
-            inset: 0,
+            left: 0,
+            top: 0,
+            bottom: 0,
             backgroundColor: "var(--accent)",
-            borderRadius: "inherit",
           }}
         />
       ) : (
         <motion.div
           initial={{ left: "-40%" }}
           animate={{ left: "100%" }}
-          transition={{
-            duration: 1.2,
-            ease: "linear",
-            repeat: Infinity,
-          }}
+          transition={{ duration: 1.2, ease: "linear", repeat: Infinity }}
           style={{
             position: "absolute",
             top: 0,
             bottom: 0,
             width: "40%",
             backgroundColor: "var(--accent)",
-            borderRadius: "inherit",
           }}
         />
       )}
     </div>
   );
-}
-
-function formatBytes(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
 }
