@@ -50,19 +50,34 @@ export function IconPickerDialog({
   const nameRef = useRef<HTMLInputElement>(null);
   const backdropMouseDownRef = useRef(false);
 
+  // Parents pass inline arrow callbacks (`onRename`, `onClose`) that get
+  // fresh identities on every render, and `targetName` can change while
+  // open if unrelated worktree state updates upstream. Keep them in refs
+  // so the open/close effect only runs on the rising/falling edge of
+  // `open` — otherwise mid-typing parent re-renders re-seed `draftName`
+  // and wipe out the in-progress edit.
+  const targetNameRef = useRef(targetName);
+  const onCloseRef = useRef(onClose);
+  const onRenameRef = useRef(onRename);
+  useEffect(() => {
+    targetNameRef.current = targetName;
+    onCloseRef.current = onClose;
+    onRenameRef.current = onRename;
+  });
+
   useEffect(() => {
     if (!open) {
       setQuery("");
-      setDraftName(targetName);
+      setDraftName(targetNameRef.current);
       return;
     }
-    setDraftName(targetName);
+    setDraftName(targetNameRef.current);
     // Renaming is the most common reason to open this dialog, so focus
     // the name input and pre-select its text — users can immediately
     // type a new label and hit Enter. Falls back to the icon search
     // when the row isn't renameable (e.g. read-only callers).
     const t = window.setTimeout(() => {
-      if (onRename && nameRef.current) {
+      if (onRenameRef.current && nameRef.current) {
         nameRef.current.focus();
         nameRef.current.select();
       } else {
@@ -70,14 +85,14 @@ export function IconPickerDialog({
       }
     }, 80);
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
     window.addEventListener("keydown", onKey);
     return () => {
       window.clearTimeout(t);
       window.removeEventListener("keydown", onKey);
     };
-  }, [open, onClose, onRename, targetName]);
+  }, [open]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
