@@ -359,6 +359,50 @@ pub fn system_save_image_to_temp(
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Read the macOS clipboard's plain-text contents via the native
+/// `pbpaste` binary.
+///
+/// Why this exists: `navigator.clipboard.readText()` inside Tauri's
+/// WKWebView is governed by WebKit's clipboard permission policy and,
+/// on macOS 15+ (Sequoia), by the system-wide "Apps want to read your
+/// clipboard" gate. If the user ever dismissed or denied that prompt,
+/// the web API returns an empty string without throwing — and the
+/// Ctrl+V paste path in PromptInput / PtyPassthrough silently no-ops.
+///
+/// `/usr/bin/pbpaste` reads NSPasteboard via AppKit's standard paste
+/// pathway. macOS treats it as a first-party paste action, so the
+/// read succeeds even when the per-app clipboard-read prompt was
+/// declined for the WKWebView itself. That gives us a reliable
+/// fallback the Ctrl+V handlers route through whenever the browser
+/// API comes back empty.
+///
+/// Returns the clipboard text as UTF-8 (lossy on invalid bytes —
+/// `pbpaste` outputs whatever's on the pasteboard; a binary clipboard
+/// item produces a lossy decode rather than an error so the caller's
+/// paste flow still has something to work with). Returns an empty
+/// string if the clipboard is genuinely empty or pbpaste fails (e.g.
+/// PATH missing, signal interrupt). Errors only on spawn failures.
+#[tauri::command]
+pub async fn system_clipboard_read_text() -> Result<String, String> {
+    // Pin the absolute path. We've seen $PATH come through stripped
+    // when Goonware is launched outside a terminal (Finder/Dock); a
+    // bare `pbpaste` would then ENOENT. /usr/bin is system-pinned on
+    // macOS and ships pbpaste since 10.6 — no realistic ENOENT path
+    // unless the user has wiped their OS.
+    let output = Command::new("/usr/bin/pbpaste")
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("spawn pbpaste: {e}"))?;
+    if !output.status.success() {
+        // Non-zero exit — clipboard might just be empty or hold a
+        // non-text item. Return empty so the caller's fallback chain
+        // can decide what to do (most callers no-op cleanly).
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Opens a path in a named application (e.g. "Visual Studio Code",
 /// "Sublime Text", "Safari", "Google Chrome"). Uses `open -a` on macOS.
 #[tauri::command]

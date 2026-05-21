@@ -78,6 +78,19 @@ export const system = {
       base64Bytes: bytesToBase64(bytes),
       extension,
     }),
+  /**
+   * Read the system clipboard as plain text via the native macOS
+   * `pbpaste`. Used as a fallback by Ctrl+V handlers when
+   * `navigator.clipboard.readText()` returns empty — see the doc on
+   * `system_clipboard_read_text` in src-tauri/src/fs.rs for the
+   * macOS 15+ permission gate that motivates this path.
+   *
+   * Returns "" rather than rejecting when the clipboard is empty or
+   * pbpaste exits non-zero, so callers can chain a simple
+   * `if (text.length === 0) return;` bail. The promise only rejects
+   * if the IPC bridge itself failed (Tauri host gone).
+   */
+  readClipboardText: () => invoke<string>("system_clipboard_read_text"),
 };
 
 function bytesToBase64(bytes: Uint8Array): string {

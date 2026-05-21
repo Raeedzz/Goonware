@@ -9,6 +9,7 @@ import {
 } from "react";
 import { system } from "@/lib/fs";
 import { shellQuotePath } from "@/lib/shellQuote";
+import { readClipboardTextWithFallback } from "./clipboardRead";
 import { isGlobalChord, keyToBytes } from "./keyEncoding";
 import { decideCtrlCAction } from "./ctrlCEscalation";
 
@@ -178,10 +179,14 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
       ) {
         e.preventDefault();
         void (async () => {
+          // Image branch first: navigator.clipboard.read() surfaces
+          // every MIME the OS attached (image + html + plain text);
+          // readText() would silently strip the image and we'd lose
+          // the screenshot. We still try this even though it shares
+          // the same WebKit-level clipboard-read permission as
+          // readText(), because there's no Rust-side equivalent for
+          // image clipboard items (pbpaste prints text only).
           try {
-            // navigator.clipboard.read() surfaces every MIME the OS
-            // attached (image + html + plain text); readText() would
-            // silently strip the image and we'd lose the screenshot.
             const items = await navigator.clipboard.read();
             for (const item of items) {
               const imageType = item.types.find((t) => t.startsWith("image/"));
@@ -195,15 +200,17 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
               sendPasteText(`${shellQuotePath(path)} `);
               return;
             }
-            // No image MIME found — fall through to plain text.
-            const text = await navigator.clipboard.readText();
-            if (text.length === 0) return;
-            sendPasteText(text);
           } catch {
-            // Clipboard access denied / no permission / API missing
-            // (e.g. clipboard.read() not exposed) — silently no-op;
-            // the user will retry and notice nothing landed.
+            // clipboard.read() denied or unavailable — fall through
+            // to the text fallback chain below.
           }
+          // Text branch with the layered fallback (see
+          // clipboardRead.ts) — survives the macOS Sequoia
+          // clipboard-read denial that makes
+          // `navigator.clipboard.readText()` return "" silently.
+          const text = await readClipboardTextWithFallback();
+          if (text === null || text.length === 0) return;
+          sendPasteText(text);
         })();
         return;
       }

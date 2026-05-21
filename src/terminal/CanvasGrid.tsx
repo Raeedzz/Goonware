@@ -9,6 +9,10 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import { createGridRenderer, type GridRenderer } from "./gpu/GridRenderer";
+import {
+  decideVisibilityAction,
+  executeVisibilityAction,
+} from "./gpu/visibilityRestore";
 import { isGlobalChord, keyToBytes } from "./keyEncoding";
 import type { DirtyRow, RenderFrame } from "./types";
 
@@ -65,6 +69,30 @@ interface Props {
    * cursor a few rows above where it should be.
    */
   firstRowOffset?: number;
+  /**
+   * Whether this canvas is currently the visible one in its parent's
+   * keepalive layer. Used to gate two things:
+   *
+   *   1. The ResizeObserver no-ops when the wrapper went `display:
+   *      none` (contentRect = 0×0). Without the gate the renderer
+   *      would resize its backbuffer down to 1×1 physical pixels —
+   *      visible as the entire agent pane going black, and the
+   *      symptom the user reports as "switch tabs → terminal stays
+   *      blank after I come back."
+   *
+   *   2. On hidden→visible transition we rebuild the renderer from
+   *      scratch. macOS's WKWebView releases GPU surface resources
+   *      for `display: none` views without firing a `device.lost`
+   *      callback, so the existing renderer may have a dead GPU
+   *      context that paints nothing while reporting no error.
+   *      Force-bumping the bootstrap epoch tears the renderer down
+   *      and spawns a fresh one against the now-live canvas surface.
+   *
+   * Defaults to `true` so standalone callers (and the alt-screen
+   * branch in BlockTerminal that hasn't been wired up yet) keep
+   * working unchanged.
+   */
+  isVisible?: boolean;
 }
 
 /**
@@ -90,6 +118,7 @@ export function CanvasGrid({
   fontSizeCss = 13,
   lineHeight = 1.35,
   firstRowOffset,
+  isVisible = true,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -278,6 +307,17 @@ export function CanvasGrid({
       const renderer = rendererRef.current;
       if (!renderer) return;
       const rect = entries[0].contentRect;
+      // Skip when either dimension is 0 — that's the keepalive
+      // layer flipping us to `display: none`. Pushing a 0×0 into
+      // `renderer.resize` would clamp the canvas backbuffer to 1×1
+      // physical pixels; the wrapper coming back to its real size
+      // wouldn't always re-fire ResizeObserver (WKWebView is flaky
+      // about display:none → display:flex transitions when the
+      // restored CSS size matches the cached pre-hide size), and
+      // the user lands on a black pane. Letting the renderer keep
+      // its pre-hide backbuffer means the next visibility tick can
+      // paint the cached frame without a re-fit round-trip.
+      if (rect.width === 0 || rect.height === 0) return;
       renderer.resize(
         rect.width,
         rect.height,
@@ -288,6 +328,48 @@ export function CanvasGrid({
     observer.observe(wrapper);
     return () => observer.disconnect();
   }, []);
+
+  // Hidden→visible restore hook. Driven by the pure state machine
+  // in `gpu/visibilityRestore.ts` — see that file's header for the
+  // full root-cause writeup (TL;DR: WKWebView releases the GPU
+  // swapchain during `display: none` without firing `device.lost`,
+  // and the next render paints into a dead surface = black canvas).
+  //
+  // `wasVisibleRef` only advances when the decision is "restore" or
+  // "noop" — a "defer" leaves it at false so the next ResizeObserver
+  // tick (with a real rect this time) can still trigger the restore.
+  const wasVisibleRef = useRef(isVisible);
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    const wrapper = wrapperRef.current;
+    const rect = wrapper?.getBoundingClientRect();
+    const rectWidth = rect?.width ?? 0;
+    const rectHeight = rect?.height ?? 0;
+    const action = decideVisibilityAction({
+      wasVisible: wasVisibleRef.current,
+      isVisible,
+      rectWidth,
+      rectHeight,
+    });
+    // On `defer` the ref stays at false so the next observer tick
+    // (with real rect) decides "restore" instead of "noop". On
+    // anything else, the ref advances to mirror the current value.
+    if (action !== "defer") wasVisibleRef.current = isVisible;
+    if (!renderer) return;
+    executeVisibilityAction(
+      action,
+      {
+        reconfigure: () => renderer.reconfigure(),
+        resizeFromRect: (w, h, dpr) => renderer.resize(w, h, dpr),
+        invalidate: () => renderer.invalidate(),
+        paint: () => renderRequest(renderer),
+      },
+      rectWidth,
+      rectHeight,
+      window.devicePixelRatio || 1,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isVisible]);
 
   // Repaint at the new DPR when the user drags Goonware between a Retina
   // and an external 1x monitor mid-session. Without this, the canvas
