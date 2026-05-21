@@ -29,6 +29,7 @@ mod git;
 mod helper_agent;
 mod pr;
 mod search;
+mod skills;
 mod state;
 mod term;
 mod worktree;
@@ -183,6 +184,9 @@ pub fn run() {
             // Search (Task #15)
             search::search_rg,
             search::search_files,
+            // Skills + MCP enumeration for the right-panel Skills tab
+            skills::skills_list,
+            skills::mcps_list,
             // Filesystem
             fs::fs_read_dir,
             fs::fs_read_text_file,

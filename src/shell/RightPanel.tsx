@@ -26,6 +26,7 @@ import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { useToast } from "@/primitives/Toast";
 import { Loader } from "@/primitives/Loader";
 import { BrowserPane } from "@/browser/BrowserPane";
+import { SkillsView } from "@/skills/SkillsView";
 
 /**
  * Right panel: top tabs (All files / Changes / Checks / Memory) + Review
@@ -110,6 +111,12 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
         />
         <PanelTab
           worktreeId={worktree.id}
+          label="Skills"
+          tab="skills"
+          active={worktree.rightPanel === "skills"}
+        />
+        <PanelTab
+          worktreeId={worktree.id}
           label="Browser"
           tab="browser"
           active={worktree.rightPanel === "browser"}
@@ -144,6 +151,9 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
             error={status.error}
             refresh={status.refresh}
           />
+        </PaneSlot>
+        <PaneSlot active={worktree.rightPanel === "skills"}>
+          <SkillsView worktree={worktree} />
         </PaneSlot>
         <PaneSlot active={worktree.rightPanel === "browser"}>
           <BrowserPane
