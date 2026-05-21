@@ -16,6 +16,7 @@ import { useTerminalRunningPoll } from "@/terminal/terminalActivityStore";
 import { useAgentHookSubscription } from "@/state/agentActivityStore";
 import { useAppDispatch, useAppState } from "@/state/AppState";
 import { fs } from "@/lib/fs";
+import { coalesceFrame } from "@/lib/coalesceFrame";
 import {
   RIGHT_DEFAULT,
   RIGHT_MAX,
@@ -128,32 +129,17 @@ export function AppShell() {
   );
   useEffect(() => {
     if (typeof window === "undefined") return;
-    // rAF-coalesce the window-resize signal. macOS fires `resize`
-    // continuously during a live window-drag (often >120 Hz on
-    // high-refresh displays). Calling `setViewportWidth` on every
-    // event forces a React commit per OS sample, which cascades into
-    // a flex relayout → CanvasGrid ResizeObserver → WebGPU backbuffer
-    // realloc per sample. That's the dominant jitter source in the
-    // bundled DMG. Warp's resize stream uses a Debounce/Throttle
-    // combinator for the same reason (see warpdotdev/warp
-    // `app/src/throttle.rs`); on the web side rAF gives us a free
-    // throttle aligned to the compositor's frame cadence.
-    let rafId: number | null = null;
-    let pending: number | null = null;
-    const flush = () => {
-      rafId = null;
-      const next = pending;
-      pending = null;
-      if (next != null) setViewportWidth(next);
-    };
-    const onResize = () => {
-      pending = window.innerWidth;
-      if (rafId === null) rafId = window.requestAnimationFrame(flush);
-    };
+    // Coalesce the window-resize signal to one React commit per frame.
+    // macOS fires `resize` continuously during a live window-drag (often
+    // >120 Hz on high-refresh displays) and each event would otherwise
+    // cascade into a flex relayout → CanvasGrid ResizeObserver → WebGPU
+    // backbuffer realloc.
+    const coalescer = coalesceFrame<number>(setViewportWidth);
+    const onResize = () => coalescer.push(window.innerWidth);
     window.addEventListener("resize", onResize);
     return () => {
       window.removeEventListener("resize", onResize);
-      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      coalescer.cancel();
     };
   }, []);
 
@@ -298,28 +284,19 @@ function ResizeHandle({
   );
 
   useEffect(() => {
-    // rAF-coalesce drag dispatches. macOS trackpads + high-refresh
-    // pointers fire mousemove well above 60 Hz (often 120 Hz). In
-    // dev that's masked by the slower devtools-attached pipeline,
-    // but in a notarized production build every event drives a full
-    // state dispatch → React commit → AppShell flex re-layout →
-    // CanvasGrid ResizeObserver → WebGPU backbuffer reallocation.
-    // Two of those per frame is visible jitter. Aligning the
-    // dispatch to rAF gives the layout one chance per frame to
-    // settle and matches the cadence the GPU is rendering at
-    // anyway.
-    let rafId: number | null = null;
-    let pendingWidth: number | null = null;
-    const flush = () => {
-      rafId = null;
-      const next = pendingWidth;
-      pendingWidth = null;
-      if (next == null) return;
+    // Coalesce drag dispatches to one React commit per frame. macOS
+    // trackpads + high-refresh pointers fire mousemove well above 60 Hz
+    // (often 120 Hz). In dev that's masked by the slower devtools-
+    // attached pipeline, but in a notarized production build every
+    // event drives a full state dispatch → React commit → AppShell flex
+    // re-layout → CanvasGrid ResizeObserver → WebGPU backbuffer
+    // reallocation.
+    const coalescer = coalesceFrame<number>((width) => {
       dispatch({
         type: side === "left" ? "set-sidebar-width" : "set-right-panel-width",
-        width: next,
+        width,
       });
-    };
+    });
     const onMove = (e: MouseEvent) => {
       if (!draggingRef.current) return;
       const dx = e.clientX - startXRef.current;
@@ -337,13 +314,11 @@ function ResizeHandle({
       );
       // Sidebar grows to the right (positive dx → wider).
       // Right panel grows to the left (positive dx → narrower).
-      pendingWidth =
+      const next =
         side === "left"
           ? Math.min(dynamicMax, Math.max(min, startWRef.current + dx))
           : Math.min(dynamicMax, Math.max(min, startWRef.current - dx));
-      if (rafId === null) {
-        rafId = window.requestAnimationFrame(flush);
-      }
+      coalescer.push(next);
     };
     const onUp = () => {
       if (!draggingRef.current) return;
@@ -353,18 +328,14 @@ function ResizeHandle({
       document.body.style.userSelect = "";
       // Make sure the final width lands even if mouseup arrives
       // between the last rAF-scheduled flush and its fire.
-      if (rafId !== null) {
-        window.cancelAnimationFrame(rafId);
-        rafId = null;
-        flush();
-      }
+      coalescer.flush();
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     return () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
-      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      coalescer.cancel();
     };
   }, [side, min, baseMax, otherSideWidth, dispatch]);
 
