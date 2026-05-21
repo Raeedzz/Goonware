@@ -16,7 +16,8 @@ import {
 } from "@/state/AppState";
 import type { Project, Tab, TerminalTab, Worktree } from "@/state/types";
 import { projectSettings } from "@/state/types";
-import { worktreeArchive } from "@/lib/worktrees";
+import { collectWorktreePtyIds, worktreeArchive } from "@/lib/worktrees";
+import { forgetPtys } from "@/terminal/sessionMemory";
 import { useToast } from "@/primitives/Toast";
 import { FolderOffIcon } from "hugeicons-react";
 import { ErrorBoundary } from "./ErrorBoundary";
@@ -1329,6 +1330,10 @@ function MissingWorktreeView({
         deleteBranch: state.settings.deleteBranchOnArchive,
         archiveScript: cfg.archiveScript,
       });
+      // Cascade-delete the worktree's persisted block history + kill
+      // live PTYs. See the matching call in Sidebar.tsx for the
+      // rationale (restore mints fresh ids, originals are orphaned).
+      forgetPtys(collectWorktreePtyIds(worktree, state.tabs));
       dispatch({ type: "archive-worktree", id: worktree.id, record });
       toast.show({ message: `Removed missing worktree ${worktree.name}` });
     } catch (err) {

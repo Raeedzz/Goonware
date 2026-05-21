@@ -49,12 +49,14 @@ import {
 } from "@/state/types";
 import { openProjectDialog } from "@/lib/projectDialog";
 import {
+  collectWorktreePtyIds,
   nextAutoBranch,
   worktreeArchive,
   primaryTerminalTab,
   worktreeCreate,
   worktreeRestore,
 } from "@/lib/worktrees";
+import { forgetPtys } from "@/terminal/sessionMemory";
 import { useToast } from "@/primitives/Toast";
 import { useTrackAgentActivity } from "@/state/agentActivityStore";
 
@@ -724,6 +726,14 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   // rerender (the others stay memoized).
   const isRunning = useTrackAgentActivity(worktree.id, worktree.path);
   const dispatch = useAppDispatch();
+  // Subscribed to state so the archive handler can look up the
+  // worktree's terminal-tab pty_ids and feed them to `forgetPtys`.
+  // The earlier memo discipline (drill `archiveBehavior` /
+  // `deleteBranchOnArchive` instead of subscribing) targeted settings
+  // touches specifically; tab edits already invalidate the row's
+  // ancestors and the lookup only runs on the archive click, so the
+  // added churn from `tabs` updates is acceptable.
+  const fullState = useAppState();
   const toast = useToast();
   const [hovering, setHovering] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -842,6 +852,13 @@ const WorktreeRow = memo(function WorktreeRowImpl({
         deleteBranch: deleteBranchOnArchive,
         archiveScript: cfg.archiveScript,
       });
+      // Cascade-delete the worktree's persisted block history + kill
+      // its live PTYs. Restore mints fresh ids
+      // (see `worktree_restore` in src-tauri/src/worktree.rs ~L551–598),
+      // so the original pty_ids are unreachable after archive — leaving
+      // them in SQLite would grow `terminal_panes`/`blocks` unbounded
+      // across archive cycles.
+      forgetPtys(collectWorktreePtyIds(worktree, fullState.tabs));
       dispatch({ type: "archive-worktree", id: worktree.id, record });
       toast.show({
         message: `Archived ${worktree.name}`,

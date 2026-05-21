@@ -25,7 +25,8 @@ import {
 } from "@/state/AppState";
 import { useToast } from "@/primitives/Toast";
 import { projectSettings, type Tab, type Worktree } from "@/state/types";
-import { worktreeArchive } from "@/lib/worktrees";
+import { collectWorktreePtyIds, worktreeArchive } from "@/lib/worktrees";
+import { forgetPtys } from "@/terminal/sessionMemory";
 
 const TRAFFIC_LIGHT_GUTTER = 78;
 // 36px matches the right panel's tab bar exactly, so the two
@@ -149,6 +150,10 @@ function BranchActionButton({ worktree }: { worktree: Worktree | null }) {
         deleteBranch: deleteBranchOnArchive,
         archiveScript: cfg.archiveScript,
       });
+      // Cascade-delete the worktree's persisted block history + kill
+      // live PTYs. See the matching call in Sidebar.tsx for the
+      // rationale (restore mints fresh ids, originals are orphaned).
+      forgetPtys(collectWorktreePtyIds(worktree, state.tabs));
       dispatch({ type: "archive-worktree", id: worktree.id, record });
       toast.show({ message: `Archived ${worktree.name} after merge` });
     } catch (e) {
