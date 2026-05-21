@@ -17,21 +17,19 @@
 //! `seven_day` utilization percentages that Claude.ai's settings
 //! page shows.
 //!
-//! The lower-cadence `claude_activity_summary` command (tab subtitle
-//! summarizer) still reads transcripts since there's no API
-//! equivalent for "what is the user currently working on" — that's
-//! covered by the existing `autoSummarize` setting users can switch
-//! off if the prompts are unwelcome.
+//! TCC-safety of this module is a hard invariant. The tests at the
+//! bottom assert it stays that way: no `helper_agent` subprocess
+//! spawns from polling paths, no reads under `~/.claude`, no
+//! `claude --version` shellouts. Every one of those would re-trip
+//! macOS App Data Isolation under GLI's responsible bundle and
+//! resurrect the popup the user kept seeing.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-
-use crate::helper_agent::{run_inline, HelperMode};
 
 
 /// Anthropic's enforced 5-hour session length. A "session" in
@@ -108,47 +106,13 @@ pub async fn claude_usage_status() -> Result<ClaudeUsageStatus, String> {
     Ok(fetch_oauth_usage().await.unwrap_or_default())
 }
 
-/// Cache the resolved `claude --version` output so we don't fork a
-/// subprocess on every poll. The version is stable for the lifetime
-/// of the GLI process (a `claude` upgrade in between would just
-/// produce a slightly-stale UA string, which is benign).
-static CLAUDE_USER_AGENT: OnceLock<Option<String>> = OnceLock::new();
-
-fn resolve_claude_user_agent() -> Option<String> {
-    CLAUDE_USER_AGENT
-        .get_or_init(|| {
-            // Try the conventional install paths in priority order.
-            // PATH is unreliable inside Tauri (the launched binary
-            // doesn't inherit a login shell's PATH), so we probe the
-            // common locations explicitly.
-            let home = dirs::home_dir()?;
-            let candidates = [
-                home.join(".local/bin/claude"),
-                PathBuf::from("/opt/homebrew/bin/claude"),
-                PathBuf::from("/usr/local/bin/claude"),
-            ];
-            for c in candidates.iter() {
-                let Ok(output) = Command::new(c)
-                    .arg("--version")
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .output()
-                else {
-                    continue;
-                };
-                if !output.status.success() {
-                    continue;
-                }
-                let raw = String::from_utf8_lossy(&output.stdout);
-                // `claude --version` prints e.g. "1.0.108 (Claude Code)" —
-                // grab the first whitespace-delimited token.
-                let version = raw.split_whitespace().next()?.to_string();
-                return Some(format!("claude-code/{version}"));
-            }
-            None
-        })
-        .clone()
-}
+/// User-Agent we send on the OAuth-usage request. Hardcoded rather
+/// than resolved at runtime via `claude --version` — that subprocess
+/// reads its own `~/.claude/*` config on startup, which sits inside
+/// another app's MACL domain and would re-fire the App Data Isolation
+/// popup for GLI on every fresh launch. The string just needs to look
+/// plausible to Anthropic's edge; the exact version is cosmetic.
+const CLAUDE_USER_AGENT: &str = "claude-code/2.0";
 
 /// Read Claude Code's OAuth credentials JSON from the macOS Keychain.
 /// We use `/usr/bin/security` (Apple-signed) rather than the
@@ -235,17 +199,16 @@ async fn fetch_oauth_usage() -> Option<ClaudeUsageStatus> {
         .build()
         .ok()?;
     // Anthropic's OAuth usage endpoint is internal to Claude Code's
-    // own UI plumbing. We send the same User-Agent shape Claude Code
-    // sends (resolved from the locally installed `claude` binary) so
-    // the request looks identical on the wire — third-party UAs risk
-    // 403s if Anthropic ever filters this endpoint.
-    let user_agent = resolve_claude_user_agent().unwrap_or_else(|| "claude-code/1.0".to_string());
+    // own UI plumbing. We send a Claude-Code-shaped User-Agent so the
+    // request looks like one the endpoint expects to serve — using a
+    // bespoke "gli" UA risks 403s if Anthropic ever filters this
+    // endpoint to first-party callers.
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
         .bearer_auth(&creds.access_token)
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("Accept", "application/json")
-        .header("User-Agent", user_agent)
+        .header("User-Agent", CLAUDE_USER_AGENT)
         .send()
         .await
         .ok()?;
@@ -318,26 +281,9 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe as i64 - 719_468
 }
 
-/// In-memory cache for the natural-language summary, keyed by
-/// "<cwd>:<prompt>". As long as the user hasn't submitted a new
-/// prompt, the cached creative summary stays valid — so the 4s
-/// frontend poll costs zero helper-CLI invocations between turns.
-#[derive(Clone)]
-struct CachedSummary {
-    /// The exact prompt text that produced this summary. Re-checked
-    /// against the live `latest_prompt_for_cwd` value on every hit.
-    user_uuid: String,
-    summary: String,
-}
-
-fn summary_cache() -> &'static Mutex<HashMap<String, CachedSummary>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, CachedSummary>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Collapse internal whitespace and cap to `max` chars. The transcript
-/// can contain newlines, tabs, and (rarely) control bytes — we want a
-/// single-line snippet that reads cleanly when stuffed into a prompt.
+/// Collapse internal whitespace and cap to `max` chars. The hook
+/// can deliver prompts with embedded newlines / tabs; we want a
+/// single-line snippet that reads cleanly in a 28px header strip.
 fn cap_inline(s: &str, max: usize) -> String {
     let normalized: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() > max {
@@ -349,54 +295,34 @@ fn cap_inline(s: &str, max: usize) -> String {
     }
 }
 
-/// Strip chatty preamble and trailing punctuation from Gemini's raw
-/// reply so the result reads like a status line. Flash-Lite occasionally
-/// wraps its answer in quotes or appends a period — both look out of
-/// place in the 28px header strip.
-fn normalize_summary(raw: &str) -> String {
-    // Order matters: strip trailing period FIRST, in case it sits
-    // outside the closing quote (`"fix oauth flow".`). Then strip the
-    // quote pair. Then strip a trailing period one more time, in case
-    // it was sitting INSIDE the quotes (`"fix oauth flow."`). Either
-    // shape shows up in Flash-Lite output and we want both to land on
-    // the same result.
-    let mut s = raw.trim().trim_end_matches('.').trim().to_string();
-    if (s.starts_with('"') && s.ends_with('"'))
-        || (s.starts_with('\'') && s.ends_with('\''))
-    {
-        s = s[1..s.len() - 1].to_string();
-    }
-    let trimmed = s.trim().trim_end_matches('.').trim();
-    cap_inline(trimmed, 80)
-}
-
-/// Natural-language summary of what the user is working on inside
-/// claude / codex / aider, generated by Gemini Flash-Lite from the
-/// last 3 user prompts + the assistant's text replies between them.
+/// Tab-subtitle summary for the foregrounded Claude session.
 ///
-/// Cached in-memory keyed by transcript path; the cache invalidates
-/// when either the latest user-turn uuid or the latest assistant-turn
-/// uuid changes (i.e. a new turn has actually been written). Polling
-/// at 4s from the frontend therefore costs ONE Gemini call per real
-/// exchange, not one per poll.
+/// Returns the user's most recent prompt (whitespace-collapsed, capped
+/// at 80 chars). The frontend polls this every ~4s from BlockTerminal.
 ///
-/// Falls back gracefully:
-///   - No prompt captured yet for this cwd → `Ok(None)`. Frontend
-///     uses `activeCommand` ("claude") as the subtitle.
-///   - Helper CLI unreachable → returns the prompt verbatim. Still
-///     more informative than just "claude".
+/// **Invariant: this command must touch nothing outside the in-memory
+/// hook map.** Earlier iterations spawned `claude --print` to rewrite
+/// the prompt into a creative one-liner ("Fix oauth refresh bug"
+/// rather than the raw text the user typed). That subprocess, run as
+/// a child of GLI, inherits GLI's responsible bundle — so when it
+/// reads its own `~/.claude/*` config + credentials, macOS fires
+/// `kTCCServiceSystemPolicyAppData` ("GLI would like to access data
+/// from other apps") against GLI on every poll. A 4-second cadence
+/// turned that into a continuous stream of popups any time Claude
+/// was foregrounded.
 ///
-/// Prompt source: the live in-memory map in `agent_hooks` that the
-/// Claude hook script populates on every `UserPromptSubmit` event.
-/// We used to read `~/.claude/projects/<cwd>/<session>.jsonl` here,
-/// but that fired a macOS App Data Isolation popup every time
-/// Claude opened a fresh session (each transcript file carries a
-/// unique MACL xattr). The hook-based path runs inside Claude's
-/// process tree, so the prompt forwarding is TCC-free.
+/// The fix is to do zero subprocess work in this command. The user's
+/// raw prompt is already informative ("fix the OAuth refresh bug
+/// when the token expires mid-session" is fine as a tab subtitle) —
+/// the creative rewrite was a nicety, not load-bearing UX. Source
+/// stays the in-memory `LATEST_PROMPT_BY_CWD` map in `agent_hooks`,
+/// populated by the Claude hook script via the Unix socket; that
+/// path is TCC-free because the data never lands on disk in another
+/// app's MACL domain.
 #[tauri::command]
-pub async fn claude_activity_summary(
+pub fn claude_activity_summary(
     project_cwd: String,
-    cli: Option<String>,
+    _cli: Option<String>,
 ) -> Result<Option<String>, String> {
     let Some(prompt_text) = crate::agent_hooks::latest_prompt_for_cwd(&project_cwd) else {
         return Ok(None);
@@ -405,50 +331,7 @@ pub async fn claude_activity_summary(
     if trimmed.is_empty() {
         return Ok(None);
     }
-
-    // Cache fingerprint = the prompt text itself. If the user hasn't
-    // submitted a new prompt since the last summarize, the cached
-    // creative summary is still accurate, so the 4s frontend poll
-    // costs zero helper-CLI invocations.
-    let cache_key = format!("{}:{}", project_cwd, trimmed);
-    if let Some(cached) = summary_cache().lock().unwrap().get(&cache_key).cloned() {
-        if cached.user_uuid == trimmed {
-            return Ok(Some(cached.summary));
-        }
-    }
-
-    let fallback = cap_inline(trimmed, 80);
-    let cli_name = cli.unwrap_or_else(|| "claude".to_string());
-    let summary = match summarize_with_helper(&cli_name, trimmed).await {
-        Ok(s) if !s.is_empty() => s,
-        _ => fallback.clone(),
-    };
-
-    summary_cache().lock().unwrap().insert(
-        cache_key,
-        CachedSummary {
-            user_uuid: trimmed.to_string(),
-            summary: summary.clone(),
-        },
-    );
-    Ok(Some(summary))
-}
-
-/// Ask the helper agent to compress the user's prompt into a single
-/// short activity summary. CLI defaults to "claude" but can be any
-/// of our supported agents.
-async fn summarize_with_helper(cli: &str, user_prompt: &str) -> Result<String, String> {
-    let prompt = format!(
-        "Below is the most recent prompt a developer typed into a Claude Code \
-         session in their terminal:\n\n\
-         [USER]\n{user_prompt}\n\n\
-         Summarize what the developer is asking Claude to do. One short \
-         phrase, 8 words or fewer, sentence case, no trailing period, no \
-         quotes. Use an active verb. Be specific about the task — not \
-         \"working on code\".",
-    );
-    let raw = run_inline("", cli, HelperMode::Summary, &prompt, None).await?;
-    Ok(normalize_summary(&raw))
+    Ok(Some(cap_inline(trimmed, 80)))
 }
 
 #[cfg(test)]
@@ -509,11 +392,171 @@ mod tests {
         assert_eq!(chars[50], '…');
     }
 
-    #[test]
-    fn normalize_summary_strips_quotes_and_trailing_period() {
-        assert_eq!(normalize_summary("\"fix oauth flow\"."), "fix oauth flow");
-        assert_eq!(normalize_summary("'wire up oscillator'"), "wire up oscillator");
-        assert_eq!(normalize_summary("  refactor.  "), "refactor");
+    /* ----------------------------------------------------------------
+       TCC-safety regression guards.
+
+       These are not behaviour tests — they're source-text assertions
+       that any future edit which reintroduces a subprocess spawn from
+       the polling path is caught at `cargo test` time, before it can
+       ship and resurrect the App Data popup.
+
+       The previous fix removed transcript reads but missed the
+       4s-cadence helper-agent spawn, so the popup still fired on every
+       prompt. These guards exist to prevent that class of regression:
+       reading source is cheap, and the assertion message tells the
+       next contributor exactly which line is the trap.
+       ---------------------------------------------------------------- */
+
+    /// Return just the production code from this file — i.e. everything
+    /// before the `#[cfg(test)]` marker that opens this test module.
+    /// Comments and doc-comments are stripped too, so an explanatory
+    /// mention of `helper_agent` in a `//` line doesn't false-trip
+    /// the assertions below.
+    fn production_code_only() -> String {
+        let src = include_str!("claude_usage.rs");
+        // The split anchor lives only at the top of the test module
+        // (no other `#[cfg(test)]` in this file). Splitting on it lets
+        // us scan the real code and ignore the assertion-message
+        // strings inside the tests themselves.
+        let cutoff = src
+            .find("#[cfg(test)]")
+            .expect("claude_usage.rs has a #[cfg(test)] section");
+        src[..cutoff]
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("//!")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
+    /// `claude_activity_summary` is invoked every ~4s from the frontend
+    /// while a Claude pane is foregrounded. It must never spawn a
+    /// helper-agent subprocess, because that subprocess (run as a
+    /// child of GLI) inherits GLI's responsible bundle and trips
+    /// kTCCServiceSystemPolicyAppData when it reads its own
+    /// `~/.claude/*` data files.
+    #[test]
+    fn activity_summary_never_calls_helper_agent() {
+        let code_only = production_code_only();
+        assert!(
+            !code_only.contains("helper_agent"),
+            "claude_usage.rs production code must not reference helper_agent — \
+             its inline runner spawns claude/codex/gemini as children of GLI, \
+             which trips the macOS App Data popup on every poll. Use the \
+             in-memory hook map instead."
+        );
+        assert!(
+            !code_only.contains("run_inline"),
+            "claude_usage.rs production code must not call run_inline directly \
+             either — same reason."
+        );
+    }
+
+    /// The OAuth UA spoof must stay a constant string, not a
+    /// `claude --version` subprocess. `claude --version` reads its own
+    /// `~/.claude/settings.json` on startup, which trips the App Data
+    /// popup once per app launch.
+    #[test]
+    fn user_agent_is_a_static_string() {
+        let code_only = production_code_only();
+        assert!(
+            !code_only.contains("--version"),
+            "claude_usage.rs must not invoke a `--version` subprocess. \
+             Use the CLAUDE_USER_AGENT constant for the OAuth User-Agent."
+        );
+        let src = include_str!("claude_usage.rs");
+        let cutoff = src.find("#[cfg(test)]").unwrap();
+        let suspicious_spawns: Vec<&str> = src[..cutoff]
+            .lines()
+            .filter(|l| l.contains("Command::new(") && !l.trim_start().starts_with("//"))
+            .collect();
+        for line in &suspicious_spawns {
+            assert!(
+                line.contains("/usr/bin/security"),
+                "unexpected subprocess spawn in claude_usage.rs: {line}\n\
+                 Only `/usr/bin/security` is allowed (Keychain Always-Allow). \
+                 Any other binary risks re-tripping macOS App Data Isolation."
+            );
+        }
+    }
+
+    /// The module must not read from `~/.claude` directly. The hook
+    /// map (populated via the Unix socket) is the TCC-safe data source.
+    #[test]
+    fn no_direct_filesystem_reads_under_dot_claude() {
+        let code_only = production_code_only();
+        for forbidden in [
+            "fs::read",
+            "fs::metadata",
+            "fs::File::open",
+            "read_to_string",
+            "read_dir",
+        ] {
+            assert!(
+                !code_only.contains(forbidden),
+                "claude_usage.rs production code must not call {forbidden} — \
+                 every path that would land on a Claude-owned file trips \
+                 kTCCServiceSystemPolicyAppData. Source data through \
+                 `agent_hooks::latest_prompt_for_cwd` or the OAuth API instead."
+            );
+        }
+    }
+
+    /* ---------- behavioural test for the simplified summary ---------- */
+
+    /// End-to-end: the activity summary is just the truncated prompt
+    /// from the hook map. No subprocess, no creative rewrite.
+    #[test]
+    fn activity_summary_returns_capped_prompt_verbatim() {
+        // Seed the hook map directly, mimicking what the Claude
+        // UserPromptSubmit hook does on the Unix socket.
+        let cwd = format!("/tmp/gli-test-activity-{}", std::process::id());
+        crate::agent_hooks::record_prompt_for_cwd_for_test(
+            &cwd,
+            "Fix the OAuth refresh bug",
+        );
+        let out =
+            claude_activity_summary(cwd.clone(), Some("claude".into())).unwrap();
+        assert_eq!(out.as_deref(), Some("Fix the OAuth refresh bug"));
+    }
+
+    /// Long prompts get capped + …-suffixed so they fit in the chrome.
+    #[test]
+    fn activity_summary_caps_long_prompts() {
+        let cwd = format!("/tmp/gli-test-activity-long-{}", std::process::id());
+        let long = "a".repeat(200);
+        crate::agent_hooks::record_prompt_for_cwd_for_test(&cwd, &long);
+        let out = claude_activity_summary(cwd, None).unwrap().unwrap();
+        let chars: Vec<char> = out.chars().collect();
+        assert_eq!(chars.len(), 81);
+        assert_eq!(chars[80], '…');
+    }
+
+    /// No prompt captured yet → None, so the frontend keeps showing
+    /// the activeCommand fallback ("claude") instead of a stale value.
+    #[test]
+    fn activity_summary_none_when_no_prompt_seen() {
+        let cwd = format!(
+            "/tmp/gli-test-activity-empty-{}-unique",
+            std::process::id()
+        );
+        let out = claude_activity_summary(cwd, None).unwrap();
+        assert_eq!(out, None);
+    }
+
+    /// Empty / whitespace-only prompts also yield None — happens if
+    /// the hook fires with a stripped payload, e.g. user hit Enter on
+    /// an empty input.
+    #[test]
+    fn activity_summary_none_for_whitespace_prompt() {
+        let cwd = format!(
+            "/tmp/gli-test-activity-ws-{}-unique",
+            std::process::id()
+        );
+        crate::agent_hooks::record_prompt_for_cwd_for_test(&cwd, "   \n\t  ");
+        let out = claude_activity_summary(cwd, None).unwrap();
+        assert_eq!(out, None);
+    }
 }

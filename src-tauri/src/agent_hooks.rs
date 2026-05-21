@@ -335,6 +335,14 @@ pub fn latest_prompt_for_cwd(cwd: &str) -> Option<String> {
     store.lock().ok().and_then(|g| g.get(cwd).cloned())
 }
 
+/// Test-only seam: lets `claude_usage`'s regression tests drive the
+/// hook map without standing up a full Unix-socket listener. Kept
+/// `pub(crate)` and `#[cfg(test)]` so it can't leak into shipped code.
+#[cfg(test)]
+pub(crate) fn record_prompt_for_cwd_for_test(cwd: &str, prompt: &str) {
+    record_prompt_for_cwd(cwd, prompt);
+}
+
 /// Spawn the Unix-socket listener + the Codex liveness watchdog.
 pub fn start_socket_server(app: AppHandle<Wry>) {
     let _ = fs::remove_file(SOCKET_PATH);
