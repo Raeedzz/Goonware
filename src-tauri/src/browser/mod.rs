@@ -24,7 +24,7 @@ use chrome::ChromeSession;
 /// out of the lock so the write-lock isn't held for the whole request.
 ///
 /// Also publishes the daemon's bound port (0 = not yet bound) so the
-/// rest of the app — specifically `term.rs` injecting `GLI_BROWSER_URL`
+/// rest of the app — specifically `term.rs` injecting `GOONWARE_BROWSER_URL`
 /// into PTY child env — can read the actual URL instead of guessing
 /// at the default 4000.
 #[derive(Default, Clone)]

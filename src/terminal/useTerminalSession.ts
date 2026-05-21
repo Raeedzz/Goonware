@@ -37,11 +37,11 @@ interface Args {
   cols: number;
   /**
    * Active project id, forwarded to term_start so the PTY's env gets
-   * `GLI_PROJECT_ID` / `RLI_PROJECT_ID` set. In-pane agents (claude,
+   * `GOONWARE_PROJECT_ID` / `RLI_PROJECT_ID` set. In-pane agents (claude,
    * codex, gemini) read this to identify which project they're in.
    */
   projectId?: string;
-  /** Active session id. Mirrors `GLI_SESSION_ID` / `RLI_SESSION_ID` in PTY env. */
+  /** Active session id. Mirrors `GOONWARE_SESSION_ID` / `RLI_SESSION_ID` in PTY env. */
   sessionId?: string;
   /**
    * Whether this terminal is currently visible to the user (i.e. the

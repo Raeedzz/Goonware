@@ -6,7 +6,7 @@
 //! That broke under macOS Sequoia's App Data Isolation: each new
 //! Claude session writes a fresh `.jsonl` with a unique
 //! `com.apple.macl` xattr, and the first read of each one triggers a
-//! "GLI would like to access data from other apps" prompt. So users
+//! "Goonware would like to access data from other apps" prompt. So users
 //! got a permission popup every time they opened a new agent.
 //!
 //! The fix mirrors what `notchi` does. We read Claude Code's cached
@@ -21,7 +21,7 @@
 //! bottom assert it stays that way: no `helper_agent` subprocess
 //! spawns from polling paths, no reads under `~/.claude`, no
 //! `claude --version` shellouts. Every one of those would re-trip
-//! macOS App Data Isolation under GLI's responsible bundle and
+//! macOS App Data Isolation under Goonware's responsible bundle and
 //! resurrect the popup the user kept seeing.
 
 use std::collections::HashMap;
@@ -81,7 +81,7 @@ pub struct ClaudeUsageStatus {
     pub real_seven_day_percent: Option<f32>,
     /// Real reset wall-clock millis for the 5h window, when available.
     pub real_five_hour_resets_ms: Option<i64>,
-    /// When the gli-usage-capture.sh hook last wrote the cache file,
+    /// When the goonware-usage-capture.sh hook last wrote the cache file,
     /// in epoch millis. Used by the frontend to age out stale data.
     pub real_captured_at_ms: Option<i64>,
 }
@@ -92,7 +92,7 @@ pub async fn claude_usage_status() -> Result<ClaudeUsageStatus, String> {
     // OAuth-API path (notchi-style). We avoid reading
     // `~/.claude/projects/*.jsonl` entirely — those files carry
     // macOS App Data MACL xattrs unique to each Claude session, and
-    // the first read of each one triggers a "GLI would like to
+    // the first read of each one triggers a "Goonware would like to
     // access data from other apps" prompt. By calling Anthropic's
     // OAuth usage endpoint directly we get the same five_hour /
     // seven_day numbers that the official UI shows, sourced from a
@@ -110,7 +110,7 @@ pub async fn claude_usage_status() -> Result<ClaudeUsageStatus, String> {
 /// than resolved at runtime via `claude --version` — that subprocess
 /// reads its own `~/.claude/*` config on startup, which sits inside
 /// another app's MACL domain and would re-fire the App Data Isolation
-/// popup for GLI on every fresh launch. The string just needs to look
+/// popup for Goonware on every fresh launch. The string just needs to look
 /// plausible to Anthropic's edge; the exact version is cosmetic.
 const CLAUDE_USER_AGENT: &str = "claude-code/2.0";
 
@@ -201,7 +201,7 @@ async fn fetch_oauth_usage() -> Option<ClaudeUsageStatus> {
     // Anthropic's OAuth usage endpoint is internal to Claude Code's
     // own UI plumbing. We send a Claude-Code-shaped User-Agent so the
     // request looks like one the endpoint expects to serve — using a
-    // bespoke "gli" UA risks 403s if Anthropic ever filters this
+    // bespoke "goonware" UA risks 403s if Anthropic ever filters this
     // endpoint to first-party callers.
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
@@ -304,10 +304,10 @@ fn cap_inline(s: &str, max: usize) -> String {
 /// hook map.** Earlier iterations spawned `claude --print` to rewrite
 /// the prompt into a creative one-liner ("Fix oauth refresh bug"
 /// rather than the raw text the user typed). That subprocess, run as
-/// a child of GLI, inherits GLI's responsible bundle — so when it
+/// a child of Goonware, inherits Goonware's responsible bundle — so when it
 /// reads its own `~/.claude/*` config + credentials, macOS fires
-/// `kTCCServiceSystemPolicyAppData` ("GLI would like to access data
-/// from other apps") against GLI on every poll. A 4-second cadence
+/// `kTCCServiceSystemPolicyAppData` ("Goonware would like to access data
+/// from other apps") against Goonware on every poll. A 4-second cadence
 /// turned that into a continuous stream of popups any time Claude
 /// was foregrounded.
 ///
@@ -434,7 +434,7 @@ mod tests {
     /// `claude_activity_summary` is invoked every ~4s from the frontend
     /// while a Claude pane is foregrounded. It must never spawn a
     /// helper-agent subprocess, because that subprocess (run as a
-    /// child of GLI) inherits GLI's responsible bundle and trips
+    /// child of Goonware) inherits Goonware's responsible bundle and trips
     /// kTCCServiceSystemPolicyAppData when it reads its own
     /// `~/.claude/*` data files.
     #[test]
@@ -443,7 +443,7 @@ mod tests {
         assert!(
             !code_only.contains("helper_agent"),
             "claude_usage.rs production code must not reference helper_agent — \
-             its inline runner spawns claude/codex/gemini as children of GLI, \
+             its inline runner spawns claude/codex/gemini as children of Goonware, \
              which trips the macOS App Data popup on every poll. Use the \
              in-memory hook map instead."
         );
@@ -512,7 +512,7 @@ mod tests {
     fn activity_summary_returns_capped_prompt_verbatim() {
         // Seed the hook map directly, mimicking what the Claude
         // UserPromptSubmit hook does on the Unix socket.
-        let cwd = format!("/tmp/gli-test-activity-{}", std::process::id());
+        let cwd = format!("/tmp/goonware-test-activity-{}", std::process::id());
         crate::agent_hooks::record_prompt_for_cwd_for_test(
             &cwd,
             "Fix the OAuth refresh bug",
@@ -525,7 +525,7 @@ mod tests {
     /// Long prompts get capped + …-suffixed so they fit in the chrome.
     #[test]
     fn activity_summary_caps_long_prompts() {
-        let cwd = format!("/tmp/gli-test-activity-long-{}", std::process::id());
+        let cwd = format!("/tmp/goonware-test-activity-long-{}", std::process::id());
         let long = "a".repeat(200);
         crate::agent_hooks::record_prompt_for_cwd_for_test(&cwd, &long);
         let out = claude_activity_summary(cwd, None).unwrap().unwrap();
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn activity_summary_none_when_no_prompt_seen() {
         let cwd = format!(
-            "/tmp/gli-test-activity-empty-{}-unique",
+            "/tmp/goonware-test-activity-empty-{}-unique",
             std::process::id()
         );
         let out = claude_activity_summary(cwd, None).unwrap();
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn activity_summary_none_for_whitespace_prompt() {
         let cwd = format!(
-            "/tmp/gli-test-activity-ws-{}-unique",
+            "/tmp/goonware-test-activity-ws-{}-unique",
             std::process::id()
         );
         crate::agent_hooks::record_prompt_for_cwd_for_test(&cwd, "   \n\t  ");

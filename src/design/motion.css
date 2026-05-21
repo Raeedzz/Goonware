@@ -12,13 +12,13 @@
    Opacity-only — never scale (scale on a status dot reads as alarm).
    ------------------------------------------------------------------ */
 
-@keyframes gli-pulse {
+@keyframes goonware-pulse {
   0%, 100% { opacity: 0.55; }
   50%      { opacity: 1; }
 }
 
-.gli-pulse {
-  animation: gli-pulse 1.4s var(--ease-in-out) infinite;
+.goonware-pulse {
+  animation: goonware-pulse 1.4s var(--ease-in-out) infinite;
   will-change: opacity;
 }
 
@@ -31,7 +31,7 @@
    a rolling wave.
    ------------------------------------------------------------------ */
 
-.gli-loading-dots {
+.goonware-loading-dots {
   display: inline-flex;
   gap: 3px;
   align-items: baseline;
@@ -41,13 +41,13 @@
   color: var(--text-secondary);
 }
 
-.gli-loading-dots > span {
+.goonware-loading-dots > span {
   animation: rli-loading-dot 1.2s var(--ease-in-out) infinite;
   will-change: opacity;
 }
-.gli-loading-dots > span:nth-child(1) { animation-delay:    0ms; }
-.gli-loading-dots > span:nth-child(2) { animation-delay:  200ms; }
-.gli-loading-dots > span:nth-child(3) { animation-delay:  400ms; }
+.goonware-loading-dots > span:nth-child(1) { animation-delay:    0ms; }
+.goonware-loading-dots > span:nth-child(2) { animation-delay:  200ms; }
+.goonware-loading-dots > span:nth-child(3) { animation-delay:  400ms; }
 
 @keyframes rli-loading-dot {
   0%, 100% { opacity: 0.25; }
@@ -61,13 +61,13 @@
    only the press.
    ------------------------------------------------------------------ */
 
-.gli-press {
+.goonware-press {
   transition:
     transform var(--motion-fast) var(--ease-out-quart),
     background-color var(--motion-instant) var(--ease-out-quart);
   will-change: transform;
 }
-.gli-press:active {
+.goonware-press:active {
   transform: scale(0.97);
   transition:
     transform 80ms var(--ease-in-quart),
@@ -129,7 +129,7 @@
    semantics on a focusable wrapper).
    ------------------------------------------------------------------ */
 
-.gli-pane-focused {
+.goonware-pane-focused {
   box-shadow: inset 0 0 0 1px var(--accent-muted);
   transition: box-shadow var(--motion-instant) var(--ease-out-quart);
 }
@@ -139,10 +139,10 @@
    Applied via JS class while a drag is hovering a valid target.
    ------------------------------------------------------------------ */
 
-.gli-drop-target {
+.goonware-drop-target {
   position: relative;
 }
-.gli-drop-target::before {
+.goonware-drop-target::before {
   content: "";
   position: absolute;
   inset: 0;
@@ -151,7 +151,7 @@
   pointer-events: none;
   transition: opacity var(--motion-instant) var(--ease-out-quart);
 }
-.gli-drop-target.is-dragging-over::before {
+.goonware-drop-target.is-dragging-over::before {
   opacity: 0.15;
 }
 
@@ -160,22 +160,22 @@
    Apply class once, remove after the animation.
    ------------------------------------------------------------------ */
 
-@keyframes gli-drop-flash {
+@keyframes goonware-drop-flash {
   0%   { background-color: var(--state-success-bg); }
   100% { background-color: transparent; }
 }
 
-.gli-drop-flash {
-  animation: gli-drop-flash 400ms var(--ease-out-quart);
+.goonware-drop-flash {
+  animation: goonware-drop-flash 400ms var(--ease-out-quart);
 }
 
 /* ------------------------------------------------------------------
    Running-agent perimeter-wave loader cell.
 
    The Loader primitive renders a 3×3 grid where 8 perimeter cells
-   carry `<span class="gli-loader-cell">` and the center cell carries
-   `<span class="gli-loader-cell-center">`. Each perimeter cell sets
-   `--gli-loader-snake-pos` (0..7) giving its clockwise position
+   carry `<span class="goonware-loader-cell">` and the center cell carries
+   `<span class="goonware-loader-cell-center">`. Each perimeter cell sets
+   `--goonware-loader-snake-pos` (0..7) giving its clockwise position
    around the ring; the keyframe walks the palette over 1.2s with a
    per-cell negative `animation-delay` so each cell sits at its own
    phase and the crest reads as one continuous rotation.
@@ -192,13 +192,13 @@
    (20+ agents streaming, tab-switch storms, big diffs in flight)
    cannot stall it.
 
-   Scope: only `.gli-loader-cell` and `.gli-loader-cell-center` are
+   Scope: only `.goonware-loader-cell` and `.goonware-loader-cell-center` are
    styled here. The legacy class (`.rli-loader`) is intentionally NOT
    defined anywhere so the double-animate hazard called out in
    tokens.css doesn't return.
    ------------------------------------------------------------------ */
 
-@keyframes gli-loader-snake-wave {
+@keyframes goonware-loader-snake-wave {
   /* True bell curve. With only three stops (valley → peak → valley)
      and `ease-in-out` between them, the velocity tapers to zero at
      every stop — including at the 0%/100% wrap. That eliminates the
@@ -208,7 +208,7 @@
   50%      { opacity: 1; }
 }
 
-.gli-loader-cell {
+.goonware-loader-cell {
   /* Always the bright stop. The dim state is produced by fading
      opacity toward the loader container's dark base color, not by
      animating background-color. Opacity is GPU-composited, so the
@@ -218,16 +218,16 @@
      source of the perceptible micro-stutters. */
   background-color: oklch(96% 0.003 250);
   opacity: 0;
-  animation: gli-loader-snake-wave 1.2s ease-in-out infinite;
-  /* `--gli-loader-snake-pos` is 0..7 set inline per cell. A negative
+  animation: goonware-loader-snake-wave 1.2s ease-in-out infinite;
+  /* `--goonware-loader-snake-pos` is 0..7 set inline per cell. A negative
      delay equal to (pos / 8 of the 1.2s cycle = 150ms) starts each
      cell at its own phase, so the wave reads as one continuous crest
      rotating around the perimeter. */
-  animation-delay: calc(var(--gli-loader-snake-pos, 0) * -150ms);
+  animation-delay: calc(var(--goonware-loader-snake-pos, 0) * -150ms);
   will-change: opacity;
 }
 
-.gli-loader-cell-center {
+.goonware-loader-cell-center {
   /* Static anchor at calm mid-brightness. Sits between the crest's
      dark and lightest stops so it never competes with the moving
      wave but always reads as "this loader is on". */
@@ -241,15 +241,15 @@
    ------------------------------------------------------------------ */
 
 @media (prefers-reduced-motion: reduce) {
-  .gli-pulse {
+  .goonware-pulse {
     animation: none;
     opacity: 1;
   }
-  .gli-loading-dots > span {
+  .goonware-loading-dots > span {
     animation: none;
     opacity: 0.6;
   }
-  .gli-loader-cell {
+  .goonware-loader-cell {
     animation: none;
     /* Freeze at a calm mid-opacity — over the loader container's
        dark base this composites to roughly the same mid-brightness
@@ -257,12 +257,12 @@
        still reads as "still active" without any motion. */
     opacity: 0.5;
   }
-  .gli-loader-cell-center {
+  .goonware-loader-cell-center {
     /* Match the frozen perimeter brightness so the static state reads
        as one cohesive shape rather than a dim core inside a ring. */
     background-color: oklch(72% 0.003 250);
   }
-  .gli-press:active {
+  .goonware-press:active {
     transform: none;
   }
   [data-panel-resize-handle-enabled="true"]:hover,

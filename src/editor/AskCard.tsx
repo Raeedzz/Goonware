@@ -194,7 +194,7 @@ export function AskCard({
 
 function LoadingDots() {
   return (
-    <div className="gli-loading-dots">
+    <div className="goonware-loading-dots">
       <span>·</span>
       <span>·</span>
       <span>·</span>

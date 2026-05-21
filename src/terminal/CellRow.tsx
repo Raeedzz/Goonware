@@ -107,7 +107,7 @@ function UrlSpan({ text, url }: { text: string; url: string }) {
       onClick={(e) => {
         e.preventDefault();
         window.dispatchEvent(
-          new CustomEvent("gli:open-url", { detail: { url } }),
+          new CustomEvent("goonware:open-url", { detail: { url } }),
         );
       }}
       style={{

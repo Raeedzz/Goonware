@@ -9,10 +9,10 @@
 //! Flow:
 //!
 //! ```text
-//!   claude / codex / gemini  ─[hook event]─▶  gli-<cli>-hook.sh
+//!   claude / codex / gemini  ─[hook event]─▶  goonware-<cli>-hook.sh
 //!                                                  │
 //!                                                  ▼
-//!                                       /tmp/gli-agent.sock
+//!                                       /tmp/goonware-agent.sock
 //!                                                  │
 //!                                                  ▼
 //!                                AgentHookState (session map)
@@ -48,13 +48,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
-const CLAUDE_HOOK_SCRIPT: &str = include_str!("../resources/gli-claude-hook.sh");
-const CODEX_HOOK_SCRIPT: &str = include_str!("../resources/gli-codex-hook.sh");
-const GEMINI_HOOK_SCRIPT: &str = include_str!("../resources/gli-gemini-hook.sh");
+const CLAUDE_HOOK_SCRIPT: &str = include_str!("../resources/goonware-claude-hook.sh");
+const CODEX_HOOK_SCRIPT: &str = include_str!("../resources/goonware-codex-hook.sh");
+const GEMINI_HOOK_SCRIPT: &str = include_str!("../resources/goonware-gemini-hook.sh");
 
 /// Shared Unix socket. All three providers' scripts forward to the
 /// same path; the envelope's `provider` field disambiguates.
-const SOCKET_PATH: &str = "/tmp/gli-agent.sock";
+const SOCKET_PATH: &str = "/tmp/goonware-agent.sock";
 
 /// Event name emitted on every state change. Frontend listens once at
 /// app boot and updates a singleton store.
@@ -164,25 +164,31 @@ struct HookEnvelope {
     /// Codex-only. The CLI process id we should watch for liveness.
     #[serde(default)]
     codex_process_id: Option<i32>,
-    /// True iff this envelope is from a GLI helper-agent invocation
+    /// True iff this envelope is from a Goonware helper-agent invocation
     /// (commit-message draft, PR description, etc.). Belt-and-braces:
-    /// the hook script already exits early when `GLI_HELPER_AGENT` is
+    /// the hook script already exits early when `GOONWARE_HELPER_AGENT` is
     /// set, so this should never reach us in practice — but if a
     /// future script regression skips that check, the Rust side still
     /// drops the envelope and the spinner stays quiet.
-    #[serde(default)]
-    gli_helper: Option<bool>,
-    /// The GLI session id from the spawning PTY (GLI_SESSION_ID env
-    /// var, with RLI_SESSION_ID as the legacy fallback). Hook scripts
-    /// are installed globally, so they fire for *every* agent
-    /// invocation on the machine — including ones launched from Warp,
-    /// iTerm, or a bare terminal. When that env var is absent, the
-    /// agent isn't running inside a GLI PTY and the envelope must be
-    /// dropped so the worktree spinner doesn't fire for unrelated
-    /// activity. The script also exits early in that case; this is
-    /// belt-and-braces.
-    #[serde(default)]
-    gli_session_id: Option<String>,
+    ///
+    /// `alias = "gli_helper"` so stale hook scripts left on disk from
+    /// the prior GLI name still parse during the upgrade window.
+    #[serde(default, alias = "gli_helper")]
+    goonware_helper: Option<bool>,
+    /// The Goonware session id from the spawning PTY (GOONWARE_SESSION_ID env
+    /// var, with GLI_SESSION_ID / RLI_SESSION_ID as legacy fallbacks).
+    /// Hook scripts are installed globally, so they fire for *every*
+    /// agent invocation on the machine — including ones launched from
+    /// Warp, iTerm, or a bare terminal. When that env var is absent,
+    /// the agent isn't running inside a Goonware PTY and the envelope
+    /// must be dropped so the worktree spinner doesn't fire for
+    /// unrelated activity. The script also exits early in that case;
+    /// this is belt-and-braces.
+    ///
+    /// `alias = "gli_session_id"` so stale hook scripts left on disk
+    /// from the prior GLI name still parse during the upgrade window.
+    #[serde(default, alias = "gli_session_id")]
+    goonware_session_id: Option<String>,
     /// User's typed prompt text. Populated for UserPromptSubmit
     /// events; empty for everything else. Fed into the tab-subtitle
     /// summarizer (`claude_activity_summary`) so we can render a
@@ -195,17 +201,17 @@ struct HookEnvelope {
 }
 
 /// Drop envelopes that shouldn't move the spinner at all. Two rules:
-///   1. `gli_helper=true` — internal helper-agent one-shot, never a
+///   1. `goonware_helper=true` — internal helper-agent one-shot, never a
 ///      user-visible turn.
-///   2. `gli_session_id` missing/empty — agent isn't running inside a
-///      GLI PTY (e.g. user is using Claude in Warp at the same time).
+///   2. `goonware_session_id` missing/empty — agent isn't running inside a
+///      Goonware PTY (e.g. user is using Claude in Warp at the same time).
 /// Factored as a pure predicate so the rules are testable without
 /// standing up an AppHandle.
 fn should_drop_envelope(envelope: &HookEnvelope) -> bool {
-    if envelope.gli_helper.unwrap_or(false) {
+    if envelope.goonware_helper.unwrap_or(false) {
         return true;
     }
-    match envelope.gli_session_id.as_deref() {
+    match envelope.goonware_session_id.as_deref() {
         None | Some("") => true,
         Some(_) => false,
     }
@@ -311,7 +317,7 @@ fn now_ms() -> u64 {
 /// for the tab-subtitle summarizer — Claude's hook script runs
 /// inside Claude's process tree (so reading the stdin payload
 /// doesn't trip macOS App Data Isolation) and forwards just the
-/// prompt string to GLI via the existing Unix socket. GLI never has
+/// prompt string to Goonware via the existing Unix socket. Goonware never has
 /// to touch `~/.claude/projects/*.jsonl`, which is the only way to
 /// avoid the "would like to access data from other apps" popup that
 /// fires on every fresh transcript file's MACL xattr.
@@ -350,7 +356,7 @@ pub fn start_socket_server(app: AppHandle<Wry>) {
     let listener = match UnixListener::bind(SOCKET_PATH) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[gli-hooks] socket bind failed: {e}");
+            eprintln!("[goonware-hooks] socket bind failed: {e}");
             return;
         }
     };
@@ -391,14 +397,14 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let mut buf = Vec::with_capacity(2048);
     if let Err(e) = stream.read_to_end(&mut buf) {
-        eprintln!("[gli-hooks] socket read failed: {e}");
+        eprintln!("[goonware-hooks] socket read failed: {e}");
         return;
     }
     let envelope: HookEnvelope = match serde_json::from_slice(&buf) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "[gli-hooks] decode failed: {e}; raw={}",
+                "[goonware-hooks] decode failed: {e}; raw={}",
                 String::from_utf8_lossy(&buf)
             );
             return;
@@ -407,19 +413,19 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
     let provider = envelope.provider.unwrap_or(Provider::Claude);
     if envelope.session_id.is_empty() {
         eprintln!(
-            "[gli-hooks] dropping {} event with empty session_id",
+            "[goonware-hooks] dropping {} event with empty session_id",
             provider.as_str()
         );
         return;
     }
     if should_drop_envelope(&envelope) {
-        let reason = if envelope.gli_helper.unwrap_or(false) {
+        let reason = if envelope.goonware_helper.unwrap_or(false) {
             "helper-agent"
         } else {
-            "outside-gli-pty"
+            "outside-goonware-pty"
         };
         eprintln!(
-            "[gli-hooks] dropping {} envelope ({}: event={} session={})",
+            "[goonware-hooks] dropping {} envelope ({}: event={} session={})",
             provider.as_str(),
             reason,
             envelope.event,
@@ -454,7 +460,7 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
         classify_event(provider, &envelope.event, &envelope.aux, prior_in_turn)
     else {
         eprintln!(
-            "[gli-hooks] {} event '{}' (aux='{}') ignored (in_turn={})",
+            "[goonware-hooks] {} event '{}' (aux='{}') ignored (in_turn={})",
             provider.as_str(),
             envelope.event,
             envelope.aux,
@@ -463,7 +469,7 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
         return;
     };
     eprintln!(
-        "[gli-hooks] {} {}{} → {:?} (in_turn {}→{}) cwd={} session={}",
+        "[goonware-hooks] {} {}{} → {:?} (in_turn {}→{}) cwd={} session={}",
         provider.as_str(),
         envelope.event,
         if envelope.aux.is_empty() {
@@ -617,7 +623,7 @@ fn reconcile_codex_liveness(app: &AppHandle<Wry>) {
 
     for mut sess in to_evict {
         eprintln!(
-            "[gli-hooks] codex pid {} exited; ending session {}",
+            "[goonware-hooks] codex pid {} exited; ending session {}",
             sess.codex_process_id.unwrap_or(-1),
             sess.session_id
         );
@@ -709,7 +715,7 @@ fn reconcile_stale_sessions(app: &AppHandle<Wry>) {
 
     for rec in updated {
         eprintln!(
-            "[gli-hooks] {} session {} stuck >{}ms in working — forcing Idle",
+            "[goonware-hooks] {} session {} stuck >{}ms in working — forcing Idle",
             rec.provider.as_str(),
             rec.session_id,
             STALE_WORKING_TIMEOUT_MS
@@ -751,21 +757,21 @@ fn install_claude_hooks() {
     // proactively so a freshly-installed Claude that hasn't been
     // launched yet still picks up our hook on its first run.
     if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!("[gli-hooks] mkdir {} failed: {e}", dir.display());
+        eprintln!("[goonware-hooks] mkdir {} failed: {e}", dir.display());
         return;
     }
     let hooks_dir = dir.join("hooks");
     if let Err(e) = fs::create_dir_all(&hooks_dir) {
-        eprintln!("[gli-hooks] mkdir claude/hooks failed: {e}");
+        eprintln!("[goonware-hooks] mkdir claude/hooks failed: {e}");
         return;
     }
-    let script_path = hooks_dir.join("gli-claude-hook.sh");
+    let script_path = hooks_dir.join("goonware-claude-hook.sh");
     if let Err(e) = fs::write(&script_path, CLAUDE_HOOK_SCRIPT) {
-        eprintln!("[gli-hooks] write claude script failed: {e}");
+        eprintln!("[goonware-hooks] write claude script failed: {e}");
         return;
     }
     chmod_executable(&script_path);
-    eprintln!("[gli-hooks] wrote {}", script_path.display());
+    eprintln!("[goonware-hooks] wrote {}", script_path.display());
 
     let settings_path = dir.join("settings.json");
     let existing: Value = fs::read_to_string(&settings_path)
@@ -778,7 +784,7 @@ fn install_claude_hooks() {
 
 fn upsert_claude_settings(mut root: Value) -> Value {
     let command =
-        "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/gli-claude-hook.sh\"";
+        "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/goonware-claude-hook.sh\"";
     let hook_entry = json!([{"type": "command", "command": command}]);
     let with_matcher = json!([{"matcher": "*", "hooks": hook_entry}]);
     let without_matcher = json!([{"hooks": hook_entry}]);
@@ -801,7 +807,7 @@ fn upsert_claude_settings(mut root: Value) -> Value {
         ("SessionEnd", &without_matcher),
     ];
 
-    upsert_settings_hooks(&mut root, events, "gli-claude-hook.sh");
+    upsert_settings_hooks(&mut root, events, "goonware-claude-hook.sh");
     root
 }
 
@@ -819,16 +825,16 @@ fn install_codex_hooks() {
     }
     let hooks_dir = dir.join("hooks");
     if let Err(e) = fs::create_dir_all(&hooks_dir) {
-        eprintln!("[gli-hooks] mkdir codex/hooks failed: {e}");
+        eprintln!("[goonware-hooks] mkdir codex/hooks failed: {e}");
         return;
     }
-    let script_path = hooks_dir.join("gli-codex-hook.sh");
+    let script_path = hooks_dir.join("goonware-codex-hook.sh");
     if let Err(e) = fs::write(&script_path, CODEX_HOOK_SCRIPT) {
-        eprintln!("[gli-hooks] write codex script failed: {e}");
+        eprintln!("[goonware-hooks] write codex script failed: {e}");
         return;
     }
     chmod_executable(&script_path);
-    eprintln!("[gli-hooks] wrote {}", script_path.display());
+    eprintln!("[goonware-hooks] wrote {}", script_path.display());
 
     // Codex registers hooks in ~/.codex/hooks.json (separate from
     // config.toml). The script path is absolute since Codex doesn't
@@ -846,10 +852,10 @@ fn install_codex_hooks() {
     let existing_cfg = fs::read_to_string(&config_path).unwrap_or_default();
     let updated_cfg = upsert_codex_feature_flag(&existing_cfg);
     if let Err(e) = fs::write(&config_path, &updated_cfg) {
-        eprintln!("[gli-hooks] write codex config.toml failed: {e}");
+        eprintln!("[goonware-hooks] write codex config.toml failed: {e}");
     } else {
         eprintln!(
-            "[gli-hooks] enabled codex_hooks in {}",
+            "[goonware-hooks] enabled codex_hooks in {}",
             config_path.display()
         );
     }
@@ -892,7 +898,7 @@ fn upsert_codex_hooks_json(mut root: Value, script_path: &Path) -> Value {
         }
         let arr = entry.as_array_mut().expect("array");
 
-        // Strip any prior GLI entries (different absolute path on a
+        // Strip any prior Goonware entries (different absolute path on a
         // moved install), then re-append the current one.
         arr.retain(|item| {
             !item
@@ -902,7 +908,7 @@ fn upsert_codex_hooks_json(mut root: Value, script_path: &Path) -> Value {
                     inner.iter().any(|h| {
                         h.get("command")
                             .and_then(|c| c.as_str())
-                            .map(|s| s.contains("gli-codex-hook.sh"))
+                            .map(|s| s.contains("goonware-codex-hook.sh"))
                             .unwrap_or(false)
                     })
                 })
@@ -975,31 +981,31 @@ fn install_gemini_hooks() {
     // Proactively create ~/.gemini even if Gemini CLI has never been
     // launched yet — mirrors the Claude installer path. Without this,
     // a fresh Gemini install (binary in PATH but no ~/.gemini directory
-    // yet) silently runs without GLI's hooks attached, so the agent's
+    // yet) silently runs without Goonware's hooks attached, so the agent's
     // BeforeAgent / AfterAgent lifecycle events never reach the
-    // spinner / activity-tracker on the GLI side. That manifests as
+    // spinner / activity-tracker on the Goonware side. That manifests as
     // "I typed `gemini` and nothing shows up" — the binary IS running,
-    // it just doesn't surface in GLI's chrome.
+    // it just doesn't surface in Goonware's chrome.
     //
     // Gemini reads settings.json eagerly on first invocation, so a
     // pre-created file with our hooks is honoured the first time the
     // user actually launches the CLI.
     if let Err(e) = fs::create_dir_all(&dir) {
-        eprintln!("[gli-hooks] mkdir {} failed: {e}", dir.display());
+        eprintln!("[goonware-hooks] mkdir {} failed: {e}", dir.display());
         return;
     }
     let hooks_dir = dir.join("hooks");
     if let Err(e) = fs::create_dir_all(&hooks_dir) {
-        eprintln!("[gli-hooks] mkdir gemini/hooks failed: {e}");
+        eprintln!("[goonware-hooks] mkdir gemini/hooks failed: {e}");
         return;
     }
-    let script_path = hooks_dir.join("gli-gemini-hook.sh");
+    let script_path = hooks_dir.join("goonware-gemini-hook.sh");
     if let Err(e) = fs::write(&script_path, GEMINI_HOOK_SCRIPT) {
-        eprintln!("[gli-hooks] write gemini script failed: {e}");
+        eprintln!("[goonware-hooks] write gemini script failed: {e}");
         return;
     }
     chmod_executable(&script_path);
-    eprintln!("[gli-hooks] wrote {}", script_path.display());
+    eprintln!("[goonware-hooks] wrote {}", script_path.display());
 
     let settings_path = dir.join("settings.json");
     let existing: Value = fs::read_to_string(&settings_path)
@@ -1030,7 +1036,7 @@ fn upsert_gemini_settings(mut root: Value, script_path: &Path) -> Value {
         ("SessionEnd", &without_matcher),
     ];
 
-    upsert_settings_hooks(&mut root, events, "gli-gemini-hook.sh");
+    upsert_settings_hooks(&mut root, events, "goonware-gemini-hook.sh");
     root
 }
 
@@ -1106,10 +1112,10 @@ fn chmod_executable(path: &PathBuf) {
 fn write_pretty_json(path: &PathBuf, value: &Value, label: &str) {
     match serde_json::to_string_pretty(value) {
         Ok(s) => match fs::write(path, &s) {
-            Ok(()) => eprintln!("[gli-hooks] wrote {} ({label})", path.display()),
-            Err(e) => eprintln!("[gli-hooks] write {label} failed: {e}"),
+            Ok(()) => eprintln!("[goonware-hooks] wrote {} ({label})", path.display()),
+            Err(e) => eprintln!("[goonware-hooks] write {label} failed: {e}"),
         },
-        Err(e) => eprintln!("[gli-hooks] serialize {label} failed: {e}"),
+        Err(e) => eprintln!("[goonware-hooks] serialize {label} failed: {e}"),
     }
 }
 
@@ -1642,15 +1648,15 @@ mod tests {
             "session_id": "abc-123",
             "cwd": "/Users/x/repo",
             "event": "UserPromptSubmit",
-            "gli_helper": true,
+            "goonware_helper": true,
         }));
         assert!(should_drop_envelope(&helper));
     }
 
     /// The same envelope without the marker must NOT be dropped —
     /// that's a real user turn, the spinner should fire normally.
-    /// `gli_session_id` is included so the "agent must be running
-    /// inside GLI" guard doesn't drop it for an unrelated reason.
+    /// `goonware_session_id` is included so the "agent must be running
+    /// inside Goonware" guard doesn't drop it for an unrelated reason.
     #[test]
     fn non_helper_envelope_is_kept() {
         let interactive = envelope_from_json(serde_json::json!({
@@ -1658,7 +1664,7 @@ mod tests {
             "session_id": "abc-123",
             "cwd": "/Users/x/repo",
             "event": "UserPromptSubmit",
-            "gli_session_id": "gli-session-1",
+            "goonware_session_id": "goonware-session-1",
         }));
         assert!(!should_drop_envelope(&interactive));
 
@@ -1667,8 +1673,8 @@ mod tests {
             "session_id": "abc-123",
             "cwd": "/Users/x/repo",
             "event": "UserPromptSubmit",
-            "gli_helper": false,
-            "gli_session_id": "gli-session-1",
+            "goonware_helper": false,
+            "goonware_session_id": "goonware-session-1",
         }));
         assert!(!should_drop_envelope(&explicit_false));
     }
@@ -1684,8 +1690,8 @@ mod tests {
                 "session_id": "x",
                 "cwd": "/tmp",
                 "event": "UserPromptSubmit",
-                "gli_helper": true,
-                "gli_session_id": "gli-session-1",
+                "goonware_helper": true,
+                "goonware_session_id": "goonware-session-1",
             }));
             assert!(
                 should_drop_envelope(&env),
@@ -1698,12 +1704,12 @@ mod tests {
     /* ---------- external-agent envelope drop (Warp / iTerm / etc.) ---------- */
 
     /// The reported bug: user runs Claude from Warp at the same time
-    /// GLI is open. Warp's PTY has no GLI_SESSION_ID, so the hook
-    /// envelope has no `gli_session_id` field. Without this guard, the
-    /// spinner would fire in GLI for an agent that isn't even running
+    /// Goonware is open. Warp's PTY has no GOONWARE_SESSION_ID, so the hook
+    /// envelope has no `goonware_session_id` field. Without this guard, the
+    /// spinner would fire in Goonware for an agent that isn't even running
     /// inside the app.
     #[test]
-    fn envelope_without_gli_session_id_is_dropped() {
+    fn envelope_without_goonware_session_id_is_dropped() {
         let external = envelope_from_json(serde_json::json!({
             "provider": "claude",
             "session_id": "abc-123",
@@ -1713,17 +1719,17 @@ mod tests {
         assert!(should_drop_envelope(&external));
     }
 
-    /// An empty-string `gli_session_id` is treated the same as missing
-    /// — the bash hook may emit `"gli_session_id": ""` when the env
+    /// An empty-string `goonware_session_id` is treated the same as missing
+    /// — the bash hook may emit `"goonware_session_id": ""` when the env
     /// var is unset (depending on quoting), so we must drop that too.
     #[test]
-    fn envelope_with_empty_gli_session_id_is_dropped() {
+    fn envelope_with_empty_goonware_session_id_is_dropped() {
         let external = envelope_from_json(serde_json::json!({
             "provider": "claude",
             "session_id": "abc-123",
             "cwd": "/Users/x/repo",
             "event": "UserPromptSubmit",
-            "gli_session_id": "",
+            "goonware_session_id": "",
         }));
         assert!(should_drop_envelope(&external));
     }
@@ -1742,73 +1748,78 @@ mod tests {
             }));
             assert!(
                 should_drop_envelope(&env),
-                "external (no gli_session_id) envelope from provider={} should be dropped",
+                "external (no goonware_session_id) envelope from provider={} should be dropped",
                 provider
             );
         }
     }
 
-    /// Any non-empty `gli_session_id` keeps the envelope — the value
+    /// Any non-empty `goonware_session_id` keeps the envelope — the value
     /// itself isn't validated here, only its presence. (The session id
     /// is informational; cwd-based worktree matching is what actually
     /// routes the spinner.)
     #[test]
-    fn envelope_with_gli_session_id_is_kept() {
-        for sid in ["gli-1", "abc", "x"] {
+    fn envelope_with_goonware_session_id_is_kept() {
+        for sid in ["goonware-1", "abc", "x"] {
             let env = envelope_from_json(serde_json::json!({
                 "provider": "claude",
                 "session_id": "s",
                 "cwd": "/tmp",
                 "event": "UserPromptSubmit",
-                "gli_session_id": sid,
+                "goonware_session_id": sid,
             }));
             assert!(
                 !should_drop_envelope(&env),
-                "envelope with gli_session_id={:?} must be kept",
+                "envelope with goonware_session_id={:?} must be kept",
                 sid
             );
         }
     }
 
     /// Sanity check on the script-level guard: the bundled hook
-    /// scripts must exit early when `GLI_HELPER_AGENT` is set. The
+    /// scripts must exit early when `GOONWARE_HELPER_AGENT` is set. The
     /// script-level skip is the primary defense (no socket write at
-    /// all); the envelope-level `gli_helper` drop is just
+    /// all); the envelope-level `goonware_helper` drop is just
     /// belt-and-braces. Asserting on the embedded `include_str!`
     /// content catches an accidental removal of the guard during
     /// refactors.
     #[test]
     fn hook_scripts_check_helper_env_var() {
         assert!(
-            CLAUDE_HOOK_SCRIPT.contains("GLI_HELPER_AGENT"),
-            "claude hook script must skip when GLI_HELPER_AGENT is set"
+            CLAUDE_HOOK_SCRIPT.contains("GOONWARE_HELPER_AGENT"),
+            "claude hook script must skip when GOONWARE_HELPER_AGENT is set"
         );
         assert!(
-            CODEX_HOOK_SCRIPT.contains("GLI_HELPER_AGENT"),
-            "codex hook script must skip when GLI_HELPER_AGENT is set"
+            CODEX_HOOK_SCRIPT.contains("GOONWARE_HELPER_AGENT"),
+            "codex hook script must skip when GOONWARE_HELPER_AGENT is set"
         );
         assert!(
-            GEMINI_HOOK_SCRIPT.contains("GLI_HELPER_AGENT"),
-            "gemini hook script must skip when GLI_HELPER_AGENT is set"
+            GEMINI_HOOK_SCRIPT.contains("GOONWARE_HELPER_AGENT"),
+            "gemini hook script must skip when GOONWARE_HELPER_AGENT is set"
         );
     }
 
     /// Hook scripts are installed globally and fire for every agent
     /// invocation, including ones from Warp / iTerm / bare Terminal.
-    /// Each script must check for GLI_SESSION_ID (with RLI_SESSION_ID
+    /// Each script must check for GOONWARE_SESSION_ID (with RLI_SESSION_ID
     /// as the legacy fallback) and exit early when neither is set. If
     /// this assertion fails, the script has lost its guard and the
-    /// spinner will fire for agents outside GLI.
+    /// spinner will fire for agents outside Goonware.
     #[test]
-    fn hook_scripts_check_gli_session_id() {
+    fn hook_scripts_check_goonware_session_id() {
         for (name, body) in [
             ("claude", CLAUDE_HOOK_SCRIPT),
             ("codex", CODEX_HOOK_SCRIPT),
             ("gemini", GEMINI_HOOK_SCRIPT),
         ] {
             assert!(
+                body.contains("GOONWARE_SESSION_ID"),
+                "{} hook script must read GOONWARE_SESSION_ID",
+                name
+            );
+            assert!(
                 body.contains("GLI_SESSION_ID"),
-                "{} hook script must read GLI_SESSION_ID",
+                "{} hook script must fall back to GLI_SESSION_ID",
                 name
             );
             assert!(

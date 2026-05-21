@@ -556,7 +556,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         });
       })
       .catch((err: unknown) => {
-        console.error("[GLI] persistence: loadState failed", err);
+        console.error("[Goonware] persistence: loadState failed", err);
         hydratedRef.current = true;
       });
     return () => {
@@ -568,7 +568,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     if (!hydratedRef.current) return;
     const timer = window.setTimeout(() => {
       saveState(state).catch((err: unknown) => {
-        console.error("[GLI] persistence: saveState failed", err);
+        console.error("[Goonware] persistence: saveState failed", err);
       });
     }, SAVE_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);

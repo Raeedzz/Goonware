@@ -9,7 +9,7 @@
  * macOS file paths are bytes-with-no-NUL — single-quoting handles
  * every character except `'` itself, which we escape as `'\''`. We
  * skip quoting entirely for paths made of safe characters so common
- * cases (`/tmp/gli-paste/paste-1234.png`) stay readable.
+ * cases (`/tmp/goonware-paste/paste-1234.png`) stay readable.
  */
 export function shellQuotePath(path: string): string {
   if (path.length === 0) return "''";

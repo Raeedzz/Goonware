@@ -1428,37 +1428,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gli"
-version = "0.0.1"
-dependencies = [
- "alacritty_terminal",
- "axum",
- "base64 0.22.1",
- "chromiumoxide",
- "dirs 5.0.1",
- "futures",
- "libc",
- "portable-pty",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-fs",
- "tauri-plugin-os",
- "tauri-plugin-process",
- "tauri-plugin-shell",
- "tauri-plugin-updater",
- "tempfile",
- "tokio",
- "tower",
- "tower-http",
- "uuid",
- "zip 2.4.2",
-]
-
-[[package]]
 name = "glib"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1520,6 +1489,37 @@ dependencies = [
  "glib-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "goonware"
+version = "0.0.1"
+dependencies = [
+ "alacritty_terminal",
+ "axum",
+ "base64 0.22.1",
+ "chromiumoxide",
+ "dirs 5.0.1",
+ "futures",
+ "libc",
+ "portable-pty",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-fs",
+ "tauri-plugin-os",
+ "tauri-plugin-process",
+ "tauri-plugin-shell",
+ "tauri-plugin-updater",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tower-http",
+ "uuid",
+ "zip 2.4.2",
 ]
 
 [[package]]

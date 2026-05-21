@@ -24,10 +24,10 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
  *
  * Architecture:
  *
- *   claude / codex / gemini  ─[hook event]─▶  ~/.<cli>/hooks/gli-<cli>-hook.sh
+ *   claude / codex / gemini  ─[hook event]─▶  ~/.<cli>/hooks/goonware-<cli>-hook.sh
  *                                                    │  (JSON envelope)
  *                                                    ▼
- *                                         /tmp/gli-agent.sock
+ *                                         /tmp/goonware-agent.sock
  *                                                    │
  *                                                    ▼
  *                                      Rust AgentHookState
@@ -125,7 +125,7 @@ function applyRecord(record: SessionRecord) {
 async function bootstrap() {
   if (bootstrapped) return;
   bootstrapped = true;
-  // Initial snapshot in case the user starts GLI while an agent
+  // Initial snapshot in case the user starts Goonware while an agent
   // session is already mid-turn — the hook events for that turn
   // have already fired and we'd otherwise have nothing in the map
   // until the next event.
@@ -145,7 +145,7 @@ async function bootstrap() {
     // Listener bind failure is fatal-but-silent: the rest of the app
     // works without spinners. Surface via console for diagnosis.
     // eslint-disable-next-line no-console
-    console.warn("gli agent hook listener bind failed");
+    console.warn("goonware agent hook listener bind failed");
   }
 }
 

@@ -59,7 +59,7 @@ export function shouldRenderBlockList(_foregroundIsAgent: boolean): boolean {
  * is normally just a footgun. The right-panel secondary terminal
  * passes true so long lines in closed blocks (and the narrow live
  * grid) can be panned via trackpad without truncation. Pair with
- * the `gli-no-horizontal-scrollbar` class to suppress the track.
+ * the `goonware-no-horizontal-scrollbar` class to suppress the track.
  */
 export function agentScrollContainerStyle(
   allowHorizontalScroll = false,

@@ -14,7 +14,7 @@
 
 /* Prompt input placeholder ("Run commands") — explicit rule because
    inline styles can't target the ::placeholder pseudo-element. */
-.gli-prompt-input::placeholder {
+.goonware-prompt-input::placeholder {
   color: var(--text-tertiary);
   opacity: 1;
 }
@@ -23,14 +23,14 @@
    strip so horizontal overflow scrolls silently without a visible
    track under the tabs. Overrides the global *::-webkit-scrollbar
    sizing in design/tokens.css. */
-.gli-no-scrollbar { scrollbar-width: none; }
-.gli-no-scrollbar::-webkit-scrollbar { width: 0; height: 0; }
+.goonware-no-scrollbar { scrollbar-width: none; }
+.goonware-no-scrollbar::-webkit-scrollbar { width: 0; height: 0; }
 
 /* Hide ONLY the horizontal scrollbar (track + thumb) while keeping
    the vertical one visible. Used on the right-panel secondary
    terminal so long lines can be scrolled horizontally via trackpad
    without a chunky 8px track running under the prompt input. */
-.gli-no-horizontal-scrollbar::-webkit-scrollbar:horizontal { height: 0; }
+.goonware-no-horizontal-scrollbar::-webkit-scrollbar:horizontal { height: 0; }
 
 /* Resize-handle styling lives in design/motion.css. The earlier
    "8px gap between floating panes" styles that lived here have been
@@ -40,37 +40,37 @@
 /* ------------------------------------------------------------------
    Markdown preview (.md files in the editor pane)
    ------------------------------------------------------------------ */
-.gli-markdown h1,
-.gli-markdown h2,
-.gli-markdown h3,
-.gli-markdown h4,
-.gli-markdown h5,
-.gli-markdown h6 {
+.goonware-markdown h1,
+.goonware-markdown h2,
+.goonware-markdown h3,
+.goonware-markdown h4,
+.goonware-markdown h5,
+.goonware-markdown h6 {
   color: var(--text-primary);
   font-weight: var(--weight-semibold);
   letter-spacing: var(--tracking-tight);
   line-height: 1.25;
   margin: 1.6em 0 0.5em;
 }
-.gli-markdown h1 { font-size: 1.85em; border-bottom: var(--border-1); padding-bottom: 0.25em; }
-.gli-markdown h2 { font-size: 1.45em; border-bottom: var(--border-1); padding-bottom: 0.25em; }
-.gli-markdown h3 { font-size: 1.2em; }
-.gli-markdown h4 { font-size: 1.05em; }
-.gli-markdown h5,
-.gli-markdown h6 { font-size: 0.95em; color: var(--text-secondary); }
-.gli-markdown p { margin: 0.6em 0; color: var(--text-secondary); }
-.gli-markdown a {
+.goonware-markdown h1 { font-size: 1.85em; border-bottom: var(--border-1); padding-bottom: 0.25em; }
+.goonware-markdown h2 { font-size: 1.45em; border-bottom: var(--border-1); padding-bottom: 0.25em; }
+.goonware-markdown h3 { font-size: 1.2em; }
+.goonware-markdown h4 { font-size: 1.05em; }
+.goonware-markdown h5,
+.goonware-markdown h6 { font-size: 0.95em; color: var(--text-secondary); }
+.goonware-markdown p { margin: 0.6em 0; color: var(--text-secondary); }
+.goonware-markdown a {
   color: var(--accent-bright);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
-.gli-markdown a:hover { color: var(--accent); }
-.gli-markdown strong { color: var(--text-primary); font-weight: var(--weight-semibold); }
-.gli-markdown em { color: var(--text-primary); }
-.gli-markdown ul,
-.gli-markdown ol { margin: 0.5em 0 0.5em 1.5em; padding-left: 0.25em; color: var(--text-secondary); }
-.gli-markdown li { margin: 0.15em 0; }
-.gli-markdown blockquote {
+.goonware-markdown a:hover { color: var(--accent); }
+.goonware-markdown strong { color: var(--text-primary); font-weight: var(--weight-semibold); }
+.goonware-markdown em { color: var(--text-primary); }
+.goonware-markdown ul,
+.goonware-markdown ol { margin: 0.5em 0 0.5em 1.5em; padding-left: 0.25em; color: var(--text-secondary); }
+.goonware-markdown li { margin: 0.15em 0; }
+.goonware-markdown blockquote {
   margin: 0.6em 0;
   padding: 0.1em 0.9em;
   border-left: 2px solid var(--accent-muted);
@@ -78,12 +78,12 @@
   color: var(--text-secondary);
   border-radius: var(--radius-xs);
 }
-.gli-markdown hr {
+.goonware-markdown hr {
   border: none;
   border-top: var(--border-1);
   margin: 1.5em 0;
 }
-.gli-markdown code {
+.goonware-markdown code {
   font-family: var(--font-mono);
   font-size: 0.92em;
   padding: 0.12em 0.32em;
@@ -91,7 +91,7 @@
   border-radius: var(--radius-xs);
   color: var(--text-primary);
 }
-.gli-markdown pre {
+.goonware-markdown pre {
   margin: 0.8em 0;
   padding: var(--space-3) var(--space-4);
   background-color: var(--surface-1);
@@ -101,51 +101,51 @@
   font-size: 0.92em;
   line-height: 1.5;
 }
-.gli-markdown pre code {
+.goonware-markdown pre code {
   padding: 0;
   background: transparent;
   font-size: inherit;
 }
-.gli-markdown table {
+.goonware-markdown table {
   border-collapse: collapse;
   margin: 0.8em 0;
   width: 100%;
   font-size: 0.95em;
 }
-.gli-markdown th,
-.gli-markdown td {
+.goonware-markdown th,
+.goonware-markdown td {
   text-align: left;
   padding: 0.4em 0.6em;
   border-bottom: var(--border-1);
 }
-.gli-markdown th {
+.goonware-markdown th {
   color: var(--text-primary);
   font-weight: var(--weight-semibold);
   background-color: var(--surface-1);
 }
-.gli-markdown img {
+.goonware-markdown img {
   max-width: 100%;
   border-radius: var(--radius-sm);
   display: block;
   margin: 0.6em 0;
 }
-.gli-markdown input[type="checkbox"] {
+.goonware-markdown input[type="checkbox"] {
   margin-right: 0.4em;
   vertical-align: middle;
   accent-color: var(--accent-bright);
 }
 
-/* TipTap rich-edit surface — same prose chrome as `.gli-markdown`,
+/* TipTap rich-edit surface — same prose chrome as `.goonware-markdown`,
    plus contenteditable affordances. The global :focus-visible rule
    would otherwise paint a 2px blue ring around the entire article;
    ProseMirror's own caret is the right focus indicator here. */
-.gli-rich-editor:focus,
-.gli-rich-editor:focus-visible,
-.gli-rich-editor.ProseMirror:focus,
-.gli-rich-editor.ProseMirror:focus-visible {
+.goonware-rich-editor:focus,
+.goonware-rich-editor:focus-visible,
+.goonware-rich-editor.ProseMirror:focus,
+.goonware-rich-editor.ProseMirror:focus-visible {
   outline: none;
 }
-.gli-rich-editor.ProseMirror {
+.goonware-rich-editor.ProseMirror {
   min-height: 100%;
   font-family: var(--font-sans);
   font-size: 15px;
@@ -153,7 +153,7 @@
   color: var(--text-primary);
   caret-color: var(--accent-bright);
 }
-.gli-rich-editor [data-placeholder]::before {
+.goonware-rich-editor [data-placeholder]::before {
   color: var(--text-tertiary);
 }
 
@@ -161,22 +161,22 @@
    .ProseMirror with no inherent spacing, so without explicit margins
    the prose collapses into a wall of text (this is the "everything
    in a line" symptom). The selectors below add the same block-level
-   rhythm the rendered `.gli-markdown` preview uses. We don't rely on
-   `.gli-markdown` here because TipTap wraps content in its own
+   rhythm the rendered `.goonware-markdown` preview uses. We don't rely on
+   `.goonware-markdown` here because TipTap wraps content in its own
    ProseMirror DOM, so the cascade alone doesn't reach the rich
    block children reliably across browsers. */
-.gli-rich-editor.ProseMirror > * {
+.goonware-rich-editor.ProseMirror > * {
   margin-top: 0.75em;
   margin-bottom: 0.75em;
 }
-.gli-rich-editor.ProseMirror > *:first-child { margin-top: 0; }
-.gli-rich-editor.ProseMirror > *:last-child  { margin-bottom: 0; }
-.gli-rich-editor.ProseMirror h1,
-.gli-rich-editor.ProseMirror h2,
-.gli-rich-editor.ProseMirror h3,
-.gli-rich-editor.ProseMirror h4,
-.gli-rich-editor.ProseMirror h5,
-.gli-rich-editor.ProseMirror h6 {
+.goonware-rich-editor.ProseMirror > *:first-child { margin-top: 0; }
+.goonware-rich-editor.ProseMirror > *:last-child  { margin-bottom: 0; }
+.goonware-rich-editor.ProseMirror h1,
+.goonware-rich-editor.ProseMirror h2,
+.goonware-rich-editor.ProseMirror h3,
+.goonware-rich-editor.ProseMirror h4,
+.goonware-rich-editor.ProseMirror h5,
+.goonware-rich-editor.ProseMirror h6 {
   margin-top: 1.6em;
   margin-bottom: 0.5em;
   color: var(--text-primary);
@@ -184,49 +184,49 @@
   letter-spacing: var(--tracking-tight);
   line-height: 1.25;
 }
-.gli-rich-editor.ProseMirror h1 {
+.goonware-rich-editor.ProseMirror h1 {
   font-size: 1.85em;
   border-bottom: var(--border-1);
   padding-bottom: 0.25em;
 }
-.gli-rich-editor.ProseMirror h2 {
+.goonware-rich-editor.ProseMirror h2 {
   font-size: 1.45em;
   border-bottom: var(--border-1);
   padding-bottom: 0.25em;
 }
-.gli-rich-editor.ProseMirror h3 { font-size: 1.2em; }
-.gli-rich-editor.ProseMirror h4 { font-size: 1.05em; }
-.gli-rich-editor.ProseMirror h5,
-.gli-rich-editor.ProseMirror h6 {
+.goonware-rich-editor.ProseMirror h3 { font-size: 1.2em; }
+.goonware-rich-editor.ProseMirror h4 { font-size: 1.05em; }
+.goonware-rich-editor.ProseMirror h5,
+.goonware-rich-editor.ProseMirror h6 {
   font-size: 0.95em;
   color: var(--text-secondary);
 }
-.gli-rich-editor.ProseMirror p {
+.goonware-rich-editor.ProseMirror p {
   color: var(--text-secondary);
 }
-.gli-rich-editor.ProseMirror strong {
+.goonware-rich-editor.ProseMirror strong {
   color: var(--text-primary);
   font-weight: var(--weight-semibold);
 }
-.gli-rich-editor.ProseMirror em {
+.goonware-rich-editor.ProseMirror em {
   color: var(--text-primary);
   font-style: italic;
 }
-.gli-rich-editor.ProseMirror a {
+.goonware-rich-editor.ProseMirror a {
   color: var(--accent-bright);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
-.gli-rich-editor.ProseMirror a:hover { color: var(--accent); }
-.gli-rich-editor.ProseMirror ul,
-.gli-rich-editor.ProseMirror ol {
+.goonware-rich-editor.ProseMirror a:hover { color: var(--accent); }
+.goonware-rich-editor.ProseMirror ul,
+.goonware-rich-editor.ProseMirror ol {
   margin-left: 1.5em;
   padding-left: 0.25em;
   color: var(--text-secondary);
 }
-.gli-rich-editor.ProseMirror li { margin: 0.15em 0; }
-.gli-rich-editor.ProseMirror li > p { margin: 0; }
-.gli-rich-editor.ProseMirror blockquote {
+.goonware-rich-editor.ProseMirror li { margin: 0.15em 0; }
+.goonware-rich-editor.ProseMirror li > p { margin: 0; }
+.goonware-rich-editor.ProseMirror blockquote {
   margin: 0.6em 0;
   padding: 0.1em 0.9em;
   border-left: 2px solid var(--accent-muted);
@@ -234,12 +234,12 @@
   color: var(--text-secondary);
   border-radius: var(--radius-xs);
 }
-.gli-rich-editor.ProseMirror hr {
+.goonware-rich-editor.ProseMirror hr {
   border: none;
   border-top: var(--border-1);
   margin: 1.5em 0;
 }
-.gli-rich-editor.ProseMirror code {
+.goonware-rich-editor.ProseMirror code {
   font-family: var(--font-mono);
   font-size: 0.92em;
   padding: 0.12em 0.32em;
@@ -247,7 +247,7 @@
   border-radius: var(--radius-xs);
   color: var(--text-primary);
 }
-.gli-rich-editor.ProseMirror pre {
+.goonware-rich-editor.ProseMirror pre {
   margin: 0.8em 0;
   padding: var(--space-3) var(--space-4);
   background-color: var(--surface-1);
@@ -258,29 +258,29 @@
   line-height: 1.5;
   color: var(--text-primary);
 }
-.gli-rich-editor.ProseMirror pre code {
+.goonware-rich-editor.ProseMirror pre code {
   padding: 0;
   background: transparent;
   font-size: inherit;
 }
-.gli-rich-editor.ProseMirror table {
+.goonware-rich-editor.ProseMirror table {
   border-collapse: collapse;
   margin: 0.8em 0;
   width: 100%;
   font-size: 0.95em;
 }
-.gli-rich-editor.ProseMirror th,
-.gli-rich-editor.ProseMirror td {
+.goonware-rich-editor.ProseMirror th,
+.goonware-rich-editor.ProseMirror td {
   text-align: left;
   padding: 0.4em 0.6em;
   border-bottom: var(--border-1);
 }
-.gli-rich-editor.ProseMirror th {
+.goonware-rich-editor.ProseMirror th {
   color: var(--text-primary);
   font-weight: var(--weight-semibold);
   background-color: var(--surface-1);
 }
-.gli-rich-editor.ProseMirror img {
+.goonware-rich-editor.ProseMirror img {
   max-width: 100%;
   border-radius: var(--radius-sm);
   display: block;

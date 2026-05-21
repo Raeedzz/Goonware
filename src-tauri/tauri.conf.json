@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "GLI",
+  "productName": "Goonware",
   "version": "0.0.1",
-  "identifier": "dev.raeedz.gli",
+  "identifier": "dev.raeedz.goonware",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "GLI",
+        "title": "Goonware",
         "width": 1440,
         "height": 900,
         "minWidth": 960,
@@ -52,12 +52,12 @@
     },
     "category": "public.app-category.developer-tools",
     "shortDescription": "Workspace for running CLI coding agents.",
-    "longDescription": "GLI is a confident dark instrument for spawning, organizing, and orchestrating CLI coding agents like Claude Code and Codex. macOS only."
+    "longDescription": "Goonware is a confident dark instrument for spawning, organizing, and orchestrating CLI coding agents like Claude Code and Codex. macOS only."
   },
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/Raeedzz/GLI/releases/latest/download/latest.json"
+        "https://github.com/Raeedzz/Goonware/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcxOEFCNTAxNUQ0OEY0RjcKUldUMzlFaGRBYldLY1RXWWV5a1ppcG94QlVxd2xZMjZ3eEFTbTMzc3g3eFhuUFJjQitqdjhZbXUK"
     }

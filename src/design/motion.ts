@@ -1,5 +1,5 @@
 /**
- * GLI motion language — Motion (Framer Motion v12+) variants & transitions.
+ * Goonware motion language — Motion (Framer Motion v12+) variants & transitions.
  *
  * See design-system/motion.md for the rationale and choreography spec.
  *
@@ -80,8 +80,8 @@ export const t = {
    Shared layoutId constants
    ------------------------------------------------------------------ */
 
-export const LAYOUT_TAB_INDICATOR    = "gli-active-tab";
-export const LAYOUT_PROJECT_STRIP    = "gli-active-project";
+export const LAYOUT_TAB_INDICATOR    = "goonware-active-tab";
+export const LAYOUT_PROJECT_STRIP    = "goonware-active-project";
 
 /* ------------------------------------------------------------------
    Surface variants
@@ -269,7 +269,7 @@ export function useTabIndicatorTransition(): Transition {
    ------------------------------------------------------------------ */
 
 export const css = {
-  pulse:        "gli-pulse",        // streaming agent status dot
-  loadingDots:  "gli-loading-dots", // three-dot loading indicator
-  pressDown:    "gli-press",        // button :active scale-down
+  pulse:        "goonware-pulse",        // streaming agent status dot
+  loadingDots:  "goonware-loading-dots", // three-dot loading indicator
+  pressDown:    "goonware-press",        // button :active scale-down
 };

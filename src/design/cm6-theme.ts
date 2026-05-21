@@ -1,5 +1,5 @@
 /**
- * GLI CodeMirror 6 theme.
+ * Goonware CodeMirror 6 theme.
  *
  * Calm, monochromatic-leaning syntax highlighting. Keywords use the info
  * blue (distinct from the accent steel blue), strings use sage green,

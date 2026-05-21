@@ -15,7 +15,7 @@ import type { Span } from "./types";
  * visible styling in the output.
  *
  * Palette mirrors `ANSI_16` in `term.rs` — workshop pigments tuned to
- * the GLI dark theme. Truecolor (`38;2;R;G;B`) round-trips losslessly.
+ * the Goonware dark theme. Truecolor (`38;2;R;G;B`) round-trips losslessly.
  */
 
 const ANSI_16: readonly string[] = [

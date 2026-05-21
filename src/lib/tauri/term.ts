@@ -139,3 +139,15 @@ export async function termResetGrid(id: string): Promise<void> {
 export async function termSetVisibleSet(ids: string[]): Promise<void> {
   await invoke("term_set_visible_set", { ids });
 }
+
+/**
+ * Force-kill the PTY's foreground process group with SIGKILL. Wired
+ * to the double-tap-Ctrl+C escalation in BlockTerminal — bun, some
+ * dev-server wrappers, and certain build watchers trap SIGINT and
+ * refuse to die from 0x03 alone. SIGKILL bypasses every signal trap
+ * the process can install. The shell process is unaffected; only the
+ * stuck foreground job dies, leaving the user back at the prompt.
+ */
+export async function termKillForeground(id: string): Promise<void> {
+  await invoke("term_kill_foreground", { id });
+}

@@ -129,7 +129,7 @@ pub async fn run_inline(
         // spinner is reserved for interactive turns the user actually
         // started, not background calls like "draft this commit msg".
         // Inherited through the agent CLI into its hook subprocesses.
-        command.env("GLI_HELPER_AGENT", "1");
+        command.env("GOONWARE_HELPER_AGENT", "1");
         if !cwd.is_empty() {
             command.current_dir(cwd);
         }
@@ -150,7 +150,7 @@ pub async fn run_inline(
 
     let mut command = Command::new(bin);
     command.args(&args);
-    command.env("GLI_HELPER_AGENT", "1");
+    command.env("GOONWARE_HELPER_AGENT", "1");
     if !cwd.is_empty() {
         command.current_dir(cwd);
     }

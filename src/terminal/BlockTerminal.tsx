@@ -29,7 +29,8 @@ import {
   clearTerminalRunning,
 } from "./terminalActivityStore";
 import { detectClaude } from "@/lib/claudeUsage";
-import { termResetGrid } from "@/lib/tauri/term";
+import { termKillForeground, termResetGrid } from "@/lib/tauri/term";
+import { decideCtrlCAction } from "./ctrlCEscalation";
 import {
   agentScrollContainerStyle,
   shouldRenderBlockList,
@@ -91,11 +92,11 @@ interface Props {
   autoSummarize?: boolean;
   /**
    * Active project id. Forwarded to term_start so the PTY's env has
-   * `GLI_PROJECT_ID` / `RLI_PROJECT_ID` set — agents inside the PTY
+   * `GOONWARE_PROJECT_ID` / `RLI_PROJECT_ID` set — agents inside the PTY
    * read this to identify which project they're running in.
    */
   projectId?: string;
-  /** Active session id, mirrors `GLI_SESSION_ID` / `RLI_SESSION_ID` in PTY env. */
+  /** Active session id, mirrors `GOONWARE_SESSION_ID` / `RLI_SESSION_ID` in PTY env. */
   sessionId?: string;
   /**
    * Fires once when Claude is first detected in this pane's PTY
@@ -830,6 +831,25 @@ export function BlockTerminal({
     [sendBytes],
   );
 
+  // Double-tap Ctrl+C escape hatch — see {@link decideCtrlCAction}.
+  // Called by PromptInput / PtyPassthrough when the user mashes
+  // Ctrl+C and a single SIGINT didn't take. The Rust side reads the
+  // foreground process group via tcgetpgrp(master_fd) and SIGKILLs
+  // it, bypassing whatever signal trap the running process installed.
+  const onForceKill = useCallback(() => {
+    void termKillForeground(ptyId).catch(() => {
+      // Backend may have torn the session down between the read and
+      // the kill (rare race on tab close). Nothing useful to do; the
+      // next Ctrl+C will start a fresh single-tap cycle anyway.
+    });
+  }, [ptyId]);
+
+  // Window-level Ctrl+C path (fallback for focus-drifted-to-body) has
+  // its own escalation state because the window listener never runs
+  // PromptInput's keydown. Keep them independent so a mash that
+  // ricochets through both paths still escalates cleanly.
+  const fallbackLastCtrlCAtRef = useRef<number | null>(null);
+
   const onSubmit = useCallback(
     (text: string) => {
       setActiveCommand(text);
@@ -1103,12 +1123,20 @@ export function BlockTerminal({
 
   // Window-level Ctrl+C fallback — handles the "focus drifted to
   // document.body after a drag-selection" case. Encoding is pinned
-  // by keyEncoding.test.ts; this pins the delivery path.
+  // by keyEncoding.test.ts; this pins the delivery path. Same
+  // double-tap escalation as the textarea-focused path: second press
+  // within ESCALATION_WINDOW_MS escalates SIGINT → SIGKILL on the
+  // foreground process group.
   //
   // Gates:
   //   - No text currently selected (don't compete with copy paths).
   //   - Focus is on body or non-editable (not stealing from real inputs).
   //   - This terminal was most-recently interacted with (multi-pane).
+  const liveCommandRunning = liveFrame?.command_running ?? false;
+  const liveCommandRunningRef = useRef(liveCommandRunning);
+  useEffect(() => {
+    liveCommandRunningRef.current = liveCommandRunning;
+  }, [liveCommandRunning]);
   useEffect(() => {
     if (!isVisible) return;
     const onKey = (e: KeyboardEvent) => {
@@ -1129,7 +1157,18 @@ export function BlockTerminal({
       }
       if (getLastInteractedTerminal() !== id) return;
       e.preventDefault();
-      void sendBytes(new Uint8Array([0x03]));
+      const decision = decideCtrlCAction({
+        now: Date.now(),
+        lastCtrlCAt: fallbackLastCtrlCAtRef.current,
+        commandRunning: liveCommandRunningRef.current,
+      });
+      fallbackLastCtrlCAtRef.current =
+        decision.newLastCtrlCAt === 0 ? null : decision.newLastCtrlCAt;
+      if (decision.action === "sigkill") {
+        onForceKill();
+      } else {
+        void sendBytes(new Uint8Array([0x03]));
+      }
       if (foregroundIsAgentRef.current) {
         passthroughRef.current?.focus();
       } else {
@@ -1138,7 +1177,7 @@ export function BlockTerminal({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [id, isVisible, sendBytes]);
+  }, [id, isVisible, sendBytes, onForceKill]);
 
   // Window-level Cmd+C copy. Closed blocks are plain divs with
   // userSelect: "text"; users can drag-select inside them. But our
@@ -1283,42 +1322,71 @@ export function BlockTerminal({
           ref={scrollContainerRef}
           onScroll={onScrollContainerScroll}
           className={
-            allowHorizontalScroll ? "gli-no-horizontal-scrollbar" : undefined
+            allowHorizontalScroll ? "goonware-no-horizontal-scrollbar" : undefined
           }
           style={agentScrollContainerStyle(allowHorizontalScroll)}
         >
-          {/* BlockList must render in BOTH shell and agent modes so the
-              user can always scroll back into closed-block history.
-              The earlier "hide it during agent mode" workaround broke
-              scrollback while a live agent was running (user-reported
-              "i cant scroll in the terminal while an agent is
-              running"). Squashing of the LiveBlock by a tall BlockList
-              is now prevented by the fill-mode LiveBlock's hard
-              min-height: 100cqh (see `liveBlockOuterStyle`), not by
-              hiding history. `shouldRenderBlockList` always returns
-              true and exists so the regression is pinned by a test. */}
-          {shouldRenderBlockList(foregroundIsAgent) && (
-            <BlockList blocks={blocks} noWrap={allowHorizontalScroll} />
-          )}
-          {liveFrame?.command_running && !exited && (
-            <LiveBlock
-              command={activeCommand}
-              frame={liveFrame}
-              cwd={effectiveCwd}
-              preserveGrid={foregroundIsAgent}
-              noWrap={allowHorizontalScroll}
-              // Agent TUIs own the surface — let the LiveBlock fill
-              // the pane instead of sizing to content. Without this,
-              // a tall agent grid (claude with the slash-command
-              // picker open) draws below an empty BlockList region,
-              // the outer scroll anchors that combined column at the
-              // bottom, and the user sees a fat band of blank canvas
-              // above the picker. Filling the pane puts the picker's
-              // first row at the visible top edge — what users mean
-              // by "I want to see what I'm picking."
-              fill={foregroundIsAgent}
-            />
-          )}
+          {/* Width-sizing wrapper. In `allowHorizontalScroll` mode,
+              CellRows render with `whiteSpace: pre` and the LiveBlock
+              body has `overflowX: visible`, so individual lines can
+              extend past the scroll container's viewport. Without this
+              wrapper, the LiveBlock outer (and each closed Block) is
+              sized to the scroll container's CLIENT width — so when
+              the user pans right, the block frames (border-top of
+              LiveBlock, border-bottom of the command-line divider,
+              the "RUNNING" header row) end short of the visible right
+              edge while the inner text keeps going. The user-reported
+              symptom is "white space on the side on the right." The
+              wrapper takes `min-width: max-content` so it expands to
+              the widest line across all blocks; combined with `100%`
+              minimum so a narrow transcript still fills the pane. All
+              block frames inside stretch to this wrapper's width, so
+              every divider and pill spans the full panned content. */}
+          <div
+            style={
+              allowHorizontalScroll
+                ? {
+                    display: "flex",
+                    flexDirection: "column",
+                    minWidth: "max-content",
+                    width: "100%",
+                  }
+                : { display: "contents" }
+            }
+          >
+            {/* BlockList must render in BOTH shell and agent modes so the
+                user can always scroll back into closed-block history.
+                The earlier "hide it during agent mode" workaround broke
+                scrollback while a live agent was running (user-reported
+                "i cant scroll in the terminal while an agent is
+                running"). Squashing of the LiveBlock by a tall BlockList
+                is now prevented by the fill-mode LiveBlock's hard
+                min-height: 100cqh (see `liveBlockOuterStyle`), not by
+                hiding history. `shouldRenderBlockList` always returns
+                true and exists so the regression is pinned by a test. */}
+            {shouldRenderBlockList(foregroundIsAgent) && (
+              <BlockList blocks={blocks} noWrap={allowHorizontalScroll} />
+            )}
+            {liveFrame?.command_running && !exited && (
+              <LiveBlock
+                command={activeCommand}
+                frame={liveFrame}
+                cwd={effectiveCwd}
+                preserveGrid={foregroundIsAgent}
+                noWrap={allowHorizontalScroll}
+                // Agent TUIs own the surface — let the LiveBlock fill
+                // the pane instead of sizing to content. Without this,
+                // a tall agent grid (claude with the slash-command
+                // picker open) draws below an empty BlockList region,
+                // the outer scroll anchors that combined column at the
+                // bottom, and the user sees a fat band of blank canvas
+                // above the picker. Filling the pane puts the picker's
+                // first row at the visible top edge — what users mean
+                // by "I want to see what I'm picking."
+                fill={foregroundIsAgent}
+              />
+            )}
+          </div>
         </div>
       )}
 
@@ -1341,6 +1409,8 @@ export function BlockTerminal({
           ref={promptRef}
           onSubmit={onSubmit}
           onSendBytes={onSendBytesVoid}
+          onForceKill={onForceKill}
+          commandRunning={liveCommandRunning}
           onPaste={onPaste}
           historyLength={history.length}
           historyAt={historyAt}
@@ -1352,6 +1422,8 @@ export function BlockTerminal({
         <PtyPassthrough
           ref={passthroughRef}
           onSendBytes={onSendBytesVoid}
+          onForceKill={onForceKill}
+          commandRunning={liveCommandRunning}
           appCursor={liveFrame?.app_cursor ?? false}
           bracketedPaste={liveFrame?.bracketed_paste ?? false}
           autoFocus={autoFocus}

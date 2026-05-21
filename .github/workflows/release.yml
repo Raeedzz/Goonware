@@ -1,4 +1,4 @@
-# Release pipeline for GLI.
+# Release pipeline for Goonware.
 #
 # Trigger: every push to `main` (which includes merged PRs). The
 # workflow computes the next version by patch-bumping the latest
@@ -9,7 +9,7 @@
 #
 # The published release also contains a `latest.json` — the file the
 # installed app polls at
-# `https://github.com/Raeedzz/GLI/releases/latest/download/latest.json`
+# `https://github.com/Raeedzz/Goonware/releases/latest/download/latest.json`
 # to discover new versions. Because we publish as Latest immediately,
 # every push to main ships an update; `UpdaterToast.tsx` shows the
 # prompt in the corner on the user's next app start.
@@ -19,7 +19,7 @@
 # 1. Generate the updater keypair on your dev machine:
 #
 #      mkdir -p ~/.tauri
-#      npx @tauri-apps/cli signer generate --password "" --ci -w ~/.tauri/gli.key
+#      npx @tauri-apps/cli signer generate --password "" --ci -w ~/.tauri/goonware.key
 #
 #    (Use `--password "<your-password>"` instead of empty if you want
 #    one. If you set a password, also add the secret in step 3.)
@@ -34,9 +34,9 @@
 #      }
 #
 # 3. Add the GitHub secret at
-#    https://github.com/Raeedzz/GLI/settings/secrets/actions :
+#    https://github.com/Raeedzz/Goonware/settings/secrets/actions :
 #
-#      TAURI_SIGNING_PRIVATE_KEY          ← contents of ~/.tauri/gli.key
+#      TAURI_SIGNING_PRIVATE_KEY          ← contents of ~/.tauri/goonware.key
 #      TAURI_SIGNING_PRIVATE_KEY_PASSWORD ← (only if you set one in step 1)
 #
 # 4. (Optional — Apple notarization) If you want users to skip the
@@ -244,7 +244,7 @@ jobs:
           # Build universal so a single DMG runs on Apple Silicon + Intel.
           args: --target universal-apple-darwin
           tagName: ${{ steps.ver.outputs.tag }}
-          releaseName: "GLI ${{ steps.ver.outputs.tag }}"
+          releaseName: "Goonware ${{ steps.ver.outputs.tag }}"
           # Publish as Latest immediately so users' installed builds
           # see the new version on their next poll. Drafts would
           # require manual promotion before the updater toast fires.

@@ -1,7 +1,7 @@
 //! Filesystem + shell-out commands.
 //!
 //! tauri-plugin-fs exists but is capability-scoped — every path the
-//! frontend touches has to be in an allowlist. For GLI's "open any
+//! frontend touches has to be in an allowlist. For Goonware's "open any
 //! folder you point at" model that's the wrong shape, so we expose
 //! direct read commands instead.
 //!
@@ -102,7 +102,7 @@ fn decode_text(bytes: &[u8]) -> Result<String, String> {
 /// nothing was found; never throws on missing files, only on unreadable
 /// paths the caller passed in.
 ///
-/// The candidate list is ordered: Tauri icons first (so GLI itself
+/// The candidate list is ordered: Tauri icons first (so Goonware itself
 /// shows its app icon), then common web favicon locations across the
 /// frameworks we see in real projects. We cap at 256 KiB per icon so
 /// a stray huge PNG can't bloat persisted state.
@@ -327,7 +327,7 @@ pub fn system_save_image_to_temp(
         _ => "png".to_string(),
     };
 
-    let dir = std::env::temp_dir().join("gli-paste");
+    let dir = std::env::temp_dir().join("goonware-paste");
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
 
     let stamp = std::time::SystemTime::now()

@@ -100,11 +100,11 @@ impl ChromeSession {
         let chrome_path = ensure_chrome(app).await?;
 
         // Per-PID user-data-dir keeps a crashed previous session from
-        // colliding with this one. Inside ~/Library/Application Support/GLI/.
+        // colliding with this one. Inside ~/Library/Application Support/Goonware/.
         let pid = std::process::id();
         let data_root = dirs::data_dir()
             .ok_or_else(|| "no home directory".to_string())?
-            .join("GLI")
+            .join("Goonware")
             .join("chrome-profiles");
         std::fs::create_dir_all(&data_root)
             .map_err(|e| format!("create profile root: {e}"))?;

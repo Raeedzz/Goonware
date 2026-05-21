@@ -85,7 +85,7 @@ export function RepositorySettingsView({ projectId }: { projectId: string }) {
           label="Root path"
           path={project.path}
           highlight={project.name}
-          warning="Do not move or delete this directory. Instead, remove the repository in GLI."
+          warning="Do not move or delete this directory. Instead, remove the repository in Goonware."
         />
 
         <PathsForWorktrees project={project} />
@@ -117,11 +117,11 @@ export function RepositorySettingsView({ projectId }: { projectId: string }) {
 
         <Section
           title="Preview URL"
-          subtitle="Overrides the terminal panel's Open button URL. Supports all GLI environment variables ($GLI_WORKTREE_NAME, $GLI_PORT, $GLI_PROJECT_ID). Leave blank to auto-detect from output logs."
+          subtitle="Overrides the terminal panel's Open button URL. Supports all Goonware environment variables ($GOONWARE_WORKTREE_NAME, $GOONWARE_PORT, $GOONWARE_PROJECT_ID). Leave blank to auto-detect from output logs."
         >
           <TextInput
             value={settings.previewUrl}
-            placeholder="https://localhost:$GLI_PORT"
+            placeholder="https://localhost:$GOONWARE_PORT"
             onChange={(v) => update({ previewUrl: v })}
             mono
           />
@@ -293,7 +293,7 @@ function PathRow({
 }
 
 function PathsForWorktrees({ project }: { project: Project }) {
-  // Workspaces live at `~/gli/workspaces/<project-basename>/`.
+  // Workspaces live at `~/goonware/workspaces/<project-basename>/`.
   // We resolve $HOME once on mount via Tauri's path API; the basename
   // comes straight from the project's repo path so the displayed path
   // matches what `worktree_create` actually writes to.
@@ -316,14 +316,14 @@ function PathsForWorktrees({ project }: { project: Project }) {
   const basename =
     project.path.split("/").filter(Boolean).pop() ?? project.name;
   const fullPath = home
-    ? `${home.replace(/\/$/, "")}/GLI/workspaces/${basename}`
-    : `~/GLI/workspaces/${basename}`;
+    ? `${home.replace(/\/$/, "")}/Goonware/workspaces/${basename}`
+    : `~/Goonware/workspaces/${basename}`;
   return (
     <PathRow
       label="Workspaces path"
       path={fullPath}
       highlight={basename}
-      warning="Do not move or delete the workspace subdirectories. Instead, archive workspaces in GLI."
+      warning="Do not move or delete the workspace subdirectories. Instead, archive workspaces in Goonware."
     />
   );
 }
@@ -684,7 +684,7 @@ function FilesToCopy({
       title="Files to copy"
       subtitle={
         <>
-          GLI will automatically copy these file paths into each new
+          Goonware will automatically copy these file paths into each new
           workspace.
         </>
       }
@@ -1110,7 +1110,7 @@ function RemoveRepoButton({ project }: { project: Project }) {
         if (lockRef.current) return;
         if (
           window.confirm(
-            `Remove ${project.name} from GLI? Local files at ${project.path} are untouched.`,
+            `Remove ${project.name} from Goonware? Local files at ${project.path} are untouched.`,
           )
         ) {
           lockRef.current = true;
