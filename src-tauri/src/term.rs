@@ -366,6 +366,13 @@ struct Session {
     /// Last full snapshot we sent to the frontend. We diff against this so
     /// only changed rows go over the wire.
     last_snapshot: Vec<RowSnapshot>,
+    /// alacritty's `history_size()` at the previous flush. Used to
+    /// compute how many rows just scrolled into scrollback (delta > 0
+    /// → capture the newest `delta` history rows and ship them as
+    /// `scrollback_appended`). When `delta < 0` the history shrunk
+    /// (resize-evict, clear-saved); we mark `scrollback_reset` so the
+    /// frontend drops its mirror before re-syncing.
+    last_history_size: usize,
     /// When we last flushed a frame — used for the throttle.
     last_flush: Instant,
     /// Last `command_running` value we emitted. We send a frame every
@@ -559,6 +566,21 @@ pub struct RenderFrame {
     /// Sparse: only rows that changed since the last frame. Frontend
     /// keeps the rest from its previous snapshot.
     pub dirty: Vec<DirtyRow>,
+    /// Rows that have just scrolled OUT of the visible grid into PTY
+    /// scrollback since the last frame. Oldest first — so the frontend
+    /// can append them verbatim to its scrollback buffer and the agent
+    /// history reads top-to-bottom. The `row` field carries the
+    /// scrollback row's CURRENT alacritty-grid index (negative; -1 is
+    /// the row that just left the visible viewport) at capture time.
+    /// Empty in the common case (no scroll between flushes).
+    pub scrollback_appended: Vec<DirtyRow>,
+    /// When true, the frontend should DROP its scrollback buffer before
+    /// applying `scrollback_appended`. Set on term_start re-emit (full
+    /// state refresh after remount), and whenever alacritty's
+    /// `history_size()` shrinks (resize-evict, clear-saved, etc.) —
+    /// either case means the prior buffer's row identities no longer
+    /// match the live grid and replaying them would surface stale rows.
+    pub scrollback_reset: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1998,6 +2020,14 @@ pub fn term_start(
                         spans: snap.spans.clone(),
                     })
                     .collect();
+                // Full scrollback snapshot — remount needs the entire
+                // history so the user's pre-remount scroll position is
+                // recoverable. `scrollback_reset: true` tells the
+                // frontend to drop whatever it had and rebuild from
+                // these rows.
+                let history_size = s.term.grid().history_size();
+                let scrollback_appended = sample_scrollback_rows(&s.term, history_size);
+                s.last_history_size = history_size;
                 let seq = s.next_frame_seq;
                 s.next_frame_seq = s.next_frame_seq.saturating_add(1);
                 let frame = RenderFrame {
@@ -2013,6 +2043,8 @@ pub fn term_start(
                     bracketed_paste: s.term.mode().contains(TermMode::BRACKETED_PASTE),
                     cursor_visible: s.term.mode().contains(TermMode::SHOW_CURSOR),
                     dirty,
+                    scrollback_appended,
+                    scrollback_reset: true,
                 };
                 let _ = s.frame_channel.send(frame);
             }
@@ -2166,6 +2198,7 @@ pub fn term_start(
         cols: args.cols,
         rows: args.rows,
         last_snapshot: initial_snapshot,
+        last_history_size: 0,
         last_flush: Instant::now() - FRAME_THROTTLE_VISIBLE,
         visible: true,
         last_command_running: false,
@@ -2572,7 +2605,33 @@ fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
     }
     let snapshot = snapshot_grid(&s.term);
     let dirty = diff_rows(&s.last_snapshot, &snapshot);
-    if dirty.is_empty() && !cmd_running_changed {
+    // Scrollback delta — capture rows that just left the visible grid
+    // since the last flush. The visible grid only sees the bottom
+    // `screen_lines()` of the buffer, so without this the user has no
+    // way to scroll back to anything an agent (claude / codex) wrote
+    // more than a screenful ago. alt-screen swap suspends this because
+    // alt-screen content (vim/htop) doesn't go through main scrollback.
+    let in_alt_screen = s.term.mode().contains(TermMode::ALT_SCREEN);
+    let current_history_size = s.term.grid().history_size();
+    let mut scrollback_appended: Vec<DirtyRow> = Vec::new();
+    let mut scrollback_reset = false;
+    if !in_alt_screen {
+        if current_history_size < s.last_history_size {
+            // History shrunk (resize-evict, clear-saved). Frontend's
+            // mirror is no longer in sync — tell it to drop and rebuild
+            // from a fresh snapshot of whatever's currently in history.
+            scrollback_reset = true;
+            scrollback_appended =
+                sample_scrollback_rows(&s.term, current_history_size);
+        } else if current_history_size > s.last_history_size {
+            let delta = current_history_size - s.last_history_size;
+            scrollback_appended = sample_scrollback_rows(&s.term, delta);
+        }
+        s.last_history_size = current_history_size;
+    }
+    if dirty.is_empty() && scrollback_appended.is_empty() && !cmd_running_changed
+        && !scrollback_reset
+    {
         return;
     }
     let cursor = s.term.grid().cursor.point;
@@ -2585,18 +2644,98 @@ fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
         rows: s.rows,
         cursor_row: cursor.line.0,
         cursor_col: cursor.column.0 as u16,
-        alt_screen: s.term.mode().contains(TermMode::ALT_SCREEN),
+        alt_screen: in_alt_screen,
         command_running: cmd_running,
         app_cursor: s.term.mode().contains(TermMode::APP_CURSOR),
         bracketed_paste: s.term.mode().contains(TermMode::BRACKETED_PASTE),
         cursor_visible: s.term.mode().contains(TermMode::SHOW_CURSOR),
         dirty,
+        scrollback_appended,
+        scrollback_reset,
     };
     let _ = s.frame_channel.send(frame);
     s.last_snapshot = snapshot;
     s.last_flush = Instant::now();
     s.last_command_running = cmd_running;
     let _ = (app, id);
+}
+
+/// Snapshot the most-recently-scrolled-out `count` rows of alacritty's
+/// history. Returned in temporal order (oldest first), so a caller can
+/// `Vec::extend` them onto a tail-growing scrollback buffer and the
+/// agent's history reads top-to-bottom.
+///
+/// `Line(-1)` is the row that just left the visible grid; `Line(-N)`
+/// is the row that left N flushes ago. Walking from `-count` up to
+/// `-1` therefore yields the new rows in the order they entered
+/// history. Each row's `DirtyRow.row` field is set to the row's
+/// **current** alacritty index at capture time (negative), so any
+/// future debugging that needs to correlate rows back to the live
+/// grid can; the frontend ignores it for scrollback display (rows
+/// are positional in the buffer).
+fn sample_scrollback_rows<E: EventListener>(
+    term: &Term<E>,
+    count: usize,
+) -> Vec<DirtyRow> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let cols = term.columns();
+    let history_size = term.grid().history_size();
+    let take = count.min(history_size);
+    let mut out: Vec<DirtyRow> = Vec::with_capacity(take);
+    // Oldest-first: start at Line(-take) and walk toward Line(-1).
+    for offset in (1..=take).rev() {
+        let row_idx = -(offset as i32);
+        let mut spans: Vec<Span> = Vec::new();
+        let mut current: Option<Span> = None;
+        for col_idx in 0..cols {
+            let point = Point::new(Line(row_idx), Column(col_idx));
+            let cell: &Cell = &term.grid()[point];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let span = cell_to_span(cell);
+            match &mut current {
+                Some(c) if c.fg == span.fg
+                    && c.bg == span.bg
+                    && c.bold == span.bold
+                    && c.italic == span.italic
+                    && c.underline == span.underline
+                    && c.inverse == span.inverse
+                    && c.dim == span.dim
+                    && c.strikeout == span.strikeout =>
+                {
+                    c.text.push_str(&span.text);
+                }
+                Some(_) | None => {
+                    if let Some(c) = current.take() {
+                        spans.push(c);
+                    }
+                    current = Some(span);
+                }
+            }
+        }
+        if let Some(c) = current.take() {
+            spans.push(c);
+        }
+        // `row` is informational here — the frontend treats scrollback
+        // as positional. Cast saturates at i16::MIN for very deep
+        // histories rather than panicking.
+        let stored_row = if row_idx >= i16::MIN as i32 {
+            row_idx as i16
+        } else {
+            i16::MIN
+        };
+        // DirtyRow.row is u16 in the wire format. Use the bit pattern
+        // of the i16 so the negative value round-trips losslessly if
+        // anyone inspects it on the JS side.
+        out.push(DirtyRow {
+            row: stored_row as u16,
+            spans,
+        });
+    }
+    out
 }
 
 /* ------------------------------------------------------------------
@@ -3402,5 +3541,89 @@ mod tests {
         let diff = diff_rows(&prev, &next);
         assert_eq!(diff.len(), 1);
         assert_eq!(diff[0].row, 1);
+    }
+
+    /* ---------- scrollback sampling ---------- */
+    //
+    // Pins the agent-scroll-history fix: rows that scroll out of the
+    // visible grid must surface in `sample_scrollback_rows` in temporal
+    // order (oldest first), so the frontend can `Vec::extend` them onto
+    // its scrollback buffer and the user can scroll back through
+    // everything an agent (claude/codex/aider) has ever written —
+    // not just the last screenful that happens to still be in the
+    // visible PTY grid.
+
+    #[test]
+    fn sample_scrollback_returns_empty_when_no_history() {
+        let term = Term::new(
+            term_config(),
+            &Dims { cols: 10, rows: 4 },
+            NullEventProxy,
+        );
+        let rows = sample_scrollback_rows(&term, 0);
+        assert!(rows.is_empty(), "zero count → no rows");
+        let rows = sample_scrollback_rows(&term, 10);
+        assert!(
+            rows.is_empty(),
+            "fresh term has no history; should still return empty"
+        );
+    }
+
+    #[test]
+    fn sample_scrollback_captures_rows_in_temporal_order() {
+        // 4-row visible grid; print 6 lines so the first 2 spill into
+        // history. Order: oldest scrollback row must come first.
+        let mut term = Term::new(
+            term_config(),
+            &Dims { cols: 10, rows: 4 },
+            NullEventProxy,
+        );
+        let mut parser: Processor = Processor::new();
+        // Six rows of distinct content separated by CRLF so each line
+        // lands on its own row.
+        parser.advance(
+            &mut term,
+            b"row-1\r\nrow-2\r\nrow-3\r\nrow-4\r\nrow-5\r\nrow-6",
+        );
+        let history = term.grid().history_size();
+        assert!(history >= 2, "expected ≥2 rows in history, got {history}");
+        let rows = sample_scrollback_rows(&term, history);
+        assert_eq!(rows.len(), history);
+        // Oldest first: row-1 must precede row-2 in the result.
+        let text_of = |spans: &[Span]| -> String {
+            let mut out = String::new();
+            for s in spans {
+                out.push_str(&s.text);
+            }
+            out.trim_end().to_string()
+        };
+        let oldest = text_of(&rows[0].spans);
+        let next = text_of(&rows[1].spans);
+        assert!(
+            oldest.starts_with("row-1"),
+            "expected oldest row to start with row-1, got {oldest:?}"
+        );
+        assert!(
+            next.starts_with("row-2"),
+            "expected second row to start with row-2, got {next:?}"
+        );
+    }
+
+    #[test]
+    fn sample_scrollback_caps_to_history_size() {
+        let mut term = Term::new(
+            term_config(),
+            &Dims { cols: 10, rows: 4 },
+            NullEventProxy,
+        );
+        let mut parser: Processor = Processor::new();
+        parser.advance(&mut term, b"a\r\nb\r\nc\r\nd\r\ne\r\nf");
+        let history = term.grid().history_size();
+        let rows = sample_scrollback_rows(&term, history + 100);
+        assert_eq!(
+            rows.len(),
+            history,
+            "asking for more rows than exist must clamp to history size",
+        );
     }
 }

@@ -72,6 +72,25 @@ export interface RenderFrame {
    */
   cursor_visible: boolean;
   dirty: DirtyRow[];
+  /**
+   * Rows that just scrolled OUT of the visible grid into PTY scrollback
+   * since the previous frame. Oldest first — the frontend appends them
+   * verbatim to its scrollback buffer so the agent's history reads
+   * top-to-bottom. Empty in the common case; only populated by the
+   * scroll-on-LF path in alacritty's main screen (alt-screen apps like
+   * vim/htop never push to main scrollback, so this stays empty while
+   * `alt_screen` is true).
+   */
+  scrollback_appended: DirtyRow[];
+  /**
+   * When true, the frontend MUST drop its scrollback buffer before
+   * applying `scrollback_appended`. The backend sets this on the
+   * term_start re-emit (full state refresh, used after a React remount)
+   * and whenever alacritty's `history_size()` shrinks (resize-evict,
+   * Ctrl+L clear-saved). In both cases, the prior buffer's row
+   * identities no longer line up with the live grid.
+   */
+  scrollback_reset: boolean;
 }
 
 /**

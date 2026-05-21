@@ -29,6 +29,15 @@ interface Memory {
   history: string[];
   /** Snapshot of the live grid's rows, indexed by row number. */
   rows: Span[][];
+  /**
+   * Accumulated PTY scrollback rows — oldest first. Each frame's
+   * `scrollback_appended` from the backend gets pushed onto the tail.
+   * Survives remount so a user that switches tabs and comes back keeps
+   * their full agent scroll-back. Reset to `[]` whenever a frame
+   * carries `scrollback_reset: true` (full re-sync from the backend,
+   * or `history_size()` shrunk on resize/clear).
+   */
+  scrollback: Span[][];
   /** Last frame metadata (cursor + alt-screen flag). When null, the
    *  pane has never received a frame yet. */
   liveFrame: RenderFrame | null;
@@ -48,6 +57,7 @@ function ensure(id: string): Memory {
       blocks: [],
       history: [],
       rows: [],
+      scrollback: [],
       liveFrame: null,
       altScreen: false,
       exited: false,
@@ -81,6 +91,14 @@ export function getRows(id: string): Span[][] {
 
 export function setRows(id: string, rows: Span[][]): void {
   ensure(id).rows = rows;
+}
+
+export function getScrollback(id: string): Span[][] {
+  return ensure(id).scrollback;
+}
+
+export function setScrollback(id: string, scrollback: Span[][]): void {
+  ensure(id).scrollback = scrollback;
 }
 
 export function getLiveFrame(id: string): RenderFrame | null {

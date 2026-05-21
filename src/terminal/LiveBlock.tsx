@@ -116,21 +116,56 @@ export function LiveBlock({
     return trimEchoAndBlanks(frame.dirty, command, footerKeep);
   }, [frame, command, preserveGrid]);
 
-  // Original-grid row index of `visibleRows[0]`. Used by the canvas
-  // path to translate `frame.cursor_row` into a window-relative row.
-  // Without it, CanvasGrid assumes the window is the tail of the
-  // grid — wrong when `trimEchoAndBlanks` dropped leading blanks, and
-  // the cursor would paint several rows above where it should be.
-  const firstRowOffset = useMemo(() => {
-    if (!frame || visibleRows.length === 0) return 0;
-    const first = visibleRows[0];
-    // `DirtyRow.row` carries the original grid index — that's what
-    // the trim function preserves verbatim, so we can read it back
-    // directly instead of doing an indexOf walk.
-    return first.row;
+  // Concatenate scrollback above visibleRows. Each entry in
+  // `frame.scrollback_appended` (in this code path, the full
+  // accumulated scrollback — see flushFrame in useTerminalSession)
+  // becomes a row at the top of the rendered canvas, then the trimmed
+  // visible grid follows. Without this concat, the only thing the user
+  // can scroll back through is whatever currently fits in alacritty's
+  // visible grid — anything an agent wrote earlier has already moved
+  // to PTY scrollback and is invisible to the canvas.
+  //
+  // Row-index space. The cursor's row index (`frame.cursor_row`) is in
+  // alacritty's visible-grid coords (0..screen_lines-1). `visibleRows`
+  // already preserves those indices verbatim (trim drops leading
+  // blanks but keeps `row.row` set to the original grid index). To
+  // keep the cursor translation in CanvasGrid working unchanged
+  // (`cursorRowInWindow = cursor_row - firstRowOffset` must land at
+  // the correct array index in `combinedRows`), the scrollback rows
+  // we prepend MUST extend that same coordinate space — i.e. carry
+  // synthetic indices `(visibleRows[0].row - K)..(visibleRows[0].row - 1)`.
+  // Then `combinedRows[0].row` is the correct `firstRowOffset` for
+  // both the no-scrollback and with-scrollback cases.
+  const combinedRows = useMemo(() => {
+    if (!frame) return visibleRows;
+    const scrollback = frame.scrollback_appended ?? [];
+    if (scrollback.length === 0) return visibleRows;
+    const out: typeof visibleRows = new Array(
+      scrollback.length + visibleRows.length,
+    );
+    const visibleStart = visibleRows.length > 0 ? visibleRows[0].row : 0;
+    const scrollbackStart = visibleStart - scrollback.length;
+    for (let i = 0; i < scrollback.length; i++) {
+      out[i] = { row: scrollbackStart + i, spans: scrollback[i].spans };
+    }
+    for (let j = 0; j < visibleRows.length; j++) {
+      out[scrollback.length + j] = visibleRows[j];
+    }
+    return out;
   }, [frame, visibleRows]);
 
-  const hasBody = visibleRows.length > 0;
+  // Original-grid row index of `combinedRows[0]`. Used by the canvas
+  // path to translate `frame.cursor_row` (in visible-grid coords) into
+  // a window-relative row. When scrollback is non-empty this is
+  // negative (extends the visible-grid coord space upward into
+  // scrollback); without it the cursor would paint several rows above
+  // where it should be the moment scrollback grew beyond zero rows.
+  const firstRowOffset = useMemo(() => {
+    if (!frame || combinedRows.length === 0) return 0;
+    return combinedRows[0].row;
+  }, [frame, combinedRows]);
+
+  const hasBody = combinedRows.length > 0;
   const cwdLabel = formatCwd(cwd);
 
   // Live duration counter — same look as closed blocks but updated
@@ -290,12 +325,12 @@ export function LiveBlock({
           {preserveGrid && frame ? (
             <CanvasGrid
               frame={frame}
-              rows={visibleRows}
+              rows={combinedRows}
               mode="auto"
               firstRowOffset={firstRowOffset}
             />
           ) : (
-            visibleRows.map((row) => (
+            combinedRows.map((row) => (
               <CellRow
                 key={row.row}
                 spans={row.spans}
