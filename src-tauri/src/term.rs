@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -217,6 +217,136 @@ pub fn term_running_session_ids(state: State<TerminalState>) -> Vec<String> {
 }
 
 /* ------------------------------------------------------------------
+   Trailing-edge flush scheduler.
+   ------------------------------------------------------------------ */
+
+/// Companion to the leading-edge throttle in `maybe_flush`. The reader
+/// thread calls `schedule(deadline)` whenever a frame is gated against
+/// the throttle window; a dedicated per-session flusher thread waits on
+/// the condvar and re-runs `maybe_flush` once the deadline elapses,
+/// guaranteeing the final frame of any burst reaches the frontend even
+/// when no further PTY output arrives to drive another wakeup.
+///
+/// This is Goonware's port of Warp's `app/src/throttle.rs` trailing-edge
+/// throttle. Without it, a clear-screen, large agent reply, or any other
+/// burst that ends mid-throttle-window leaves the last frame trapped on
+/// the backend until the next PTY byte (commonly: the user's next
+/// keystroke or Ctrl+C) — which read as "the terminal goes black for a
+/// beat after bulk output until I type."
+struct TrailingFlusher {
+    state: Mutex<TrailingFlushState>,
+    cvar: Condvar,
+}
+
+#[derive(Clone, Copy)]
+enum TrailingFlushState {
+    Idle,
+    Pending(Instant),
+    Stopped,
+}
+
+impl TrailingFlusher {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(TrailingFlushState::Idle),
+            cvar: Condvar::new(),
+        })
+    }
+
+    /// Request that `maybe_flush` be re-run no later than `deadline`.
+    /// A later deadline than the one already pending is a no-op (the
+    /// earlier deadline wins). No-op after `stop()`.
+    fn schedule(&self, deadline: Instant) {
+        let mut state = match self.state.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match *state {
+            TrailingFlushState::Stopped => return,
+            TrailingFlushState::Pending(existing) if existing <= deadline => return,
+            _ => *state = TrailingFlushState::Pending(deadline),
+        }
+        self.cvar.notify_one();
+    }
+
+    /// Signal the flusher thread to exit. Idempotent.
+    fn stop(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = TrailingFlushState::Stopped;
+        }
+        self.cvar.notify_all();
+    }
+}
+
+/// Per-session flusher thread loop. Sleeps on the condvar until a
+/// deadline is scheduled, sleeps with timeout until the deadline, then
+/// runs `maybe_flush` on the session — if it can still upgrade the
+/// weak reference. Exits when the session is dropped or `stop()` is
+/// called.
+fn run_trailing_flusher(
+    flusher: Arc<TrailingFlusher>,
+    session: Weak<Mutex<Session>>,
+    app: AppHandle<Wry>,
+    id: String,
+) {
+    loop {
+        // Wait for a scheduled deadline (or stop).
+        let deadline = {
+            let mut state = match flusher.state.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            loop {
+                match *state {
+                    TrailingFlushState::Stopped => return,
+                    TrailingFlushState::Pending(d) => break d,
+                    TrailingFlushState::Idle => {
+                        state = match flusher.cvar.wait(state) {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                    }
+                }
+            }
+        };
+        // Sleep until the deadline (or get notified — schedule pulled
+        // it earlier, or stop). After waking, loop to re-check state.
+        let now = Instant::now();
+        if deadline > now {
+            let dur = deadline - now;
+            let state = match flusher.state.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let _ = flusher.cvar.wait_timeout(state, dur);
+            continue;
+        }
+        // Deadline elapsed — atomically claim it (Pending → Idle) and
+        // run the flush. If another `schedule()` raced and bumped the
+        // deadline past `now`, leave it Pending and loop.
+        {
+            let mut state = match flusher.state.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            match *state {
+                TrailingFlushState::Stopped => return,
+                TrailingFlushState::Pending(d) if d > Instant::now() => continue,
+                _ => *state = TrailingFlushState::Idle,
+            }
+        }
+        match session.upgrade() {
+            Some(arc) => {
+                if let Ok(mut s) = arc.lock() {
+                    maybe_flush(&mut s, &app, &id);
+                }
+            }
+            None => return,
+        }
+    }
+}
+
+/* ------------------------------------------------------------------
    State container — one entry per running PTY session.
    ------------------------------------------------------------------ */
 
@@ -270,6 +400,14 @@ struct Session {
     /// old channel goes dead and any in-flight send is silently
     /// dropped.
     frame_channel: Channel<RenderFrame>,
+    /// Trailing-edge flush scheduler — see `TrailingFlusher`. Shared
+    /// with the per-session flusher thread spawned in `term_start`.
+    /// `maybe_flush` calls `schedule()` when it gates a frame against
+    /// the throttle window, so the last frame of any output burst is
+    /// guaranteed to ship within one throttle window of output
+    /// stopping — even when no further PTY bytes arrive to drive
+    /// another wakeup.
+    trailing_flusher: Arc<TrailingFlusher>,
 }
 
 /* ------------------------------------------------------------------
@@ -2017,6 +2155,8 @@ pub fn term_start(
     let term = Term::new(term_config(), &dims, proxy);
     let initial_snapshot = snapshot_grid(&term);
 
+    let trailing_flusher = TrailingFlusher::new();
+
     let session = Arc::new(Mutex::new(Session {
         term,
         parser: Processor::new(),
@@ -2032,11 +2172,28 @@ pub fn term_start(
         segmenter: BlockSegmenter::new(),
         next_frame_seq: 0,
         frame_channel,
+        trailing_flusher: trailing_flusher.clone(),
     }));
 
     {
         let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         sessions.insert(args.id.clone(), session.clone());
+    }
+
+    // Trailing-edge flusher thread. Holds a `Weak` to the session so it
+    // doesn't keep the session alive past its useful life; if the
+    // session is dropped while the flusher is between wakeups, the
+    // next upgrade fails and the thread exits cleanly. `term_close`
+    // also calls `trailing_flusher.stop()` to wake the thread early
+    // when it would otherwise be parked on the condvar.
+    {
+        let flusher = trailing_flusher;
+        let session_weak = Arc::downgrade(&session);
+        let app_for_flusher = app.clone();
+        let id_for_flusher = args.id.clone();
+        thread::spawn(move || {
+            run_trailing_flusher(flusher, session_weak, app_for_flusher, id_for_flusher);
+        });
     }
 
     // Reader thread.
@@ -2246,6 +2403,11 @@ pub fn term_close(
     };
     if let Some(arc) = arc {
         if let Ok(mut s) = arc.lock() {
+            // Wake the trailing-edge flusher thread out of its
+            // condvar wait so it exits promptly. Without this it
+            // would sit parked on `cvar.wait` until the next
+            // notify, which — for a dead session — never comes.
+            s.trailing_flusher.stop();
             let _ = s.killer.kill();
         }
     }
@@ -2323,13 +2485,25 @@ pub fn term_kill_foreground(
 fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
     let cmd_running = s.segmenter.command_running();
     let cmd_running_changed = cmd_running != s.last_command_running;
+    let throttle = session_frame_throttle(s.visible);
     // Throttle paints only — state changes (command_running flip)
     // always go out immediately. Without this bypass, a Ctrl+C kill
     // can land within 16ms of the previous paint, hit the throttle,
     // and never get re-flushed because zsh's empty PROMPT produces
     // no further bytes for the reader loop to wake on. Frontend
     // would stay stuck in agent mode with PromptInput hidden.
-    if !cmd_running_changed && s.last_flush.elapsed() < session_frame_throttle(s.visible) {
+    if !cmd_running_changed && s.last_flush.elapsed() < throttle {
+        // Trailing-edge flush. This frame is gated, but it might be
+        // the LAST one of a burst — if no more PTY output arrives
+        // before the throttle window closes, the trapped frame stays
+        // invisible until the next byte (commonly the user's next
+        // keystroke, which is why bulk agent output looked like "the
+        // screen goes black until I type something"). Schedule a
+        // re-run of `maybe_flush` for when the throttle window
+        // closes; if more output beats the timer, the reader thread
+        // calls `maybe_flush` first, advances `last_flush`, and the
+        // timer's eventual re-run is an idempotent no-op.
+        s.trailing_flusher.schedule(s.last_flush + throttle);
         return;
     }
     let snapshot = snapshot_grid(&s.term);

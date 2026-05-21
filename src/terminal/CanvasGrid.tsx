@@ -100,6 +100,21 @@ export function CanvasGrid({
   frameRef.current = frame;
   rowsRef.current = rows;
 
+  // rAF-coalesced render scheduling. React can land several state
+  // updates (a fresh frame, a rows window change, a selection drag
+  // tick) within a single paint cycle; without coalescing each one
+  // triggers an independent `renderer.render()` call. The renderer
+  // dedupes by seq, but we still pay for the per-call setup +
+  // closure churn. Mirror the trailing-edge flush we just added on
+  // the backend: queue at most one rAF callback at a time and let
+  // every caller in the same frame fold into it.
+  //
+  // Kept out of `useCallback` because the captured `renderRequest`
+  // closure must be the latest one (it reads `firstRowOffset` from
+  // the closing scope on each call, not via ref). Storing the
+  // pending id in a ref keeps the scheduler stable across renders.
+  const rafIdRef = useRef<number | null>(null);
+
   // Selection state. `selection` is the visible (committed or
   // live-during-drag) range; null means no selection. `dragging`
   // tracks whether a mouse drag is currently in flight — used to
@@ -217,14 +232,27 @@ export function CanvasGrid({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rendererEpoch]);
 
-  // Repaint on frame / rows / cursor change. The renderer dedupes
-  // by seq so a re-render with the same frame is a cheap no-op.
+  // Repaint on frame / rows / cursor change. Coalesced via rAF so
+  // that a burst of backend frame events (or React landing a frame
+  // commit and a rows-window change in the same tick) pays for at
+  // most one renderer.render() per paint. The renderer also dedupes
+  // by seq, but folding upstream avoids the per-call setup cost.
   useEffect(() => {
-    const r = rendererRef.current;
-    if (!r) return;
-    renderRequest(r);
+    if (!rendererRef.current) return;
+    scheduleRender();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [frame, rows]);
+
+  // Cancel any pending rAF on unmount so the queued callback doesn't
+  // fire against a renderer that's already been destroyed.
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+    };
+  }, []);
 
   // Resize the canvas when the container changes.
   //
@@ -367,6 +395,22 @@ export function CanvasGrid({
     }
   }
 
+  // Queue a render for the next animation frame, deduping multiple
+  // requests inside the same paint cycle. Synchronous render paths
+  // (initial bootstrap, ResizeObserver, DPR change) still call
+  // `renderRequest` directly — see the comment on the ResizeObserver
+  // effect about why deferring resize-time paint causes a black
+  // flash. This coalescer is only for cheap state-driven repaints.
+  function scheduleRender(): void {
+    if (rafIdRef.current !== null) return;
+    rafIdRef.current = requestAnimationFrame(() => {
+      rafIdRef.current = null;
+      const r = rendererRef.current;
+      if (!r) return;
+      renderRequest(r);
+    });
+  }
+
   // ---- Selection + clipboard ----------------------------------------
   //
   // Mouse-driven cell selection. The flow:
@@ -415,7 +459,10 @@ export function CanvasGrid({
     const r = rendererRef.current;
     if (!r) return;
     r.invalidate();
-    renderRequest(r);
+    // Selection drags fire mousemove many times per frame; coalesce
+    // through scheduleRender so a burst of cell-range updates flushes
+    // as a single paint instead of N renders within the same tick.
+    scheduleRender();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
