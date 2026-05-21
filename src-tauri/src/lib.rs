@@ -464,3 +464,48 @@ mod env_inherit_tests {
         assert_eq!(merge_path("", ""), "");
     }
 }
+
+/// Regression guards for the macOS Edit menu wiring.
+///
+/// Without an explicit `Menu::default(app_handle)` call on the Tauri
+/// builder, bundled `.app` builds get a stripped-down OS-default menu
+/// whose Edit items aren't wired to AppKit's responder chain. The
+/// observable failure is that ⌘C / ⌘V / ⌘X / ⌘A silently no-op
+/// everywhere outside the PTY-aware terminal handlers — including
+/// the right-panel side terminal's PromptInput textarea, the commit
+/// composer, the file editor, etc. `tauri dev` masks the bug because
+/// its dev shim installs its own menu, so the only way the regression
+/// surfaces is in a built DMG — which is the worst place to find out.
+///
+/// These tests grep this file's own source to pin the menu call in
+/// place. A future refactor that drops the `.menu(...)` line will
+/// flunk `cargo test` long before it reaches a release build.
+#[cfg(test)]
+mod macos_menu_pinning_tests {
+    /// Source text of this file at compile time. `include_str!` resolves
+    /// at the call site, so this is exactly `lib.rs` as it sits on disk.
+    const LIB_RS: &str = include_str!("lib.rs");
+
+    #[test]
+    fn macos_default_menu_is_installed_on_builder() {
+        // The exact shape the menu fix took. We assert presence of
+        // both the `Menu::default` call AND its `#[cfg(target_os = "macos")]`
+        // gate — either alone would let the regression sneak back in
+        // (a non-macOS menu, or a macOS menu missing the cut/copy/paste
+        // PredefinedMenuItems that Menu::default builds).
+        assert!(
+            LIB_RS.contains("tauri::menu::Menu::default(app)"),
+            "lib.rs must call `tauri::menu::Menu::default(app)` so the \
+             macOS Edit menu's cut/copy/paste/select-all items reach \
+             AppKit's responder chain. Without this, bundled .app builds \
+             silently break ⌘C / ⌘V / ⌘X / ⌘A in every non-PTY input \
+             (commit composer, side-terminal prompt, file editor, ...).",
+        );
+        assert!(
+            LIB_RS.contains("#[cfg(target_os = \"macos\")]\n    let builder = builder.menu("),
+            "the `.menu(...)` builder call must be gated by \
+             `#[cfg(target_os = \"macos\")]` and applied to `builder` — \
+             other platforms get their menu from elsewhere.",
+        );
+    }
+}

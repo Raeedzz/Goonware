@@ -1754,6 +1754,16 @@ function SecondaryTerminals({ worktree }: { worktree: Worktree }) {
               cwd={worktree.path}
               projectId={worktree.projectId}
               sessionId={`${worktree.id}:${ptyId}`}
+              // Forward visibility so only the active side terminal
+              // owns its window-level Cmd+C / Ctrl+C / drag-drop
+              // listeners. Without this gate, every hidden secondary
+              // terminal in the layer also kept its global keydown
+              // listeners armed — they'd all run on every keystroke,
+              // gate-out via container.contains(anchor), and pile up
+              // O(n) work per keystroke. Mirrors MainColumn's
+              // TerminalKeepaliveLayer, which already passes
+              // `isVisible={tab.id === activeTerminalTabId}`.
+              isVisible={isActive}
               // Secondary terminals never auto-focus on mount. They
               // sit in the right panel; only the user explicitly
               // clicking into them should pull focus. Without this,
