@@ -173,6 +173,49 @@ export function useTerminalSession(opts: Args): SessionApi {
     // was showing. Hydration already happened in useState init.
     pendingInputsRef.current = [];
 
+    // Cross-restart history restore. After an app relaunch the
+    // module-scoped sessionMemory is empty, but the SQLite
+    // persistence layer kept the prior session's finished blocks.
+    // Hydrate from there before the live PTY restart re-attaches —
+    // the user sees their scrollback above the new prompt. We only
+    // load when the in-memory list is empty so a routine remount
+    // (tab switch within one app run) doesn't trigger a DB read.
+    if (blocks.length === 0) {
+      void (async () => {
+        try {
+          const saved = await invoke<ClosedBlock[]>("term_history_load", {
+            id: opts.id,
+          });
+          if (cancelled || !saved || saved.length === 0) return;
+          // Mint a per-row React key here — sessionMemory drops the
+          // synthetic id (it isn't part of the wire format) but
+          // BlockList uses it to keep its <ul> rendering stable.
+          const hydrated: Block[] = saved.map((s, i) => ({
+            id: `r_${i}`,
+            block_id: s.block_id,
+            input: s.input,
+            transcript: s.transcript,
+            blockRows: s.blockRows ?? [],
+            exit_code: s.exit_code,
+            cwd: s.cwd,
+            durationMs: s.durationMs,
+          }));
+          // If a live block raced ahead of the awaited history load
+          // (rare but possible — termStart could re-emit a stored
+          // closed block from a still-warm PTY between the invoke
+          // and its resolve), merge instead of clobber. Historical
+          // rows go first to preserve chronology.
+          setBlocks((prev) => {
+            const merged = prev.length > 0 ? [...hydrated, ...prev] : hydrated;
+            memSetBlocks(opts.id, merged);
+            return merged;
+          });
+        } catch {
+          // History load is best-effort — terminal still works without it.
+        }
+      })();
+    }
+
     const flushFrame = () => {
       rafIdRef.current = null;
       if (cancelled) return;

@@ -96,6 +96,36 @@ export async function archiveList(
   return invoke<ArchiveRecord[]>("archive_list", { projectId });
 }
 
+/**
+ * Gather every pty_id a worktree is currently holding alive:
+ *   - the primary terminal tab(s) inside `worktree.tabIds`
+ *   - the secondary-panel terminal strip (`secondaryTerminals[]`)
+ *   - the legacy single `secondaryPtyId` (only if not already in the
+ *     strip, which it should be after the v2 hydration migration)
+ *
+ * Used by the archive flow to feed `forgetPtys()` — without it the
+ * SQLite block history + the live PTY processes hang around forever
+ * after the user archives a worktree, since `worktree_restore` mints
+ * fresh ids and never reuses the originals.
+ */
+export function collectWorktreePtyIds(
+  worktree: Worktree,
+  tabs: AppState["tabs"],
+): string[] {
+  const ids = new Set<string>();
+  for (const tid of worktree.tabIds) {
+    const tab = tabs[tid];
+    if (tab && tab.kind === "terminal") {
+      ids.add((tab as TerminalTab).ptyId);
+    }
+  }
+  for (const pty of worktree.secondaryTerminals ?? []) {
+    if (pty) ids.add(pty);
+  }
+  if (worktree.secondaryPtyId) ids.add(worktree.secondaryPtyId);
+  return Array.from(ids);
+}
+
 export type { WorktreeId };
 
 /**

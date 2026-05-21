@@ -166,9 +166,12 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
       // send the quoted path. Claude / codex / aider all accept inline
       // file paths as image references, so a Cmd+Shift+Ctrl+4 → Cmd+V
       // delivers a usable screenshot to the agent in two keystrokes.
+      // Accept both ⌘V (macOS native) and ⌃V (Windows/Linux muscle
+      // memory). Without the Ctrl branch, ⌃V falls through to
+      // keyToBytes and gets encoded as 0x16, which is useless to
+      // every agent TUI we ship.
       if (
-        e.metaKey &&
-        !e.ctrlKey &&
+        ((e.metaKey && !e.ctrlKey) || (e.ctrlKey && !e.metaKey)) &&
         !e.altKey &&
         !e.shiftKey &&
         e.key.toLowerCase() === "v"

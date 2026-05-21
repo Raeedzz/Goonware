@@ -2287,6 +2287,34 @@ pub fn term_start(
                         blocks
                     };
                     for block in blocks {
+                        // Persist the finished block to SQLite before
+                        // emitting it to the frontend. The save is
+                        // fire-and-forget — the writer thread owns
+                        // back-pressure (drops on a full mailbox), so
+                        // the reader thread is never blocked by disk
+                        // I/O even with 20 PTYs producing in parallel.
+                        if let Some(p) = app_for_reader
+                            .try_state::<crate::persistence::PersistenceState>(
+                            )
+                        {
+                            p.writer.save_block(
+                                crate::persistence::writer::SavedBlockPayload {
+                                    pty_id: id_for_reader.clone(),
+                                    block_id: block.block_id as i64,
+                                    input: block.input.clone(),
+                                    transcript: block.transcript.clone(),
+                                    block_rows_json: serde_json::to_string(
+                                        &block.block_rows,
+                                    )
+                                    .unwrap_or_else(|_| "[]".to_string()),
+                                    exit_code: block.exit_code,
+                                    cwd: block.cwd.clone(),
+                                    duration_ms: block
+                                        .duration_ms
+                                        .map(|d| d as i64),
+                                },
+                            );
+                        }
                         let _ = app_for_reader
                             .emit(&format!("term://{id_for_reader}/block"), block);
                     }
@@ -2412,6 +2440,42 @@ pub fn term_close(
         }
     }
     Ok(())
+}
+
+/// Load the persisted block history for a pty_id. Frontend calls this
+/// on `useTerminalSession` mount when in-memory `sessionMemory.blocks`
+/// is empty — typically the first mount after an app restart, when
+/// the live PTY has been torn down but the saved scrollback should
+/// survive.
+///
+/// Empty vec for unknown pty_ids (fresh session) — never an error.
+#[tauri::command]
+pub fn term_history_load<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    id: String,
+) -> Result<Vec<crate::persistence::SavedBlock>, String> {
+    let Some(state) = app.try_state::<crate::persistence::PersistenceState>()
+    else {
+        // Persistence init failed earlier; degrade to no history.
+        return Ok(Vec::new());
+    };
+    crate::persistence::load_blocks(&state.db_path, &id)
+}
+
+/// Permanently forget every block for a pty_id. Paired with the
+/// frontend's `forgetSession` — distinct from `term_close`, which is
+/// the transient kill path that keeps scrollback for a potential
+/// restart.
+#[tauri::command]
+pub fn term_history_forget<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    id: String,
+) -> Result<(), String> {
+    let Some(state) = app.try_state::<crate::persistence::PersistenceState>()
+    else {
+        return Ok(());
+    };
+    state.writer.forget_pty(id)
 }
 
 /// SIGKILL the PTY's foreground process group. The escape hatch when

@@ -27,6 +27,7 @@ mod flat_term;
 mod fs;
 mod git;
 mod helper_agent;
+mod persistence;
 mod pr;
 mod search;
 mod skills;
@@ -118,6 +119,20 @@ pub fn run() {
 
             migrate_legacy_app_data();
 
+            // Persistence (Warp-style SQLite): open the DB, run
+            // migrations, ingest any legacy `state.json`, spawn the
+            // single-writer thread. Must come AFTER
+            // `migrate_legacy_app_data` so we resolve `app_data_dir()`
+            // against the post-rename location — otherwise we'd open
+            // a fresh empty DB next to the orphaned `dev.raeedz.gli`
+            // tree and the user would appear to lose their state.
+            match persistence::init(app.handle()) {
+                Ok(state) => {
+                    app.manage(state);
+                }
+                Err(e) => eprintln!("[persistence] init failed: {e}"),
+            }
+
             // Install per-CLI hook scripts (Claude / Codex / Gemini)
             // + register entries in each tool's settings, then bind
             // the shared Unix socket the scripts will write to on
@@ -130,6 +145,19 @@ pub fn run() {
             Ok(())
         });
 
+    // Non-macOS still gets a setup call so the persistence layer
+    // initializes on those targets too. The macOS branch above already
+    // covers them, so this is just the fallback for cross-platform
+    // dev builds.
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.setup(|app| {
+        match persistence::init(app.handle()) {
+            Ok(state) => app.manage(state),
+            Err(e) => eprintln!("[persistence] init failed: {e}"),
+        }
+        Ok(())
+    });
+
     builder
         .invoke_handler(tauri::generate_handler![
             // Terminal (alacritty_terminal + custom React renderer)
@@ -141,6 +169,8 @@ pub fn run() {
             term::term_kill_foreground,
             term::term_set_visible_set,
             term::term_running_session_ids,
+            term::term_history_load,
+            term::term_history_forget,
             // Claude usage (OAuth API + hook-fed activity summarizer)
             claude_usage::claude_usage_status,
             claude_usage::claude_activity_summary,

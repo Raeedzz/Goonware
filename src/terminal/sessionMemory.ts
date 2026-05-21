@@ -124,23 +124,36 @@ export function setBellTick(id: string, tick: number): void {
 }
 
 /**
- * Drop every memory entry associated with a session AND tear down its
- * Rust-side PTYs. Memory is keyed by ptyId (`agent-${sessionId}-${paneId}`),
- * and a session can have any number of terminal panes — so we sweep
- * every entry whose key contains the session id. Call this only when
- * the session itself is being permanently removed (user closes the
- * tab) — never on routine session switches.
+ * Permanently tear down the given pty_ids: in-memory scrollback,
+ * live PTY processes, and persisted block history.
+ *
+ * Use this only on irreversible deletion paths — worktree archive,
+ * "Discard branch" from the close dialog, explicit session delete.
+ * NEVER on routine session switches or app quit, both of which want
+ * the scrollback to be there when the user comes back.
+ *
+ * Three concerns, fanned out per pty:
+ *   1. `store.delete(pty)` — drops the JS-side blocks/rows/cwd cache
+ *      so a future remount under the same id (unlikely after archive,
+ *      since `worktree_restore` mints fresh ids) doesn't replay
+ *      stale state.
+ *   2. `term_close` — kills the PTY child if it's still alive.
+ *      Idempotent on unknown ids.
+ *   3. `term_history_forget` — cascade-deletes the SQLite
+ *      `terminal_panes` + `blocks` rows via the FK declared in
+ *      persistence migration v2. Idempotent on unknown ids.
+ *
+ * Earlier this took a `sessionId` and used the prefix
+ * `agent-${sessionId}-` to scan `store.keys()`, which silently no-op'd
+ * once pty_ids switched to the `pty_<stamp>_<rand>` shape minted by
+ * `worktrees.ts` / `useKeyboardShortcuts`. Explicit ids dodge that
+ * footgun entirely.
  */
-export function forgetSession(sessionId: string): void {
-  // Match the ptyId pattern from WorkspaceLayout. Any future change to
-  // that pattern needs to update this prefix in lockstep.
-  const prefix = `agent-${sessionId}-`;
-  for (const key of Array.from(store.keys())) {
-    if (key === sessionId || key.startsWith(prefix)) {
-      store.delete(key);
-      // Fire-and-forget: failing to kill a stale PTY isn't worth
-      // surfacing to the user (the session is being deleted anyway).
-      void invoke("term_close", { id: key }).catch(() => {});
-    }
+export function forgetPtys(ptyIds: string[]): void {
+  for (const id of ptyIds) {
+    if (!id) continue;
+    store.delete(id);
+    void invoke("term_close", { id }).catch(() => {});
+    void invoke("term_history_forget", { id }).catch(() => {});
   }
 }
