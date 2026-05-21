@@ -4,6 +4,13 @@ import type { Block as BlockType } from "./types";
 
 interface Props {
   blocks: BlockType[];
+  /**
+   * Disable soft-wrap in shell closed blocks. Used by the narrow
+   * right-panel secondary terminal so long lines pan via horizontal
+   * scroll instead of wrapping into a hard-to-scan column. Agent
+   * closed blocks already render no-wrap regardless of this flag.
+   */
+  noWrap?: boolean;
 }
 
 /**
@@ -19,15 +26,15 @@ interface Props {
  * The scroll position naturally pins at the bottom: no scrollIntoView
  * jitter, no autoscroll race.
  */
-export function BlockList({ blocks }: Props) {
+export function BlockList({ blocks, noWrap = false }: Props) {
   const items = useMemo(() => {
     const out: { id: string; node: React.ReactNode }[] = [];
     for (let i = blocks.length - 1; i >= 0; i--) {
       const block = blocks[i];
-      out.push({ id: block.id, node: <Block block={block} /> });
+      out.push({ id: block.id, node: <Block block={block} noWrap={noWrap} /> });
     }
     return out;
-  }, [blocks]);
+  }, [blocks, noWrap]);
 
   return (
     <div

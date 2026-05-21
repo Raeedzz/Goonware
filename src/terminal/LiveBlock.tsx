@@ -26,6 +26,13 @@ interface Props {
    * agent's layout.
    */
   preserveGrid?: boolean;
+  /**
+   * Disable soft-wrap on shell output rows. Used by the narrow
+   * right-panel secondary terminal so long lines pan via horizontal
+   * scroll instead of wrapping. Has no effect in agent mode
+   * (`preserveGrid`/`fill`), which already runs grid-mode no-wrap.
+   */
+  noWrap?: boolean;
 }
 
 /**
@@ -94,6 +101,7 @@ export function LiveBlock({
   fill = false,
   cwd,
   preserveGrid = false,
+  noWrap = false,
 }: Props) {
   const visibleRows = useMemo(() => {
     if (!frame) return [];
@@ -261,11 +269,14 @@ export function LiveBlock({
             display: fill ? "flex" : undefined,
             flexDirection: fill ? "column" : undefined,
             justifyContent: fill ? "flex-end" : undefined,
-            // Horizontal clip stays — the CanvasGrid can briefly
-            // render at an over-wide grid while the SIGWINCH debounce
-            // settles, and without this the right edge spills under
-            // the right sidebar.
-            overflowX: "hidden",
+            // Horizontal clip protects against the CanvasGrid briefly
+            // rendering wider than the pane while the SIGWINCH debounce
+            // settles (otherwise the right edge spills under the right
+            // sidebar). In `noWrap` shell mode we WANT lines to overflow
+            // outward so the side terminal's outer scroll container can
+            // pan them — and there's no CanvasGrid in that path (canvas
+            // is `preserveGrid`-only), so dropping the clip is safe.
+            overflowX: noWrap && !preserveGrid && !fill ? "visible" : "hidden",
           }}
         >
           {/* Agent TUI blocks (preserveGrid) always render through the
@@ -288,7 +299,7 @@ export function LiveBlock({
               <CellRow
                 key={row.row}
                 spans={row.spans}
-                wrap={!preserveGrid && !fill}
+                wrap={!preserveGrid && !fill && !noWrap}
               />
             ))
           )}
