@@ -59,7 +59,12 @@ export function keyToBytes(
     case "Backspace":
       return new Uint8Array([0x7f]);
     case "Tab":
-      return encoder.encode("\t");
+      // xterm backtab CSI (`CSI Z`) for Shift+Tab — Claude Code, fzf,
+      // readline `menu-complete-backward`, vim `<S-Tab>`, and most
+      // TUIs all read this. Falling through to the catch-all `return
+      // null` would let the textarea swallow Shift+Tab entirely, so
+      // users could never cycle modes backward in agents that use it.
+      return encoder.encode(e.shiftKey ? "\x1b[Z" : "\t");
     case "Escape":
       return new Uint8Array([0x1b]);
     case "ArrowUp":
