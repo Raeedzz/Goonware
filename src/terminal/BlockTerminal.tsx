@@ -1210,16 +1210,29 @@ export function BlockTerminal({
       if (text.length === 0) return;
       // If the selection originates inside an editable element, let
       // the browser's native copy run — that's the right path for
-      // copying text the user actually typed into a textarea.
+      // copying text the user actually typed into a textarea or a
+      // contenteditable surface (CodeMirror, TipTap, etc.).
+      //
+      // `isContentEditable` is the standardized getter that returns
+      // true for any node inside a `contenteditable` ancestor —
+      // regardless of whether the attribute is set to "true", "",
+      // or "plaintext-only" — so it catches every form CodeMirror's
+      // contenteditable or TipTap's ProseMirror surface might use.
+      // The strict `[contenteditable='true']` selector used to miss
+      // any of those non-canonical values.
       const anchor = sel.anchorNode;
       const anchorEl =
         anchor instanceof Element
           ? anchor
           : anchor?.parentElement ?? null;
       if (anchorEl) {
-        const editable =
-          anchorEl.closest("textarea, input, [contenteditable='true']");
-        if (editable) return;
+        if (anchorEl.closest("textarea, input")) return;
+        if (
+          anchorEl instanceof HTMLElement &&
+          anchorEl.isContentEditable
+        ) {
+          return;
+        }
       }
       const container = containerRef.current;
       if (!container || !anchor || !container.contains(anchor)) return;

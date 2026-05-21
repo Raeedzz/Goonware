@@ -514,3 +514,287 @@ mod macos_menu_pinning_tests {
         );
     }
 }
+
+/// Regression guards for the JS-side keyboard-handler gating contract.
+///
+/// The Edit-menu pin above keeps macOS's native Cmd+C/V/X/A path alive.
+/// But any window-level keydown listener that React installs runs
+/// BEFORE WebKit's responder chain — so if a JS handler calls
+/// `e.preventDefault()` on Cmd+C/V, the menu items never fire and
+/// users see "Cmd+C/V is broken everywhere."
+///
+/// The contract every clipboard-adjacent handler must follow:
+///
+///   1. **Visibility gating**: `BlockTerminal`'s window-level
+///      keydown listeners must be gated by `if (!isVisible) return;`,
+///      and every site that mounts a hidden BlockTerminal must forward
+///      `isVisible={…}` correctly. Otherwise hidden terminals race the
+///      visible one and `O(n)` handlers steal events on each chord.
+///
+///   2. **Editable bailout**: When the focused element / selection
+///      anchor is a textarea, input, or contenteditable surface,
+///      window-level Cmd+C handlers must `return` BEFORE calling
+///      `preventDefault()`. That lets the editor's native copy fire.
+///
+///   3. **Container scoping**: Window-level handlers that DO
+///      preventDefault must verify the selection is inside the
+///      component's own container — never copy text from one pane
+///      when the user pressed Cmd+C while focused in another.
+///
+/// These tests grep the relevant `.tsx` files to pin every clause.
+/// They're cheap (text inclusion checks), they run on every
+/// `cargo test`, and they break loudly the moment someone removes
+/// a load-bearing guard. Combined with the JS unit tests in
+/// `src/terminal/keyEncoding.test.ts` and
+/// `src/terminal/clipboardContract.test.ts`, the regression that
+/// shipped — and re-shipped — in 0.0.22 / 0.0.23 cannot recur
+/// without flunking the test suite on `bun run test:all`.
+#[cfg(test)]
+mod clipboard_handler_gating_tests {
+    use std::path::PathBuf;
+
+    /// Repo-relative paths to the `.tsx` files we pin. Resolved via
+    /// `CARGO_MANIFEST_DIR` so the tests run from any cwd `cargo
+    /// test` was invoked under (the harness `cd`s into `src-tauri`
+    /// before running test binaries, but CI scripts vary).
+    fn read_repo_file(rel: &str) -> String {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.pop(); // src-tauri → repo root
+        path.push(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "could not read {} — expected at {}: {}",
+                rel,
+                path.display(),
+                e
+            )
+        })
+    }
+
+    #[test]
+    fn block_terminal_window_cmd_c_is_visibility_gated() {
+        // The two window-level keydown listeners in BlockTerminal
+        // (the Ctrl+C fallback and the Cmd+C copy) MUST each bail
+        // out at the top of the listener if the terminal is hidden.
+        // Without these, every hidden BlockTerminal in the
+        // TerminalKeepaliveLayer / SecondaryTerminals re-mount
+        // contends with the visible one for every keystroke — the
+        // original 4856c46 regression.
+        let src = read_repo_file("src/terminal/BlockTerminal.tsx");
+        // Both effects open with `if (!isVisible) return;` immediately
+        // inside the useEffect body. Pin the exact early-return so
+        // a future refactor that drops the gate (or accidentally
+        // re-orders it after a `window.addEventListener(...)`) is
+        // caught here.
+        let occurrences = src.matches("if (!isVisible) return;").count();
+        assert!(
+            occurrences >= 3,
+            "BlockTerminal.tsx must early-return on !isVisible in \
+             ALL window-level useEffect bodies (drag-drop, Ctrl+C \
+             fallback, Cmd+C copy). Found only {} occurrence(s) of \
+             `if (!isVisible) return;` — at least 3 are load-bearing.",
+            occurrences
+        );
+    }
+
+    #[test]
+    fn block_terminal_cmd_c_bails_on_contenteditable_selection() {
+        // Pin the editable-bailout in BlockTerminal's Cmd+C handler.
+        // The user-facing failure mode if this regresses: select
+        // text in CodeMirror / the markdown editor, press Cmd+C,
+        // get the BlockTerminal's stale closed-block selection on
+        // the clipboard instead of the editor text.
+        //
+        // We grep for `isContentEditable` (the standardized DOM
+        // getter that catches every form of `contenteditable` —
+        // `="true"`, `=""`, `="plaintext-only"` — that CodeMirror,
+        // TipTap, or any other editor might use) rather than the
+        // older strict `[contenteditable='true']` selector that
+        // silently missed TipTap's variants.
+        let src = read_repo_file("src/terminal/BlockTerminal.tsx");
+        assert!(
+            src.contains("isContentEditable"),
+            "BlockTerminal.tsx must use `isContentEditable` (the \
+             standard DOM property, not the strict attribute \
+             selector) to detect when Cmd+C should pass through to \
+             a focused editor. Otherwise CodeMirror / TipTap \
+             selections silently break."
+        );
+        assert!(
+            src.contains("anchorEl.closest(\"textarea, input\")"),
+            "BlockTerminal.tsx Cmd+C handler must also bail when the \
+             selection anchor is inside a plain textarea or input — \
+             checked via `.closest('textarea, input')`. The \
+             contenteditable check alone misses commit-composer-style \
+             plain textareas."
+        );
+    }
+
+    #[test]
+    fn canvas_grid_cmd_c_bails_on_focused_editable() {
+        // The window-level Cmd+C handler in CanvasGrid would
+        // otherwise steal Cmd+C anywhere on the page whenever a
+        // canvas selection ref was stale (user dragged once in a
+        // closed agent block, never clicked away to clear it).
+        // Pin the active-element bailout: when focus is on a real
+        // editable, the canvas handler must return before
+        // preventDefault.
+        let src = read_repo_file("src/terminal/CanvasGrid.tsx");
+        assert!(
+            src.contains("document.activeElement"),
+            "CanvasGrid.tsx window-level Cmd+C handler must check \
+             `document.activeElement` and bail when focus is on a \
+             real editable. Otherwise a stale canvas selection \
+             steals Cmd+C from the file editor / commit composer / \
+             side terminal."
+        );
+        assert!(
+            src.contains("isContentEditable"),
+            "CanvasGrid.tsx Cmd+C handler must use `isContentEditable` \
+             so CodeMirror / TipTap focus correctly suppresses the \
+             canvas-selection copy path."
+        );
+    }
+
+    #[test]
+    fn secondary_terminals_forward_is_visible() {
+        // The fix from 4856c46 — pin that the right-panel side
+        // terminals still forward `isVisible={isActive}` to their
+        // BlockTerminal. Without this every hidden side terminal
+        // in the keepalive layer keeps its window-level Cmd+C /
+        // Ctrl+C / drag-drop listeners armed.
+        let src = read_repo_file("src/shell/RightPanel.tsx");
+        assert!(
+            src.contains("isVisible={isActive}"),
+            "RightPanel.tsx SecondaryTerminals must pass \
+             `isVisible={{isActive}}` to BlockTerminal so only the \
+             active side terminal owns its window-level keyboard \
+             listeners. Dropping this prop re-introduces the \
+             4856c46 regression: Cmd+C/V silently breaks in the \
+             active side terminal because hidden siblings race \
+             every keystroke."
+        );
+    }
+
+    #[test]
+    fn main_column_keepalive_layer_forwards_is_visible() {
+        // The same gating contract as SecondaryTerminals, applied
+        // to the main column. The TerminalKeepaliveLayer pre-mounts
+        // every terminal tab in the active worktree and toggles
+        // `display: none` on inactive ones. Each BlockTerminal must
+        // know its visibility so its window-level handlers stay
+        // dormant when hidden.
+        let src = read_repo_file("src/shell/MainColumn.tsx");
+        assert!(
+            src.contains("isVisible={visible}"),
+            "MainColumn.tsx TerminalKeepaliveLayer must pass \
+             `isVisible={{visible}}` to TerminalTabContent so hidden \
+             main-column tabs don't contend for clipboard chords. \
+             Mirrors the SecondaryTerminals contract."
+        );
+        assert!(
+            src.contains("isVisible={isVisible}"),
+            "MainColumn.tsx TerminalTabContent must forward \
+             `isVisible={{isVisible}}` down to BlockTerminal."
+        );
+    }
+
+    #[test]
+    fn no_window_keydown_unconditionally_prevents_default() {
+        // A backstop: scan every .tsx/.ts under src/ for any
+        // window-level keydown listener that calls
+        // `e.preventDefault()` without an early bailout on the
+        // common clipboard chord conditions. Right now no such
+        // listener exists — but if a future feature ever adds
+        // `e.preventDefault()` to a global keydown handler with
+        // no guard, this test flags it as a Cmd+C/V regression
+        // risk before it ships.
+        let walked = collect_ts_sources();
+        let mut offenders = Vec::new();
+        for (rel, src) in walked {
+            // Find every `window.addEventListener("keydown", ...)`
+            // and inspect the next ~80 lines for an unconditional
+            // preventDefault. We allow files to opt out via the
+            // sentinel comment below.
+            for (idx, _) in src.match_indices("window.addEventListener(\"keydown\"") {
+                let snippet_end = (idx + 2400).min(src.len());
+                let snippet = &src[idx..snippet_end];
+                if snippet.contains("// clipboard-handler-audited") {
+                    continue;
+                }
+                // The simplest red flag: a preventDefault() that
+                // isn't preceded by a check for `e.key` or `key`.
+                // We can't AST-parse from a grep test, but every
+                // legitimate handler in the tree today gates on
+                // `e.key` / `e.metaKey` / `e.ctrlKey` before
+                // calling preventDefault. Flag any block that has
+                // preventDefault without those tokens nearby.
+                if snippet.contains("e.preventDefault()")
+                    && !snippet.contains("e.key")
+                    && !snippet.contains("e.metaKey")
+                    && !snippet.contains("e.ctrlKey")
+                {
+                    offenders.push(rel.clone());
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "Found window-level keydown listener(s) that may \
+             unconditionally preventDefault — risks breaking \
+             Cmd+C/V/X/A across the app: {:?}. Add a key/modifier \
+             gate or annotate the file with \
+             `// clipboard-handler-audited` if intentional.",
+            offenders
+        );
+    }
+
+    /// Walk `src/` and read every `.tsx` / `.ts` file, returning
+    /// `(repo-relative-path, contents)` pairs. Skips `.test.ts`
+    /// files (test code is allowed to call `preventDefault` more
+    /// liberally) and the `node_modules` / `dist` / `target` trees
+    /// in case any of those slip into the search path.
+    fn collect_ts_sources() -> Vec<(String, String)> {
+        let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        root.pop(); // src-tauri → repo root
+        root.push("src");
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if matches!(name, "node_modules" | "dist" | "target" | ".git") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if ext != "tsx" && ext != "ts" {
+                    continue;
+                }
+                let s = path.to_string_lossy();
+                if s.ends_with(".test.ts") || s.ends_with(".test.tsx") {
+                    continue;
+                }
+                let Ok(body) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let rel = path
+                    .strip_prefix(root.parent().unwrap_or(&root))
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, body));
+            }
+        }
+        out
+    }
+}
