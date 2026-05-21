@@ -9,13 +9,23 @@
 //! Both readers are best-effort: a malformed SKILL.md or a missing
 //! description field doesn't fail the whole list — we surface what we
 //! found and skip the rest.
+//!
+//! **TCC caching invariant.** Every path scanned here sits inside
+//! Claude.app's responsible-bundle MACL domain. The first read of any
+//! such file from Goonware fires the macOS App Data Isolation popup
+//! ("Goonware would like to access data from other apps"). To prevent
+//! that popup from firing every time the user opens the ⌘K palette or
+//! switches to the Skills tab, the disk walk runs at most ONCE per app
+//! launch — subsequent calls return the cached `Vec`. The cache lives
+//! until the process exits; a future "refresh" command can swap it.
 
 use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct SkillEntry {
     pub id: String,
     pub name: String,
@@ -28,7 +38,7 @@ pub struct SkillEntry {
     pub path: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct McpEntry {
     pub id: String,
     pub name: String,
@@ -42,8 +52,29 @@ pub struct McpEntry {
     pub summary: String,
 }
 
+/// Process-lifetime caches. Populated lazily on first call to the
+/// matching `*_list` command. The popup-suppression invariant in the
+/// module docs depends on these — never bypass them from the public
+/// commands.
+static SKILLS_CACHE: OnceLock<Mutex<Option<Vec<SkillEntry>>>> = OnceLock::new();
+static MCPS_CACHE: OnceLock<Mutex<Option<Vec<McpEntry>>>> = OnceLock::new();
+
 #[tauri::command]
 pub fn skills_list() -> Result<Vec<SkillEntry>, String> {
+    let slot = SKILLS_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(g) = slot.lock() {
+        if let Some(cached) = g.as_ref() {
+            return Ok(cached.clone());
+        }
+    }
+    let fresh = scan_skills_from_disk()?;
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(fresh.clone());
+    }
+    Ok(fresh)
+}
+
+fn scan_skills_from_disk() -> Result<Vec<SkillEntry>, String> {
     let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
     let mut out = Vec::new();
 
@@ -148,6 +179,20 @@ fn read_skill_description(path: &Path) -> Option<String> {
 
 #[tauri::command]
 pub fn mcps_list() -> Result<Vec<McpEntry>, String> {
+    let slot = MCPS_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(g) = slot.lock() {
+        if let Some(cached) = g.as_ref() {
+            return Ok(cached.clone());
+        }
+    }
+    let fresh = scan_mcps_from_disk()?;
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(fresh.clone());
+    }
+    Ok(fresh)
+}
+
+fn scan_mcps_from_disk() -> Result<Vec<McpEntry>, String> {
     let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
     let mut out = Vec::new();
 

@@ -16,13 +16,23 @@
 //! For each skill we read SKILL.md's YAML-ish frontmatter (between
 //! `---` delimiters) for `name` and `description`. For MCPs we extract
 //! the server name and command/args from the JSON config.
+//!
+//! **TCC popup invariant.** Every `~/.claude/*` path sits inside
+//! Claude.app's responsible-bundle MACL domain, and the first read of
+//! any of them from Goonware fires the "would like to access data
+//! from other apps" prompt. The home-dir portion of the scan is
+//! therefore cached per (project_path) for the life of the process —
+//! reopening the Connections view doesn't re-fire the popup. Project-
+//! local files (under the worktree) are scanned fresh each call since
+//! they're inside Goonware's own MACL domain and don't trigger TCC.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct Connection {
     /// `skill` or `mcp`
     pub kind: String,
@@ -38,8 +48,48 @@ pub struct Connection {
     pub command: Option<String>,
 }
 
+/// Cached home-dir scan. Keys: nothing (the home-dir half doesn't
+/// depend on the project). Populated lazily on the first
+/// `connections_scan` call. See the module-level TCC invariant.
+static HOME_SCAN_CACHE: OnceLock<Mutex<Option<Vec<Connection>>>> = OnceLock::new();
+
 #[tauri::command]
 pub fn connections_scan(project_path: Option<String>) -> Result<Vec<Connection>, String> {
+    let mut out = home_scan_cached()?;
+
+    // Project-local paths are inside Goonware's own MACL domain, so
+    // scanning them every call is TCC-free and keeps the list fresh
+    // when the user edits the project's `.claude` dir.
+    if let Some(proj) = project_path.as_deref() {
+        scan_skills(&PathBuf::from(proj).join(".claude").join("skills"), "project", &mut out);
+        parse_mcp_file(&PathBuf::from(proj).join(".mcp.json"), "project", &mut out);
+    }
+
+    // Stable sort: kind then name
+    out.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
+    Ok(out)
+}
+
+/// Walk `~/.claude/...` exactly once per process. Subsequent calls
+/// return the cached copy so the macOS App Data Isolation popup fires
+/// at most once. `HashMap` import is unused here today but kept for
+/// the per-project variant if we ever decide to also cache project-
+/// local scans.
+fn home_scan_cached() -> Result<Vec<Connection>, String> {
+    let slot = HOME_SCAN_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(g) = slot.lock() {
+        if let Some(cached) = g.as_ref() {
+            return Ok(cached.clone());
+        }
+    }
+    let fresh = scan_home_from_disk()?;
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(fresh.clone());
+    }
+    Ok(fresh)
+}
+
+fn scan_home_from_disk() -> Result<Vec<Connection>, String> {
     let mut out = Vec::new();
     let home = std::env::var("HOME").map_err(|_| "HOME unset")?;
     let home = PathBuf::from(home);
@@ -58,22 +108,10 @@ pub fn connections_scan(project_path: Option<String>) -> Result<Vec<Connection>,
         }
     }
 
-    // Skills — project
-    if let Some(proj) = project_path.as_deref() {
-        scan_skills(&PathBuf::from(proj).join(".claude").join("skills"), "project", &mut out);
-    }
-
     // MCP servers — user-level configs
     parse_mcp_file(&home.join(".claude").join(".mcp.json"), "user", &mut out);
     parse_mcp_file(&home.join(".claude").join("settings.json"), "user", &mut out);
 
-    // MCP servers — project
-    if let Some(proj) = project_path.as_deref() {
-        parse_mcp_file(&PathBuf::from(proj).join(".mcp.json"), "project", &mut out);
-    }
-
-    // Stable sort: kind then name
-    out.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
 }
 
