@@ -315,14 +315,18 @@ impl FlatTerm {
         Self {
             primary: ActiveGrid::new(cols, rows),
             alt: ActiveGrid::new(cols, rows),
-            scrollback: FlatStorage::with_capacity(5_000),
+            // Unbounded scrollback — every row the agent ever produces
+            // stays accessible. FlatStorage::with_capacity is safe with
+            // usize::MAX because it decouples the cap from the initial
+            // Vec allocation; storage grows dynamically as rows arrive.
+            scrollback: FlatStorage::with_capacity(usize::MAX),
             use_alt: false,
             app_cursor: false,
             bracketed_paste: false,
             line_wrap: true,
             saved_cursor_for_swap: None,
             tab_stops,
-            scrollback_cap: 5_000,
+            scrollback_cap: usize::MAX,
         }
     }
 

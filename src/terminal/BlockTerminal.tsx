@@ -168,7 +168,6 @@ interface Props {
 
 const DEFAULT_ROWS = 32;
 const DEFAULT_COLS = 100;
-const HISTORY_LIMIT = 100;
 const BELL_FLASH_MS = 480;
 
 /**
@@ -871,7 +870,7 @@ export function BlockTerminal({
       void sendLine(text);
       if (text.trim().length > 0) {
         setHistory((prev) => {
-          const next = [text, ...prev].slice(0, HISTORY_LIMIT);
+          const next = [text, ...prev];
           memSetHistory(id, next);
           return next;
         });
