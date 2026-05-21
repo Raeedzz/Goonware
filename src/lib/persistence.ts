@@ -58,8 +58,12 @@ export function pickPersistent(state: AppState): PersistedState {
   const worktrees = { ...state.worktrees };
   for (const id of Object.keys(worktrees)) {
     const w = worktrees[id];
+    // Strip `missing` — it's a transient flag set by the post-load
+    // path-existence sweep. Persisting it would keep stale "missing"
+    // dimming across restarts even after the user re-created the dir.
+    const { missing: _missing, ...rest } = w;
     worktrees[id] = {
-      ...w,
+      ...rest,
       agentStatus: "idle",
       agentCli: null,
       changeCount: 0,

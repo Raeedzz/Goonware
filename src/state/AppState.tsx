@@ -25,6 +25,7 @@ import {
   projectSettings,
 } from "./types";
 import { loadState, saveState } from "../lib/persistence";
+import { fs } from "../lib/fs";
 
 /* ------------------------------------------------------------------
    First-launch state — totally blank. The user opens their first
@@ -545,7 +546,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let cancelled = false;
     loadState()
-      .then((persisted) => {
+      .then(async (persisted) => {
         if (cancelled || !persisted) {
           hydratedRef.current = true;
           return;
@@ -554,6 +555,36 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         requestAnimationFrame(() => {
           hydratedRef.current = true;
         });
+
+        // Validate worktree paths after hydrating so the sidebar can
+        // flag worktrees whose backing directory was deleted between
+        // launches. Doing this here (vs at the call sites of every
+        // Tauri command that takes a cwd) gives one cheap fs::exists
+        // sweep on startup instead of cascading "cwd does not exist"
+        // errors when the user clicks a phantom worktree row.
+        const worktrees = Object.values(persisted.worktrees ?? {});
+        if (worktrees.length === 0) return;
+        try {
+          const paths = worktrees.map((w) => w.path);
+          const results = await fs.pathsExist(paths);
+          if (cancelled) return;
+          for (let i = 0; i < worktrees.length; i++) {
+            const w = worktrees[i];
+            const exists = results[i];
+            if (!exists) {
+              dispatch({
+                type: "update-worktree",
+                id: w.id,
+                patch: { missing: true },
+              });
+            }
+          }
+        } catch (err) {
+          console.warn(
+            "[Goonware] persistence: worktree path validation failed",
+            err,
+          );
+        }
       })
       .catch((err: unknown) => {
         console.error("[Goonware] persistence: loadState failed", err);

@@ -75,7 +75,14 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
   // duplicate poll of its own. Previously UpperPanel and ChangesView
   // each had their own 4s poll on the same `git.status` call — two
   // IPC round-trips, twice the work, possible to drift out of sync.
-  const status = useWorktreeStatus(worktree.id, worktree.path);
+  // Missing-directory worktrees skip the poll entirely — `git.status`
+  // would fail every tick with `cwd does not exist`, spamming the
+  // console and racing the recovery panel in MainColumn.
+  const status = useWorktreeStatus(
+    worktree.id,
+    worktree.path,
+    worktree.missing === true,
+  );
 
   return (
     <div
@@ -421,6 +428,7 @@ interface WorktreeStatusState {
 function useWorktreeStatus(
   worktreeId: string,
   worktreePath: string,
+  skip: boolean = false,
 ): WorktreeStatusState {
   const dispatch = useAppDispatch();
   const [entries, setEntries] = useState<StatusEntry[]>([]);
@@ -436,6 +444,7 @@ function useWorktreeStatus(
   }, [worktreePath]);
 
   const refresh = useCallback(async () => {
+    if (skip) return;
     const path = pathRef.current;
     try {
       const result = await git.status(path);
@@ -455,9 +464,15 @@ function useWorktreeStatus(
       if (path !== pathRef.current) return;
       setError(String(e));
     }
-  }, [worktreeId, dispatch]);
+  }, [worktreeId, dispatch, skip]);
 
   useEffect(() => {
+    if (skip) {
+      setEntries([]);
+      setAhead(0);
+      setError(null);
+      return;
+    }
     let cancelled = false;
     const tick = async () => {
       if (cancelled) return;
@@ -482,7 +497,7 @@ function useWorktreeStatus(
       window.clearInterval(t);
       window.removeEventListener("goonware-git-refresh", onRefresh);
     };
-  }, [worktreeId, worktreePath, refresh]);
+  }, [worktreeId, worktreePath, refresh, skip]);
 
   return { entries, ahead, error, refresh };
 }

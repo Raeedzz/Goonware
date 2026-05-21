@@ -234,6 +234,16 @@ export interface Worktree {
   color?: TagId;
   /** User-picked HugeIcons component name (overrides project's choice). */
   iconName?: string;
+  /**
+   * True when the backing directory on disk has gone missing between
+   * launches (e.g. the user deleted it manually). Transient — set by a
+   * post-hydrate `fs_paths_exist` sweep; never persisted. Drives the
+   * "missing" visual state in the sidebar and the recovery panel that
+   * replaces the terminal in the main column, both of which prevent
+   * downstream commands from cascading into `cwd does not exist`
+   * errors the user can't act on.
+   */
+  missing?: boolean;
 }
 
 /* ------------------------------------------------------------------

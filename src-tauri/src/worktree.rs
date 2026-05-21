@@ -425,6 +425,7 @@ pub async fn worktree_archive(
     app: AppHandle,
     worktree_id: String,
     project_id: String,
+    project_path: Option<String>,
     branch: String,
     name: String,
     path: String,
@@ -437,29 +438,62 @@ pub async fn worktree_archive(
     delete_branch: bool,
     archive_script: Option<String>,
 ) -> Result<ArchiveRecord, String> {
-    if let Some(script) = archive_script.as_deref() {
-        let trimmed = script.trim();
-        if !trimmed.is_empty() {
-            run_shell_script(&path, trimmed).await;
+    // If the worktree directory was deleted out from under us (a manual
+    // `rm -rf`, a system cleanup, a different machine that mounted the
+    // disk, etc), the user is stuck — they can't open the worktree, AND
+    // they can't archive it because every git op needs a real cwd.
+    // Detect this up front and fall back to a "force-forget" path:
+    //   - skip the archive script and stash (no working tree to act on)
+    //   - skip `git worktree remove` (it would fail), and instead run
+    //     `git worktree prune` from the parent repo so git's metadata
+    //     for the dead worktree is reclaimed.
+    // The archive record still gets written so the user sees the
+    // worktree in History with a clear "(missing)" trail back.
+    let worktree_path_exists = Path::new(&path).exists();
+    let repo_root = project_path
+        .clone()
+        .filter(|p| Path::new(p).exists())
+        .unwrap_or_else(|| infer_repo_root(&path));
+
+    if worktree_path_exists {
+        if let Some(script) = archive_script.as_deref() {
+            let trimmed = script.trim();
+            if !trimmed.is_empty() {
+                run_shell_script(&path, trimmed).await;
+            }
         }
     }
     let mut stash_ref = None;
-    if stash {
+    if stash && worktree_path_exists {
         let msg = format!("goonware-archive-{}", worktree_id);
         // Best effort — clean worktree → no stash → git returns non-zero.
         let _ = git(&path, &["stash", "push", "-u", "-m", &msg]).await;
         stash_ref = Some(msg);
     }
 
-    let mut remove_args = vec!["worktree", "remove"];
-    if force {
-        remove_args.push("--force");
+    if worktree_path_exists {
+        let mut remove_args = vec!["worktree", "remove"];
+        if force {
+            remove_args.push("--force");
+        }
+        remove_args.push(path.as_str());
+        git(&repo_root, &remove_args).await?;
+    } else if Path::new(&repo_root).exists() {
+        // Worktree directory is gone — clean up git's stale metadata so
+        // the branch isn't permanently flagged as checked-out elsewhere.
+        // Best-effort: if prune fails (corrupted git, permissions), the
+        // archive record still lands, the user is no longer stuck.
+        let _ = git(&repo_root, &["worktree", "prune"]).await;
     }
-    remove_args.push(path.as_str());
-    git(&infer_repo_root(&path), &remove_args).await?;
 
     if delete_branch {
-        let _ = git(&infer_repo_root(&path), &["branch", "-D", &branch]).await;
+        // Branch deletion targets the parent repo. If neither the
+        // worktree nor a usable parent exists, silently skip — better
+        // to land the archive record than to fail the whole operation
+        // over a branch we can't reach anyway.
+        if Path::new(&repo_root).exists() {
+            let _ = git(&repo_root, &["branch", "-D", &branch]).await;
+        }
     }
 
     let record = ArchiveRecord {

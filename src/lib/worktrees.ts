@@ -57,11 +57,13 @@ export interface ArchiveOptions {
 
 export async function worktreeArchive(
   worktree: Worktree,
+  projectPath: string | null,
   opts: ArchiveOptions,
 ): Promise<ArchiveRecord> {
   return invoke<ArchiveRecord>("worktree_archive", {
     worktreeId: worktree.id,
     projectId: worktree.projectId,
+    projectPath,
     branch: worktree.branch,
     name: worktree.name,
     path: worktree.path,

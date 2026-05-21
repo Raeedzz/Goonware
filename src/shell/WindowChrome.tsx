@@ -143,7 +143,7 @@ function BranchActionButton({ worktree }: { worktree: Worktree | null }) {
     archivedRef.current[worktree.id] = true;
     try {
       const cfg = projectSettings(project);
-      const record = await worktreeArchive(worktree, {
+      const record = await worktreeArchive(worktree, project?.path ?? null, {
         stash: true,
         force: false,
         deleteBranch: deleteBranchOnArchive,

@@ -27,7 +27,13 @@ import {
   IconEdit,
   IconPullRequest,
 } from "@/design/icons";
-import { Image01Icon, Link01Icon, ViewOffIcon, Delete01Icon } from "hugeicons-react";
+import {
+  Image01Icon,
+  Link01Icon,
+  ViewOffIcon,
+  Delete01Icon,
+  FolderOffIcon,
+} from "hugeicons-react";
 import {
   useActiveWorktree,
   useAppDispatch,
@@ -814,7 +820,13 @@ const WorktreeRow = memo(function WorktreeRowImpl({
     e.stopPropagation();
     let stash = archiveBehavior !== "force";
     let force = archiveBehavior === "force";
-    if (archiveBehavior === "ask") {
+    // When the directory is already gone, stash + git-worktree-remove
+    // are no-ops. Skip the confirmation prompt (there's nothing dirty
+    // to lose) and let the backend's force-forget path run cleanly.
+    if (worktree.missing) {
+      stash = false;
+      force = false;
+    } else if (archiveBehavior === "ask") {
       const choice = window.confirm(
         `Archive ${worktree.name}?\n\nOK = stash dirty changes (recoverable from History)\nCancel = abort`,
       );
@@ -824,7 +836,7 @@ const WorktreeRow = memo(function WorktreeRowImpl({
     }
     try {
       const cfg = projectSettings(project);
-      const record = await worktreeArchive(worktree, {
+      const record = await worktreeArchive(worktree, project.path, {
         stash,
         force,
         deleteBranch: deleteBranchOnArchive,
@@ -945,24 +957,29 @@ const WorktreeRow = memo(function WorktreeRowImpl({
       >
         <span
           aria-hidden
+          title={worktree.missing ? "Directory missing on disk" : undefined}
           style={{
             display: "inline-flex",
             alignItems: "center",
             justifyContent: "center",
             width: 16,
             height: 16,
-            color: isRunning
-              ? "var(--accent)"
-              : iconEntry
-                ? worktree.color
-                  ? `var(--tag-${worktree.color})`
-                  : "var(--text-secondary)"
-                : "var(--text-tertiary)",
+            color: worktree.missing
+              ? "var(--state-warn, var(--state-error))"
+              : isRunning
+                ? "var(--accent)"
+                : iconEntry
+                  ? worktree.color
+                    ? `var(--tag-${worktree.color})`
+                    : "var(--text-secondary)"
+                  : "var(--text-tertiary)",
             transition: "color var(--motion-fast) var(--ease-out-quart)",
             flexShrink: 0,
           }}
         >
-          {isRunning ? (
+          {worktree.missing ? (
+            <FolderOffIcon key="missing" size={16} />
+          ) : isRunning ? (
             <Loader key="running" size={16} />
           ) : iconEntry ? (
             <iconEntry.Component size={16} />
@@ -978,7 +995,13 @@ const WorktreeRow = memo(function WorktreeRowImpl({
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
+            opacity: worktree.missing ? 0.55 : 1,
+            textDecoration: worktree.missing ? "line-through" : undefined,
+            textDecorationColor: worktree.missing
+              ? "var(--text-disabled)"
+              : undefined,
           }}
+          title={worktree.missing ? `Missing: ${worktree.path}` : worktree.name}
         >
           {worktree.name}
         </span>
