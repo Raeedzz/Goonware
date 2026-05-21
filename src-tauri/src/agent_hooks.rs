@@ -384,12 +384,21 @@ pub fn start_socket_server(app: AppHandle<Wry>) {
     // every Codex session we know about, and synthesizes a SessionEnd
     // after two consecutive misses (matches notchi's 2-miss debounce
     // — guards against a transient ps glitch falsely killing a live
-    // session).
+    // session). Codex has no SessionEnd hook of its own, so liveness
+    // checking is the only way we learn it exited.
+    //
+    // Claude and Gemini deliberately have NO watchdog: they emit
+    // reliable Stop / AfterAgent / SessionEnd events at end-of-turn,
+    // and any time-based "force idle" we used to run would lie about
+    // agent state during normal long turns (extended thinking blocks,
+    // multi-minute tool calls). The cost of the missing watchdog is
+    // that a hard-killed Claude / Gemini CLI leaves the spinner on
+    // until the next real event — strictly preferable to falsely
+    // claiming idle while the agent is actively working.
     let watchdog_app = app;
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(2));
         reconcile_codex_liveness(&watchdog_app);
-        reconcile_stale_sessions(&watchdog_app);
     });
 }
 
@@ -641,86 +650,6 @@ fn reconcile_codex_liveness(app: &AppHandle<Wry>) {
         sess.last_event = "SessionEnd".to_string();
         sess.updated_at_ms = now_ms();
         let _ = app.emit(SESSION_STATE_EVENT, &sess);
-    }
-}
-
-/// How long a session can sit in `Working` / `Compacting` without a
-/// fresh event before we force-transition it to `Idle`. Covers the
-/// case where the CLI fires a turn-start event but never fires the
-/// matching turn-end event — typical examples:
-///   * Claude shows "Not logged in" and exits without firing Stop.
-///   * Codex / Gemini process killed mid-turn before SessionEnd.
-///   * Hook script failed to deliver Stop (socket gone, etc.).
-/// The spinner unsticks; the next real event re-lights it if the
-/// session resumes. 90s is comfortably above realistic turn durations
-/// (most are <30s; a heavy multi-tool turn rarely exceeds 60s).
-const STALE_WORKING_TIMEOUT_MS: u64 = 90_000;
-
-/// Pure predicate — pull out the keys whose record is "stale working":
-/// in `Working`/`Compacting` AND last touched more than `threshold_ms`
-/// ago. Factored out for unit testing without a Tauri AppHandle.
-fn find_stale_working_keys(
-    sessions: &std::collections::HashMap<SessionKey, SessionRecord>,
-    now: u64,
-    threshold_ms: u64,
-) -> Vec<SessionKey> {
-    sessions
-        .iter()
-        .filter(|(_, r)| {
-            matches!(r.status, SessionStatus::Working | SessionStatus::Compacting)
-                && now.saturating_sub(r.updated_at_ms) > threshold_ms
-        })
-        .map(|(k, _)| k.clone())
-        .collect()
-}
-
-/// Walk every session, force-idle any that's been working past the
-/// staleness deadline. Emits an Idle event so the frontend's spinner
-/// stops without waiting for the next real hook fire.
-fn reconcile_stale_sessions(app: &AppHandle<Wry>) {
-    let state = match app.try_state::<AgentHookState>() {
-        Some(s) => s,
-        None => return,
-    };
-    let now = now_ms();
-
-    let updated: Vec<SessionRecord> = match state.sessions.lock() {
-        Ok(mut sessions) => {
-            let stale_keys =
-                find_stale_working_keys(&sessions, now, STALE_WORKING_TIMEOUT_MS);
-            let mut out = Vec::with_capacity(stale_keys.len());
-            for k in &stale_keys {
-                if let Some(rec) = sessions.get_mut(k) {
-                    rec.status = SessionStatus::Idle;
-                    // Tag the synthesized transition so debug logs make
-                    // clear it didn't come from the agent itself.
-                    rec.last_event = format!("StaleIdle({})", rec.last_event);
-                    rec.updated_at_ms = now;
-                    out.push(rec.clone());
-                }
-            }
-            // Clear the turn flag for every force-idled session — a
-            // stray late tool event after staleness mustn't reignite
-            // the spinner. The next real UserPromptSubmit will set it
-            // back to true legitimately.
-            if let Ok(mut turns) = state.in_user_turn.lock() {
-                for k in &stale_keys {
-                    turns.remove(k);
-                }
-            }
-            out
-        }
-        Err(_) => Vec::new(),
-    };
-
-    for rec in updated {
-        eprintln!(
-            "[goonware-hooks] {} session {} stuck >{}ms in working — forcing Idle",
-            rec.provider.as_str(),
-            rec.session_id,
-            STALE_WORKING_TIMEOUT_MS
-        );
-        let _ = app.emit(SESSION_STATE_EVENT, &rec);
     }
 }
 
@@ -1477,153 +1406,6 @@ mod tests {
     fn pid_alive_zero_and_negative() {
         assert!(!pid_alive(0));
         assert!(!pid_alive(-1));
-    }
-
-    fn make_record(
-        provider: Provider,
-        session_id: &str,
-        status: SessionStatus,
-        updated_at_ms: u64,
-    ) -> SessionRecord {
-        SessionRecord {
-            provider,
-            session_id: session_id.to_string(),
-            cwd: "/tmp/x".to_string(),
-            status,
-            last_event: "UserPromptSubmit".to_string(),
-            last_tool: String::new(),
-            codex_process_id: None,
-            updated_at_ms,
-        }
-    }
-
-    /// The reported bug: a Claude session fires UserPromptSubmit (→ Working)
-    /// but `Stop` never arrives because the request died early ("Not
-    /// logged in · Please run /login"). Without staleness handling the
-    /// spinner sticks on forever. The watchdog must flag this session.
-    #[test]
-    fn stale_working_session_is_flagged() {
-        let mut sessions = std::collections::HashMap::new();
-        // Stuck Working session — updated 5 minutes ago.
-        let stuck_key = make_key(Provider::Claude, "stuck");
-        sessions.insert(
-            stuck_key.clone(),
-            make_record(Provider::Claude, "stuck", SessionStatus::Working, 1_000),
-        );
-        // Recently updated Working session — must NOT be flagged.
-        sessions.insert(
-            make_key(Provider::Claude, "fresh"),
-            make_record(
-                Provider::Claude,
-                "fresh",
-                SessionStatus::Working,
-                300_000 - 5_000, // 5s ago at now=300_000
-            ),
-        );
-        // Idle session, ancient — must NOT be flagged (not in Working).
-        sessions.insert(
-            make_key(Provider::Claude, "done"),
-            make_record(Provider::Claude, "done", SessionStatus::Idle, 1_000),
-        );
-
-        let now = 300_000_u64;
-        let stale = find_stale_working_keys(&sessions, now, STALE_WORKING_TIMEOUT_MS);
-
-        assert_eq!(stale, vec![stuck_key]);
-    }
-
-    /// Compacting is a working state for spinner purposes — same
-    /// timeout applies. A session stuck "compacting" (e.g. agent
-    /// crashed mid-summarization) should also unstick.
-    #[test]
-    fn stale_compacting_session_is_flagged() {
-        let mut sessions = std::collections::HashMap::new();
-        let key = make_key(Provider::Claude, "compact-stuck");
-        sessions.insert(
-            key.clone(),
-            make_record(
-                Provider::Claude,
-                "compact-stuck",
-                SessionStatus::Compacting,
-                0,
-            ),
-        );
-        let stale = find_stale_working_keys(&sessions, STALE_WORKING_TIMEOUT_MS + 1, STALE_WORKING_TIMEOUT_MS);
-        assert_eq!(stale, vec![key]);
-    }
-
-    /// Right at the boundary: updated_at == (now - threshold) is NOT
-    /// stale (the guard is strictly `>`). Avoids flapping when the
-    /// watchdog tick and the threshold align.
-    #[test]
-    fn working_at_exact_threshold_is_not_stale() {
-        let mut sessions = std::collections::HashMap::new();
-        let key = make_key(Provider::Claude, "boundary");
-        sessions.insert(
-            key,
-            make_record(
-                Provider::Claude,
-                "boundary",
-                SessionStatus::Working,
-                STALE_WORKING_TIMEOUT_MS,
-            ),
-        );
-        // now - updated = 90_000 - 90_000 = 0, exactly threshold.
-        let stale = find_stale_working_keys(
-            &sessions,
-            STALE_WORKING_TIMEOUT_MS * 2,
-            STALE_WORKING_TIMEOUT_MS,
-        );
-        // (90000*2) - 90000 = 90000 which is NOT > 90000.
-        assert_eq!(stale, Vec::<SessionKey>::new());
-
-        // One ms over the threshold IS stale.
-        let stale = find_stale_working_keys(
-            &sessions,
-            STALE_WORKING_TIMEOUT_MS * 2 + 1,
-            STALE_WORKING_TIMEOUT_MS,
-        );
-        assert_eq!(stale.len(), 1);
-    }
-
-    /// Waiting / Idle / Ended are never flagged as stale, regardless
-    /// of age. The spinner doesn't fire for those states so there's
-    /// nothing to fix; muting them would also drop legitimate
-    /// permission-prompt state.
-    #[test]
-    fn non_working_statuses_are_never_stale() {
-        let now = 1_000_000_u64;
-        for status in [
-            SessionStatus::Waiting,
-            SessionStatus::Idle,
-            SessionStatus::Ended,
-        ] {
-            let mut sessions = std::collections::HashMap::new();
-            sessions.insert(
-                make_key(Provider::Claude, "x"),
-                make_record(Provider::Claude, "x", status, 0),
-            );
-            let stale = find_stale_working_keys(&sessions, now, STALE_WORKING_TIMEOUT_MS);
-            assert!(
-                stale.is_empty(),
-                "status {:?} should not be flagged",
-                status
-            );
-        }
-    }
-
-    /// Underflow guard: an updated_at_ms larger than `now` (clock
-    /// skew, future-dated event) should NOT be flagged — saturating_sub
-    /// returns 0, which is < threshold.
-    #[test]
-    fn future_updated_at_is_not_stale() {
-        let mut sessions = std::collections::HashMap::new();
-        sessions.insert(
-            make_key(Provider::Claude, "future"),
-            make_record(Provider::Claude, "future", SessionStatus::Working, 1_000_000),
-        );
-        let stale = find_stale_working_keys(&sessions, 500_000, STALE_WORKING_TIMEOUT_MS);
-        assert!(stale.is_empty());
     }
 
     /* ---------- helper-agent envelope drop ---------- */

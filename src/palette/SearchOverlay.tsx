@@ -132,13 +132,21 @@ function SearchInner({ onClose }: { onClose: () => void }) {
   // Tauri promises landing out of order and the user sees old hits
   // overwrite new ones.
   const searchIdRef = useRef(0);
-  // Skills / MCPs are loaded once when the palette opens and cached
-  // for the life of this mount. The lists are small (dozens of items
-  // total) and don't change while the user is searching, so filtering
-  // happens client-side — no IPC per keystroke.
+  // Skills / MCPs are loaded LAZILY — only when the user first
+  // switches the palette into skills mode. Doing it on mount fires
+  // the macOS App Data Isolation popup every time the user opens
+  // ⌘K, because both `listSkills` and `listMcps` walk Claude.app's
+  // MACL-tagged `~/.claude/...` tree. Deferring until the user opts
+  // in keeps the file-picker / text / regex paths popup-free, and
+  // the Rust side caches the result so even subsequent skills-mode
+  // opens don't re-trigger the popup.
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const [mcps, setMcps] = useState<McpEntry[]>([]);
+  const skillsLoadedRef = useRef(false);
   useEffect(() => {
+    if (mode !== "skills") return;
+    if (skillsLoadedRef.current) return;
+    skillsLoadedRef.current = true;
     let cancelled = false;
     Promise.all([claudeConfig.listSkills(), claudeConfig.listMcps()])
       .then(([s, m]) => {
@@ -154,7 +162,7 @@ function SearchInner({ onClose }: { onClose: () => void }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [mode]);
 
   /**
    * Open the file behind a result row as a markdown tab in the active
