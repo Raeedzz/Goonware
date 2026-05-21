@@ -216,6 +216,12 @@ const FLAG_SELECTED = 8;
 export class GridRenderer {
   private device: GPUDevice;
   private context: GPUCanvasContext;
+  /**
+   * Preserved so `reconfigure()` can re-call `context.configure(...)`
+   * without re-querying the adapter. Critical for the visibility-
+   * restore path — see the doc on `reconfigure()` below.
+   */
+  private format: GPUTextureFormat;
   private atlas: Atlas;
   private pipeline: GPURenderPipeline;
   private bindGroup: GPUBindGroup;
@@ -236,6 +242,20 @@ export class GridRenderer {
    * caller is responsible for swapping in a fresh renderer anyway.
    */
   private lost = false;
+  /**
+   * Set when `getCurrentTexture()` throws inside `draw()`. The very
+   * next render call calls `reconfigure()` before attempting the draw
+   * again. Resets to false after a successful draw.
+   *
+   * Why: WKWebView can release the canvas's GPU surface during a
+   * `display: none` window without firing `device.lost` — the
+   * device is fine, but the swapchain is dead. The next paint
+   * after the canvas becomes visible again then throws inside
+   * `getCurrentTexture()`. Catching + reconfiguring lets the
+   * SECOND render attempt succeed without surfacing the error to
+   * the user.
+   */
+  private needsReconfigure = false;
 
   constructor(
     device: GPUDevice,
@@ -245,6 +265,7 @@ export class GridRenderer {
   ) {
     this.device = device;
     this.context = context;
+    this.format = format;
     this.atlas = atlas;
 
     const quadVerts = new Float32Array([
@@ -331,6 +352,50 @@ export class GridRenderer {
     });
   }
 
+  /**
+   * Re-call `context.configure(...)` so WKWebView re-acquires the
+   * canvas's GPU swapchain. This is the LOAD-BEARING fix for the
+   * black-screen-on-tab-switch class of bugs.
+   *
+   * Why this exists: `GPUCanvasContext.configure` was historically
+   * called once at bootstrap. macOS WKWebView is known to release
+   * the underlying GPU surface for canvases hosted under `display:
+   * none` views — without firing `device.lost`. From WebGPU's
+   * perspective the device is fine, but the swapchain is dead.
+   * `getCurrentTexture()` then returns a texture that draws nowhere
+   * and the user sees `var(--surface-0)` (effectively black) until
+   * the next call to `context.configure(...)`.
+   *
+   * Calling this on every hidden→visible transition forces the
+   * swapchain to be re-acquired against the live surface. Idempotent
+   * on a healthy surface (configure() on an already-configured
+   * context updates the descriptor without re-allocating), so it's
+   * safe to call defensively whenever in doubt.
+   *
+   * Also resets `lastSeq` so the next render bypasses dedupe — the
+   * new swapchain's first frame must paint or the user sees the
+   * cleared-black starting buffer.
+   */
+  reconfigure(): void {
+    if (this.lost) return;
+    try {
+      this.context.configure({
+        device: this.device,
+        format: this.format,
+        alphaMode: "premultiplied",
+      });
+      this.needsReconfigure = false;
+      this.lastSeq = -1;
+    } catch (err) {
+      // configure() can throw if the canvas is detached from the DOM
+      // or the context is already in a bad state. We can't do
+      // anything useful here — defer to the bootstrap rebuild path
+      // (CanvasGrid's epoch bump on persistent failure).
+      // eslint-disable-next-line no-console
+      console.warn("[GridRenderer] reconfigure failed:", err);
+    }
+  }
+
   resize(cssWidth: number, cssHeight: number, dpr: number): void {
     if (this.lost) return;
     // Compute physical (device) pixels from the CSS box.
@@ -362,6 +427,27 @@ export class GridRenderer {
     canvas.height = physHeight;
     canvas.style.width = `${physWidth / dpr}px`;
     canvas.style.height = `${physHeight / dpr}px`;
+    // Re-acquire the swapchain against the freshly-sized canvas.
+    // Without this, a resize that follows a `display: none` hide can
+    // succeed in CSS but still hit a dead GPU surface on the next
+    // getCurrentTexture() — exactly the "switch tabs → black pane"
+    // user report. configure() is idempotent on a healthy surface,
+    // so calling it on every resize is cheap insurance.
+    try {
+      this.context.configure({
+        device: this.device,
+        format: this.format,
+        alphaMode: "premultiplied",
+      });
+      this.needsReconfigure = false;
+    } catch (err) {
+      // Same fallback as in `reconfigure()` — if configure() throws
+      // we can't usefully recover from inside resize; flag for the
+      // next draw to retry.
+      this.needsReconfigure = true;
+      // eslint-disable-next-line no-console
+      console.warn("[GridRenderer] resize-time configure failed:", err);
+    }
     // Force the next render to repaint regardless of seq dedupe.
     this.lastSeq = -1;
   }
@@ -656,8 +742,38 @@ export class GridRenderer {
   }
 
   private draw(instanceCount: number): void {
+    // If the previous draw flagged a dead swapchain, reconfigure
+    // BEFORE attempting another getCurrentTexture(). Skipping the
+    // reconfigure would just re-throw and leave the canvas black.
+    if (this.needsReconfigure) {
+      this.reconfigure();
+    }
+    let view: GPUTextureView;
+    try {
+      view = this.context.getCurrentTexture().createView();
+    } catch (err) {
+      // The swapchain is dead. Reconfigure to acquire a new one and
+      // retry once. If THAT still fails, give up on this frame —
+      // the next ResizeObserver / visibility-restore tick will re-
+      // try. (The renderer is not "lost" — the device is fine; only
+      // the surface needs to be re-attached.)
+      this.needsReconfigure = true;
+      this.reconfigure();
+      try {
+        view = this.context.getCurrentTexture().createView();
+      } catch {
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[GridRenderer] getCurrentTexture failed twice; skipping frame:",
+          err,
+        );
+        // Force the next render to re-attempt (don't dedupe on the
+        // skipped seq).
+        this.lastSeq = -1;
+        return;
+      }
+    }
     const encoder = this.device.createCommandEncoder();
-    const view = this.context.getCurrentTexture().createView();
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {

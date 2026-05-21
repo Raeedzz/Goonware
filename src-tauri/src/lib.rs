@@ -228,6 +228,7 @@ pub fn run() {
             fs::system_open,
             fs::system_open_with,
             fs::system_save_image_to_temp,
+            fs::system_clipboard_read_text,
             // State persistence
             state::state_save,
             state::state_load,
@@ -703,6 +704,118 @@ mod clipboard_handler_gating_tests {
              4856c46 regression: Cmd+C/V silently breaks in the \
              active side terminal because hidden siblings race \
              every keystroke."
+        );
+    }
+
+    #[test]
+    fn pbpaste_fallback_command_is_registered() {
+        // The Ctrl+V fallback chain ends in a Tauri command that
+        // shells out to `/usr/bin/pbpaste`. macOS Sequoia silently
+        // returns "" from `navigator.clipboard.readText()` after a
+        // denied per-app clipboard prompt — Ctrl+V then no-ops in
+        // PromptInput / PtyPassthrough.
+        //
+        // The fallback ONLY works if (a) the command exists in
+        // fs.rs, and (b) lib.rs registers it in invoke_handler.
+        // Either gap on its own re-introduces the bug. Pin both
+        // points here so a future commit dropping either of them
+        // flunks `cargo test --lib`.
+        let fs_rs = read_repo_file("src-tauri/src/fs.rs");
+        assert!(
+            fs_rs.contains("pub async fn system_clipboard_read_text"),
+            "src-tauri/src/fs.rs must declare a `system_clipboard_read_text` \
+             #[tauri::command] — that's the pbpaste fallback the Ctrl+V \
+             handlers in PromptInput.tsx / PtyPassthrough.tsx call when \
+             navigator.clipboard.readText() silently returns \"\" on \
+             macOS Sequoia. Without this command, Ctrl+V silently breaks."
+        );
+        assert!(
+            fs_rs.contains("Command::new(\"/usr/bin/pbpaste\")"),
+            "system_clipboard_read_text must shell out to the absolute \
+             path `/usr/bin/pbpaste`. A bare `pbpaste` would ENOENT when \
+             Goonware is launched from the Dock with a stripped PATH — \
+             see inherit_login_shell_env() in lib.rs for the same gotcha \
+             on the spawned-PTY side."
+        );
+        let lib_rs = read_repo_file("src-tauri/src/lib.rs");
+        assert!(
+            lib_rs.contains("fs::system_clipboard_read_text"),
+            "lib.rs invoke_handler must register \
+             `fs::system_clipboard_read_text` or the frontend's \
+             invoke(\"system_clipboard_read_text\") rejects with \
+             \"command not found\" and the fallback returns null — \
+             Ctrl+V silently no-ops again."
+        );
+    }
+
+    #[test]
+    fn canvas_grid_visibility_restore_is_wired() {
+        // The black-screen fix chain. The user reports the screen
+        // going black:
+        //   - On `/model` selection inside Claude
+        //   - On switching to editor / diff / markdown and back
+        //   - On worktree switch
+        //   - Randomly mid-prompt-stream
+        //
+        // Root cause (memory observation 650): WKWebView releases
+        // the GPU swapchain for `display: none`-hosted canvases
+        // without firing `device.lost`. The fix is a multi-layer
+        // visibility-restore that re-calls `context.configure(...)`
+        // on hidden→visible and on resize. These grep-tests pin
+        // every load-bearing piece.
+        let grid_renderer =
+            read_repo_file("src/terminal/gpu/GridRenderer.ts");
+        assert!(
+            grid_renderer.contains("reconfigure(): void"),
+            "GridRenderer must expose a `reconfigure()` method that \
+             re-calls context.configure(...). Without it, a canvas \
+             hidden under `display: none` never recovers its GPU \
+             swapchain when the user comes back — the entire pane \
+             stays black."
+        );
+        // The configure call must include `alphaMode` so a future
+        // descriptor change can't silently break transparency
+        // handling.
+        assert!(
+            grid_renderer.contains("alphaMode: \"premultiplied\""),
+            "GridRenderer.reconfigure / resize must pass \
+             `alphaMode: \"premultiplied\"` to context.configure — \
+             matches the bootstrap descriptor exactly so the \
+             swapchain shape doesn't change between configures."
+        );
+        let canvas_grid = read_repo_file("src/terminal/CanvasGrid.tsx");
+        assert!(
+            canvas_grid.contains("renderer.reconfigure()"),
+            "CanvasGrid must call `renderer.reconfigure()` on the \
+             hidden→visible transition. The visibility-restore state \
+             machine in gpu/visibilityRestore.ts encodes the call \
+             order (reconfigure → resize → invalidate → paint) — drop \
+             the reconfigure and the visibility-restore lands on a \
+             dead surface."
+        );
+        // Pin the ResizeObserver 0×0 bail. Without it, the keepalive's
+        // display:none transition shrinks the GPU backbuffer to 1×1
+        // physical pixels — and the next show can't recover because
+        // the canvas's CSS style.width/height was also clobbered to
+        // ~0.5 CSS px.
+        assert!(
+            canvas_grid.contains("rect.width === 0 || rect.height === 0"),
+            "CanvasGrid's ResizeObserver must bail on a 0×0 contentRect. \
+             Without this guard, `display: none` shrinks the renderer \
+             backbuffer to 1×1 and the next visibility tick paints \
+             into a tiny surface — black pane."
+        );
+        let visibility_restore =
+            read_repo_file("src/terminal/gpu/visibilityRestore.ts");
+        assert!(
+            visibility_restore.contains("decideVisibilityAction")
+                && visibility_restore.contains("executeVisibilityAction"),
+            "gpu/visibilityRestore.ts must export BOTH \
+             `decideVisibilityAction` and `executeVisibilityAction`. \
+             The exhaustive unit tests in \
+             gpu/visibilityRestore.test.ts only protect the contract \
+             if these exports exist — a refactor that inlines them \
+             back into CanvasGrid silently bypasses every test."
         );
     }
 

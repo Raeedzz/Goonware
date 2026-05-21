@@ -10,6 +10,7 @@ import {
 } from "react";
 import { fs, system, type DirEntry } from "@/lib/fs";
 import { shellQuotePath } from "@/lib/shellQuote";
+import { readClipboardTextWithFallback } from "./clipboardRead";
 import { decideCtrlCAction } from "./ctrlCEscalation";
 
 export interface PromptInputHandle {
@@ -597,8 +598,18 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
       // already routes through the textarea's onPaste handler (the
       // OS synthesizes a paste event), but ⌃V does not — it would
       // otherwise bubble out as a global-chord miss and do nothing.
-      // Read the clipboard and splice in at the caret. Multi-line
-      // payloads route through onPaste so bracketed-paste fires.
+      //
+      // Multi-layer clipboard read (see clipboardRead.ts): the web
+      // `navigator.clipboard.readText()` path silently returns ""
+      // on macOS Sequoia after the user declines the per-app
+      // clipboard-read prompt — which is the user-reported "Ctrl+V
+      // does nothing" symptom. The fallback shells out to
+      // `/usr/bin/pbpaste` via a Tauri command so the read survives
+      // a denied WebKit-level prompt.
+      //
+      // Multi-line payloads route through onPaste so bracketed-paste
+      // fires (zsh's line editor strips OSC 200/201 markers and
+      // treats the inner text literally — no auto-execute on \n).
       if (
         e.ctrlKey &&
         !e.metaKey &&
@@ -607,27 +618,32 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
         e.key.toLowerCase() === "v"
       ) {
         e.preventDefault();
+        // Snapshot caret + value BEFORE the async clipboard read so
+        // the splice point doesn't drift if the user kept typing
+        // (rare, but spawning pbpaste is ~5–20 ms — long enough for
+        // a stray keystroke to land between preventDefault and the
+        // paste landing).
+        const ta = textareaRef.current;
+        const snapshotStart = ta?.selectionStart ?? value.length;
+        const snapshotEnd = ta?.selectionEnd ?? value.length;
+        const snapshotValue = value;
         void (async () => {
-          try {
-            const text = await navigator.clipboard.readText();
-            if (text.length === 0) return;
-            if (text.includes("\n") && onPaste) {
-              onPaste(text);
-              return;
-            }
-            const ta = textareaRef.current;
-            const start = ta?.selectionStart ?? value.length;
-            const end = ta?.selectionEnd ?? value.length;
-            const next = value.slice(0, start) + text + value.slice(end);
-            setValue(next);
-            requestAnimationFrame(() => {
-              const el = textareaRef.current;
-              if (!el) return;
-              el.selectionStart = el.selectionEnd = start + text.length;
-            });
-          } catch {
-            // Clipboard access denied — silently no-op.
+          const text = await readClipboardTextWithFallback();
+          if (text === null || text.length === 0) return;
+          if (text.includes("\n") && onPaste) {
+            onPaste(text);
+            return;
           }
+          const next =
+            snapshotValue.slice(0, snapshotStart) +
+            text +
+            snapshotValue.slice(snapshotEnd);
+          setValue(next);
+          requestAnimationFrame(() => {
+            const el = textareaRef.current;
+            if (!el) return;
+            el.selectionStart = el.selectionEnd = snapshotStart + text.length;
+          });
         })();
         return;
       }

@@ -33,6 +33,13 @@ interface Props {
    * (`preserveGrid`/`fill`), which already runs grid-mode no-wrap.
    */
   noWrap?: boolean;
+  /**
+   * Forwarded to the embedded CanvasGrid so it can rebuild / repaint
+   * on the keepalive layer's `display: none → flex` transition. See
+   * the doc on `CanvasGrid.Props.isVisible` for the WKWebView surface-
+   * release dance this works around. Defaults to true.
+   */
+  isVisible?: boolean;
 }
 
 /**
@@ -102,6 +109,7 @@ export function LiveBlock({
   cwd,
   preserveGrid = false,
   noWrap = false,
+  isVisible = true,
 }: Props) {
   const visibleRows = useMemo(() => {
     if (!frame) return [];
@@ -328,6 +336,7 @@ export function LiveBlock({
               rows={combinedRows}
               mode="auto"
               firstRowOffset={firstRowOffset}
+              isVisible={isVisible}
             />
           ) : (
             combinedRows.map((row) => (

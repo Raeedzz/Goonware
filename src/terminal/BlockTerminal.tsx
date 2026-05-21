@@ -1349,8 +1349,19 @@ export function BlockTerminal({
         // two paths invited drift bugs. The `autoFocus` prop isn't
         // forwarded because CanvasGrid manages its own focus through
         // the hidden textarea overlay.
+        //
+        // `isVisible` IS forwarded — when this terminal is hidden by
+        // the keepalive layer (display: none), the canvas needs to
+        // skip ResizeObserver-driven 0×0 resizes and force a fresh
+        // paint when it comes back, or the alt-screen picker /
+        // model selector lands on a black surface. See
+        // `CanvasGrid.Props.isVisible` for the full rationale.
         <div style={{ flex: 1, minHeight: 0 }}>
-          <CanvasGrid frame={liveFrame} onSendBytes={sendBytes} />
+          <CanvasGrid
+            frame={liveFrame}
+            onSendBytes={sendBytes}
+            isVisible={isVisible}
+          />
         </div>
       )}
 
@@ -1428,6 +1439,11 @@ export function BlockTerminal({
                 // first row at the visible top edge — what users mean
                 // by "I want to see what I'm picking."
                 fill={foregroundIsAgent}
+                // Forwarded so the embedded CanvasGrid can rebuild /
+                // repaint on tab-switch (display: none → display:
+                // flex). See CanvasGrid.Props.isVisible for the
+                // WKWebView GPU-surface-release dance this guards.
+                isVisible={isVisible}
               />
             )}
           </div>
