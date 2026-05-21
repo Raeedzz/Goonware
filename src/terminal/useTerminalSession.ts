@@ -10,6 +10,7 @@ import {
   getExited,
   getLiveFrame,
   getRows,
+  getScrollback,
   setAltScreen as memSetAltScreen,
   setBellTick as memSetBellTick,
   setBlocks as memSetBlocks,
@@ -17,6 +18,7 @@ import {
   setExited as memSetExited,
   setLiveFrame as memSetLiveFrame,
   setRows as memSetRows,
+  setScrollback as memSetScrollback,
 } from "./sessionMemory";
 import type {
   Block,
@@ -124,6 +126,14 @@ export function useTerminalSession(opts: Args): SessionApi {
   // mutate it in place on each frame and shallow-copy into
   // liveFrame.dirty for React. Memory holds the canonical copy.
   const rowsRef = useRef<Span[][]>(getRows(opts.id));
+  // Append-only buffer of rows that have scrolled out of the visible
+  // grid into PTY scrollback (oldest first). Each frame's
+  // `scrollback_appended` is pushed onto the tail; `scrollback_reset`
+  // wipes and replaces. Persists across remounts via session memory so
+  // a tab-switch round-trip doesn't lose agent history. This is what
+  // lets the user scroll back through everything the agent has written,
+  // not just whatever currently fits in the PTY's visible grid.
+  const scrollbackRowsRef = useRef<Span[][]>(getScrollback(opts.id));
   // Latest frame metadata (cursor + alt-screen flag).
   const lastFrameRef = useRef<RenderFrame | null>(getLiveFrame(opts.id));
   // FIFO of commands the user has submitted via sendLine but whose
@@ -191,13 +201,36 @@ export function useTerminalSession(opts: Args): SessionApi {
       for (let i = 0; i < rows.length; i++) {
         allDirty[i] = { row: i, spans: rows[i] };
       }
-      const merged: RenderFrame = { ...frame, dirty: allDirty };
+      // Pack scrollback rows into the merged frame so LiveBlock /
+      // CanvasGrid can concatenate them above the visible grid. The
+      // array is a fresh wrapper each flush (slice) so React's identity
+      // check sees a change; the inner Span[] entries stay shared with
+      // scrollbackRowsRef, which is fine because they're never mutated
+      // after being appended (alacritty freezes scrollback rows once
+      // they leave the visible grid).
+      const scrollbackRows = scrollbackRowsRef.current;
+      const scrollback: DirtyRow[] = new Array(scrollbackRows.length);
+      for (let i = 0; i < scrollbackRows.length; i++) {
+        scrollback[i] = { row: i, spans: scrollbackRows[i] };
+      }
+      const merged: RenderFrame = {
+        ...frame,
+        dirty: allDirty,
+        // Re-pack so consumers can read the canonical scrollback off
+        // `liveFrame.scrollback_appended` regardless of whether the
+        // backend frame carried a per-frame delta or not. The original
+        // wire field semantic (delta-only) ends at the onFrame handler
+        // — past that point it means "full scrollback for rendering".
+        scrollback_appended: scrollback,
+        scrollback_reset: false,
+      };
       lastFrameRef.current = merged;
       setAltScreen(frame.alt_screen);
       memSetAltScreen(opts.id, frame.alt_screen);
       setLiveFrame(merged);
       memSetLiveFrame(opts.id, merged);
       memSetRows(opts.id, rows);
+      memSetScrollback(opts.id, scrollbackRows);
     };
 
     // Expose the flush trigger to the outer visibility-flip effect.
@@ -218,6 +251,21 @@ export function useTerminalSession(opts: Args): SessionApi {
       while (rows.length > frame.rows) rows.pop();
       for (const dr of frame.dirty as DirtyRow[]) {
         rows[dr.row] = dr.spans;
+      }
+      // Apply the per-frame scrollback delta. The backend ships rows
+      // that just left the visible grid since the previous flush —
+      // append them to scrollbackRowsRef in temporal order. On
+      // `scrollback_reset` (term_start re-emit, or history shrunk
+      // server-side via resize-evict / Ctrl+L clear-saved), drop the
+      // local mirror first so we don't end up with duplicates or stale
+      // rows interleaved with the fresh sync.
+      const appended = frame.scrollback_appended ?? [];
+      if (frame.scrollback_reset) {
+        scrollbackRowsRef.current = appended.map((dr) => dr.spans);
+      } else if (appended.length > 0) {
+        const next = scrollbackRowsRef.current.slice();
+        for (const dr of appended) next.push(dr.spans);
+        scrollbackRowsRef.current = next;
       }
       // Latest frame wins. If multiple events arrive before the next
       // paint, the rAF flush sees only the most recent metadata
