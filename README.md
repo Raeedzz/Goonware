@@ -1,4 +1,4 @@
-# GLI
+# Goonware
 
 **GPU-accelerated terminal for running CLI coding agents in parallel.**
 
@@ -27,7 +27,7 @@ A native macOS app for orchestrating CLI coding agents the way you already think
 The signed macOS build lives at **[goonware.dev](https://goonware.dev)** — one click, drag to `/Applications`, done. The same DMG is served directly from GitHub at:
 
 ```
-https://github.com/Raeedzz/GLI/releases/latest/download/Goonware.dmg
+https://github.com/Raeedzz/Goonware/releases/latest/download/Goonware.dmg
 ```
 
 Apple Silicon and Intel are bundled into a single universal binary. First launch may show a Gatekeeper prompt while notarization rolls in.
@@ -44,14 +44,14 @@ Apple Silicon and Intel are bundled into a single universal binary. First launch
 **Build**
 
 ```bash
-git clone https://github.com/Raeedzz/GLI.git
-cd GLI
+git clone https://github.com/Raeedzz/Goonware.git
+cd Goonware
 bun install
 bun run tauri:dev      # dev with HMR
 bun run tauri:build    # production .app
 ```
 
-The bundle lands at `src-tauri/target/release/bundle/macos/GLI.app`.
+The bundle lands at `src-tauri/target/release/bundle/macos/Goonware.app`.
 
 **First run**
 
@@ -114,7 +114,7 @@ v1 keymap is fixed. No remapping.
 
 ## Per-project memory + multi-agent coordination
 
-GLI installs `rli-memory` to `~/.local/bin/` on first launch. Inside any pane:
+Goonware installs `rli-memory` to `~/.local/bin/` on first launch. Inside any pane:
 
 - `rli-memory add "<fact>"` — persist a project fact (auto-deduped).
 - `rli-memory recall "<query>"` — search this project's memory.
@@ -161,10 +161,10 @@ docs/                 Design notes, motion guidelines
 
 ## Storage paths (macOS)
 
-- App data: `~/Library/Application Support/GLI/`
-  - `gli.db` — SQLite (sessions, memory, settings cache)
+- App data: `~/Library/Application Support/Goonware/`
+  - `goonware.db` — SQLite (sessions, memory, settings cache)
   - `config.toml` — hand-editable settings
-- Logs: `~/Library/Logs/GLI/gli.log` (rotated at 10 MB)
+- Logs: `~/Library/Logs/Goonware/goonware.log` (rotated at 10 MB)
 - Worktrees: `<project>/.rli/sessions/<slug>` (gitignored automatically)
 - Secrets: macOS Keychain (Gemini API key only)
 

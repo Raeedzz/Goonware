@@ -21,7 +21,7 @@
 //!                     iteration and arithmetic; meaningless across
 //!                     sessions because blocks can be evicted.
 //!
-//! GLI's existing `term.rs` uses raw `u64` for the "active block id"
+//! Goonware's existing `term.rs` uses raw `u64` for the "active block id"
 //! (in the per-prompt counter sense). This module introduces the
 //! richer typed shape for use by future code paths; the legacy `u64`
 //! stays alive until the FlatStorage wiring is in place.

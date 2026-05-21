@@ -15,7 +15,7 @@
 //!     coalesces instead of overwhelming the IPC channel.
 //!   * `BlockSegmenter` scans the raw byte stream (parallel to VTE) for
 //!     OSC 133 prompt markers AND for Warp-style DCS hooks of the form
-//!     `ESC P gli ; <hook_name> ; <json_payload> ESC \`. The DCS hooks
+//!     `ESC P goonware ; <hook_name> ; <json_payload> ESC \`. The DCS hooks
 //!     carry richer metadata (the exact typed command, precise start
 //!     timestamp, exact exit code + duration as measured by the shell)
 //!     that enrich the resulting `ClosedBlock`. OSC 133 stays as the
@@ -49,7 +49,7 @@ use tauri::{AppHandle, Emitter, Manager, State, Wry};
 
 const SCROLLBACK_LIMIT: usize = 10_000;
 /// Frame throttle while the session is visible to the user AND the
-/// GLI window has focus. 8 ms ≈ one frame at 120 Hz, matching the
+/// Goonware window has focus. 8 ms ≈ one frame at 120 Hz, matching the
 /// MacBook Pro / Pro Display XDR ProMotion refresh rate. On non-
 /// ProMotion 60 Hz displays the compositor coalesces back to 60 fps
 /// automatically, so the higher cap is free for those users —
@@ -57,7 +57,7 @@ const SCROLLBACK_LIMIT: usize = 10_000;
 /// for sudden burst output to land in fewer coalesced frames.
 const FRAME_THROTTLE_VISIBLE: Duration = Duration::from_millis(8);
 /// Frame throttle while the session is currently NOT shown anywhere
-/// in the UI but the GLI window is otherwise focused. Kept close to
+/// in the UI but the Goonware window is otherwise focused. Kept close to
 /// the visible cadence (32 ms ≈ 30 Hz) so that a worktree-switch
 /// race between the user starting to type and `term_set_visible_set`
 /// landing on the backend doesn't introduce a perceptible delay
@@ -65,7 +65,7 @@ const FRAME_THROTTLE_VISIBLE: Duration = Duration::from_millis(8);
 /// The previous 250 ms value visibly stalled the first 1–2 frames
 /// after every switch.
 const FRAME_THROTTLE_HIDDEN: Duration = Duration::from_millis(32);
-/// Frame throttle while the GLI window is BACKGROUNDED (user is on
+/// Frame throttle while the Goonware window is BACKGROUNDED (user is on
 /// another app). The webview's JS context is suspended by macOS, so
 /// every event we emit just queues in V8's message buffer until the
 /// user comes back — and then JS has to drain the entire backlog
@@ -75,7 +75,7 @@ const FRAME_THROTTLE_HIDDEN: Duration = Duration::from_millis(32);
 /// per-session visibility flag.
 const FRAME_THROTTLE_UNFOCUSED: Duration = Duration::from_millis(1000);
 
-/// True when the GLI main window currently has user focus. Updated
+/// True when the Goonware main window currently has user focus. Updated
 /// from the window event listener in `lib.rs`. Defaults to true so
 /// cold-start (before any focus events have fired) runs at full
 /// cadence.
@@ -257,7 +257,7 @@ struct Session {
    We forward only what the frontend actually does something with.
    ------------------------------------------------------------------ */
 
-// Locked to `Wry` (Tauri's desktop runtime). GLI is macOS-desktop-only,
+// Locked to `Wry` (Tauri's desktop runtime). Goonware is macOS-desktop-only,
 // so we trade the generics for a much simpler `Session` type definition
 // — `Session` doesn't have to thread `R` through every field.
 #[derive(Clone)]
@@ -478,9 +478,9 @@ struct BlockSegmenter {
     in_osc: bool,
     /// Active DCS-sequence assembly buffer. DCS opens with `ESC P` and
     /// closes with `ESC \` (ST) — same terminator family as OSC. We
-    /// only act on DCS payloads with the `gli;` prefix; anything else
+    /// only act on DCS payloads with the `goonware;` prefix; anything else
     /// (terminfo definitions, tmux passthrough, etc.) is silently
-    /// dropped so the segmenter remains a no-op for non-GLI tooling.
+    /// dropped so the segmenter remains a no-op for non-Goonware tooling.
     dcs_buf: Vec<u8>,
     in_dcs: bool,
     current_input: String,
@@ -758,7 +758,7 @@ impl BlockSegmenter {
     }
 
     /// Parse the most recently accumulated DCS payload. Recognised
-    /// shape: `gli;<hook>;<json>` where `<hook>` is one of `preexec`,
+    /// shape: `goonware;<hook>;<json>` where `<hook>` is one of `preexec`,
     /// `cmd_finished`, `bootstrapped`. Anything else (terminfo capability
     /// payloads, tmux passthrough wrappers, etc.) is silently dropped.
     ///
@@ -773,7 +773,7 @@ impl BlockSegmenter {
         let buf = &self.dcs_buf;
         // Cheap-prefix check before invoking serde_json on every random
         // DCS payload some other process might emit through the PTY.
-        const PREFIX: &[u8] = b"gli;";
+        const PREFIX: &[u8] = b"goonware;";
         if !buf.starts_with(PREFIX) {
             return;
         }
@@ -1482,23 +1482,23 @@ fn diff_rows(prev: &[RowSnapshot], next: &[RowSnapshot]) -> Vec<DirtyRow> {
    prompt that duplicated our breadcrumb pill bar.
    ------------------------------------------------------------------ */
 
-const ZSH_INTEGRATION: &str = r#"# GLI shell integration — auto-generated, do not edit.
+const ZSH_INTEGRATION: &str = r#"# Goonware shell integration — auto-generated, do not edit.
 # Sources the user's real configuration first, then installs OSC 133
 # semantic-prompt markers + OSC 7 cwd reporting + Warp-style DCS hooks
 # carrying richer command metadata + an empty PROMPT. The empty PROMPT
-# is intentional: GLI's chrome already shows folder / branch / diff in
+# is intentional: Goonware's chrome already shows folder / branch / diff in
 # a pill row above the input, so the shell's own host@machine cwd %
 # line would just duplicate that and eat vertical space inside every
 # closed block.
 
 # Save the integration ZDOTDIR before any user config can clobber it.
-GLI_INTEGRATION_DIR="$ZDOTDIR"
+GOONWARE_INTEGRATION_DIR="$ZDOTDIR"
 
 # Restore the original ZDOTDIR (or fall back to HOME) so the user's
 # real .zshrc and the rest of zsh's config files (.zlogin, .zprofile,
 # etc.) load from where the user keeps them.
-if [ -n "$GLI_USER_ZDOTDIR" ]; then
-    export ZDOTDIR="$GLI_USER_ZDOTDIR"
+if [ -n "$GOONWARE_USER_ZDOTDIR" ]; then
+    export ZDOTDIR="$GOONWARE_USER_ZDOTDIR"
 elif [ -n "$ZDOTDIR" ]; then
     unset ZDOTDIR
 fi
@@ -1514,7 +1514,7 @@ fi
 # (jq, python) because (a) jq isn't guaranteed to be installed and
 # (b) the precmd / preexec path runs around every prompt and a subshell
 # round-trip adds visible latency.
-_gli_json_escape() {
+_goonware_json_escape() {
     local s="$1"
     s="${s//\\/\\\\}"
     s="${s//\"/\\\"}"
@@ -1527,7 +1527,7 @@ _gli_json_escape() {
 # Wall-clock milliseconds. zsh's $EPOCHREALTIME (e.g. "1700000000.123")
 # requires the zsh/datetime module which is bundled with every modern
 # zsh build but we still fall back to `date +%s000` for paranoia.
-_gli_now_ms() {
+_goonware_now_ms() {
     if [[ -n "$EPOCHREALTIME" ]]; then
         # Truncate fractional seconds to ms (3 digits).
         printf '%s' "${EPOCHREALTIME//./}" | cut -c1-13
@@ -1548,22 +1548,22 @@ zmodload zsh/datetime 2>/dev/null
 # than fishing it out of the byte stream.
 #
 # DCS hooks — Warp-style enriched lifecycle events. Wire format:
-#   ESC P gli ; <hook> ; <json> ESC \
+#   ESC P goonware ; <hook> ; <json> ESC \
 # Fired alongside OSC 133 so a session whose Rust side speaks only
 # OSC 133 still segments correctly, and a session that speaks both
 # gets the richer metadata. The hooks ARE ordered relative to the OSC
 # markers:
 #   preexec:      before OSC 133 C  → carries the user's command + start_ms
 #   cmd_finished: before OSC 133 D  → carries exact exit + duration
-_gli_precmd() {
+_goonware_precmd() {
     local _exit=$?
-    local _now_ms="$(_gli_now_ms)"
+    local _now_ms="$(_goonware_now_ms)"
     local _duration_ms=0
-    if [[ -n "$_GLI_BLOCK_START_MS" ]]; then
-        _duration_ms=$(( _now_ms - _GLI_BLOCK_START_MS ))
-        unset _GLI_BLOCK_START_MS
+    if [[ -n "$_GOONWARE_BLOCK_START_MS" ]]; then
+        _duration_ms=$(( _now_ms - _GOONWARE_BLOCK_START_MS ))
+        unset _GOONWARE_BLOCK_START_MS
     fi
-    printf '\eP'"gli;cmd_finished;{\"exit_code\":%d,\"duration_ms\":%d}"'\e\\' \
+    printf '\eP'"goonware;cmd_finished;{\"exit_code\":%d,\"duration_ms\":%d}"'\e\\' \
         "$_exit" "$_duration_ms"
     print -Pn "\e]133;D;${_exit}\a"
     print -Pn "\e]133;A\a"
@@ -1574,39 +1574,39 @@ _gli_precmd() {
     PROMPT=''
     RPROMPT=''
 }
-_gli_preexec() {
+_goonware_preexec() {
     # `$1` is the unexpanded command line as the user typed it. zsh's
     # preexec callback signature: preexec <typed> <expanded> <fullhist>.
     local _cmd="$1"
-    local _now_ms="$(_gli_now_ms)"
-    export _GLI_BLOCK_START_MS="$_now_ms"
-    printf '\eP'"gli;preexec;{\"command\":\"%s\",\"start_ms\":%s}"'\e\\' \
-        "$(_gli_json_escape "$_cmd")" "$_now_ms"
+    local _now_ms="$(_goonware_now_ms)"
+    export _GOONWARE_BLOCK_START_MS="$_now_ms"
+    printf '\eP'"goonware;preexec;{\"command\":\"%s\",\"start_ms\":%s}"'\e\\' \
+        "$(_goonware_json_escape "$_cmd")" "$_now_ms"
     print -Pn "\e]133;C\a"
 }
 
 # OSC 7 cwd reporting. Emitted on shell startup and on every cd, so
 # the chrome's folder pill tracks the *live* terminal cwd instead of
 # only the launch cwd.
-_gli_chpwd() {
+_goonware_chpwd() {
     print -Pn "\e]7;file://%m%d\a"
 }
 
 typeset -ag precmd_functions
 typeset -ag preexec_functions
 typeset -ag chpwd_functions
-precmd_functions+=(_gli_precmd)
-preexec_functions+=(_gli_preexec)
-chpwd_functions+=(_gli_chpwd)
+precmd_functions+=(_goonware_precmd)
+preexec_functions+=(_goonware_preexec)
+chpwd_functions+=(_goonware_chpwd)
 
 # One-shot startup hook — surfaces shell type + pid to the Rust side
 # for future capability negotiation (Phase 2+). The Rust segmenter
 # parses this but doesn't act on it yet, so it's harmless if unread.
-printf '\eP'"gli;bootstrapped;{\"shell\":\"zsh\",\"shell_pid\":%d,\"version\":\"1\"}"'\e\\' "$$"
+printf '\eP'"goonware;bootstrapped;{\"shell\":\"zsh\",\"shell_pid\":%d,\"version\":\"1\"}"'\e\\' "$$"
 
 # Initial cwd report — fires once at startup so the pill shows the
 # launch directory before any cd happens.
-_gli_chpwd
+_goonware_chpwd
 
 # Initial PROMPT wipe — covers the very first prompt drawn before
 # any precmd runs.
@@ -1640,7 +1640,7 @@ fn ensure_zsh_integration_dir(app: &AppHandle<Wry>) -> Result<PathBuf, String> {
    firing on every subshell inside the user's command.
    ------------------------------------------------------------------ */
 
-const BASH_INTEGRATION: &str = r#"# GLI shell integration for bash — auto-generated, do not edit.
+const BASH_INTEGRATION: &str = r#"# Goonware shell integration for bash — auto-generated, do not edit.
 # Loaded via `bash --rcfile <this-file>`. We source the user's real
 # .bashrc first so their aliases / completions / PATH all still work,
 # then install OSC 133 segmentation markers + Warp-style DCS hooks.
@@ -1656,7 +1656,7 @@ fi
 # JSON-escape a string for DCS payload bodies. Same logic as the zsh
 # version; bash's parameter expansion is close enough that the body
 # is identical.
-_gli_json_escape() {
+_goonware_json_escape() {
     local s="$1"
     s="${s//\\/\\\\}"
     s="${s//\"/\\\"}"
@@ -1669,7 +1669,7 @@ _gli_json_escape() {
 # Wall-clock milliseconds. Bash 5+ has $EPOCHREALTIME natively; older
 # bash falls back to `date +%s%3N` on Linux or `date +%s000` on macOS
 # where date doesn't support %N.
-_gli_now_ms() {
+_goonware_now_ms() {
     if [[ -n "${EPOCHREALTIME-}" ]]; then
         local sec="${EPOCHREALTIME%.*}"
         local frac="${EPOCHREALTIME#*.}"
@@ -1692,50 +1692,50 @@ _gli_now_ms() {
 # without the flag guard the trap fires inside every subshell of every
 # pipeline (e.g. `ls | grep x` would emit two preexec markers, one for
 # each side of the pipe).
-_gli_preexec_armed=0
-_gli_preexec() {
-    if [[ "$_gli_preexec_armed" != "1" ]]; then return; fi
-    _gli_preexec_armed=0
+_goonware_preexec_armed=0
+_goonware_preexec() {
+    if [[ "$_goonware_preexec_armed" != "1" ]]; then return; fi
+    _goonware_preexec_armed=0
     # BASH_COMMAND holds the command about to run. For pipelines bash
     # invokes the trap with the leftmost command; that's a reasonable
     # approximation of "the line the user typed" for display purposes.
     local _cmd="${BASH_COMMAND:-}"
     local _now_ms
-    _now_ms="$(_gli_now_ms)"
-    export _GLI_BLOCK_START_MS="$_now_ms"
-    printf '\eP''gli;preexec;{"command":"%s","start_ms":%s}''\e\\' \
-        "$(_gli_json_escape "$_cmd")" "$_now_ms"
+    _now_ms="$(_goonware_now_ms)"
+    export _GOONWARE_BLOCK_START_MS="$_now_ms"
+    printf '\eP''goonware;preexec;{"command":"%s","start_ms":%s}''\e\\' \
+        "$(_goonware_json_escape "$_cmd")" "$_now_ms"
     printf '\e]133;C\a'
 }
-trap '_gli_preexec' DEBUG
+trap '_goonware_preexec' DEBUG
 
 # precmd via PROMPT_COMMAND. We chain ourselves AFTER whatever the
 # user already had so their setup (e.g. `__git_ps1`, history sync)
 # runs first; if it overwrote PS1, we silence it below.
-_gli_precmd() {
+_goonware_precmd() {
     local _exit=$?
     local _now_ms
-    _now_ms="$(_gli_now_ms)"
+    _now_ms="$(_goonware_now_ms)"
     local _duration_ms=0
-    if [[ -n "${_GLI_BLOCK_START_MS-}" ]]; then
-        _duration_ms=$(( _now_ms - _GLI_BLOCK_START_MS ))
-        unset _GLI_BLOCK_START_MS
+    if [[ -n "${_GOONWARE_BLOCK_START_MS-}" ]]; then
+        _duration_ms=$(( _now_ms - _GOONWARE_BLOCK_START_MS ))
+        unset _GOONWARE_BLOCK_START_MS
     fi
-    printf '\eP''gli;cmd_finished;{"exit_code":%d,"duration_ms":%d}''\e\\' \
+    printf '\eP''goonware;cmd_finished;{"exit_code":%d,"duration_ms":%d}''\e\\' \
         "$_exit" "$_duration_ms"
     printf '\e]133;D;%d\a' "$_exit"
     printf '\e]133;A\a'
-    # GLI's chrome shows folder + branch above the input; silence the
+    # Goonware's chrome shows folder + branch above the input; silence the
     # shell's own prompt so the block doesn't duplicate that line.
     PS1=''
     PS2=''
     # Re-arm the preexec trap for the next command.
-    _gli_preexec_armed=1
+    _goonware_preexec_armed=1
 }
 
 # OSC 7 cwd reporting via PROMPT_COMMAND wrapping. Bash doesn't have
 # a chpwd hook, so we emit on every prompt — cheap (printf to PTY).
-_gli_chpwd_emit() {
+_goonware_chpwd_emit() {
     printf '\e]7;file://%s%s\a' "$HOSTNAME" "$PWD"
 }
 
@@ -1747,18 +1747,18 @@ if [[ "${BASH_VERSINFO[0]}" -ge 5 && "${BASH_VERSINFO[1]}" -ge 1 ]] 2>/dev/null;
         # Convert scalar to array preserving the existing value.
         PROMPT_COMMAND=("${PROMPT_COMMAND-}")
     fi
-    PROMPT_COMMAND+=('_gli_chpwd_emit' '_gli_precmd')
+    PROMPT_COMMAND+=('_goonware_chpwd_emit' '_goonware_precmd')
 else
-    PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND}$'\n'}_gli_chpwd_emit; _gli_precmd"
+    PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND}$'\n'}_goonware_chpwd_emit; _goonware_precmd"
 fi
 
 # Bootstrapped hook + initial cwd emit so the chrome has data before
 # the user's first command.
-printf '\eP''gli;bootstrapped;{"shell":"bash","shell_pid":%d,"version":"1"}''\e\\' "$$"
-_gli_chpwd_emit
+printf '\eP''goonware;bootstrapped;{"shell":"bash","shell_pid":%d,"version":"1"}''\e\\' "$$"
+_goonware_chpwd_emit
 PS1=''
 PS2=''
-_gli_preexec_armed=1
+_goonware_preexec_armed=1
 "#;
 
 /// Write the bash integration rc file into the app data dir and
@@ -1771,8 +1771,8 @@ fn ensure_bash_integration_rc(app: &AppHandle<Wry>) -> Result<PathBuf, String> {
         .map_err(|e| format!("app_data_dir: {e}"))?;
     let dir = base.join("shell-integration").join("bash");
     fs::create_dir_all(&dir).map_err(|e| format!("create integration dir: {e}"))?;
-    let path = dir.join("gli-bashrc");
-    fs::write(&path, BASH_INTEGRATION).map_err(|e| format!("write gli-bashrc: {e}"))?;
+    let path = dir.join("goonware-bashrc");
+    fs::write(&path, BASH_INTEGRATION).map_err(|e| format!("write goonware-bashrc: {e}"))?;
     Ok(path)
 }
 
@@ -1790,11 +1790,13 @@ pub struct StartArgs {
     pub rows: u16,
     pub cols: u16,
     /// Active project id (e.g. `p_rli_l2k4j`). Injected into the PTY's
-    /// env as `GLI_PROJECT_ID` / `RLI_PROJECT_ID` so in-pane agents
-    /// can identify which project they're running in.
+    /// env as `GOONWARE_PROJECT_ID` / `GLI_PROJECT_ID` / `RLI_PROJECT_ID`
+    /// so in-pane agents can identify which project they're running
+    /// in.
     #[serde(default)]
     pub project_id: Option<String>,
-    /// Active session id. Injected as `GLI_SESSION_ID` / `RLI_SESSION_ID`.
+    /// Active session id. Injected as `GOONWARE_SESSION_ID` /
+    /// `GLI_SESSION_ID` / `RLI_SESSION_ID`.
     /// Same intent as `project_id` but scoped one level finer.
     #[serde(default)]
     pub session_id: Option<String>,
@@ -1902,9 +1904,10 @@ pub fn term_start(
     #[cfg(not(target_os = "macos"))]
     let browser_port = 4000u16;
     let browser_url = format!("http://127.0.0.1:{browser_port}");
-    // Both GLI_* (current) and RLI_* (legacy) names are exported so
-    // user-side tooling that hardcodes either spelling keeps working
-    // through the rename window.
+    // Export GOONWARE_* (current), GLI_* (prior name), and RLI_*
+    // (legacy) so user-side tooling that hardcodes any spelling keeps
+    // working through the rename window.
+    cmd.env("GOONWARE_BROWSER_URL", &browser_url);
     cmd.env("GLI_BROWSER_URL", &browser_url);
     cmd.env("RLI_BROWSER_URL", &browser_url);
 
@@ -1913,10 +1916,12 @@ pub fn term_start(
     // they're running in. Not memory-specific — kept as generic
     // session metadata after the memory subsystem was removed.
     if let Some(pid) = args.project_id.as_deref() {
+        cmd.env("GOONWARE_PROJECT_ID", pid);
         cmd.env("GLI_PROJECT_ID", pid);
         cmd.env("RLI_PROJECT_ID", pid);
     }
     if let Some(sid) = args.session_id.as_deref() {
+        cmd.env("GOONWARE_SESSION_ID", sid);
         cmd.env("GLI_SESSION_ID", sid);
         cmd.env("RLI_SESSION_ID", sid);
     }
@@ -1929,7 +1934,7 @@ pub fn term_start(
     //         hooks via precmd_functions / preexec_functions /
     //         chpwd_functions.
     //
-    //   bash: pass `--rcfile <path>` so bash loads our gli-bashrc
+    //   bash: pass `--rcfile <path>` so bash loads our goonware-bashrc
     //         instead of the default. The rc sources ~/.bashrc first
     //         then installs the trap DEBUG / PROMPT_COMMAND hooks.
     //         `--rcfile` requires the shell to be interactive; we
@@ -1947,7 +1952,7 @@ pub fn term_start(
             // Stash the user's existing ZDOTDIR (if any) so the
             // integration script can chain-source from there.
             if let Ok(prev) = std::env::var("ZDOTDIR") {
-                cmd.env("GLI_USER_ZDOTDIR", prev);
+                cmd.env("GOONWARE_USER_ZDOTDIR", prev);
             }
             cmd.env("ZDOTDIR", dir.to_string_lossy().into_owned());
         }
@@ -2385,7 +2390,7 @@ mod tests {
             "id": "pty_test",
             "command": "zsh",
             "args": ["-l"],
-            "cwd": "/tmp/gli-test",
+            "cwd": "/tmp/goonware-test",
             "rows": 24,
             "cols": 80,
             "project_id": "p_test",
@@ -2396,7 +2401,7 @@ mod tests {
         assert_eq!(parsed.id, "pty_test");
         assert_eq!(parsed.command, "zsh");
         assert_eq!(parsed.args, vec!["-l".to_string()]);
-        assert_eq!(parsed.cwd.as_deref(), Some("/tmp/gli-test"));
+        assert_eq!(parsed.cwd.as_deref(), Some("/tmp/goonware-test"));
         assert_eq!(parsed.rows, 24);
         assert_eq!(parsed.cols, 80);
         assert_eq!(parsed.project_id.as_deref(), Some("p_test"));
@@ -2691,7 +2696,7 @@ mod tests {
         bytes.extend_from_slice(&osc("133;A"));
         bytes.extend_from_slice(&osc("133;B"));
         bytes.extend_from_slice(&dcs(
-            r#"gli;preexec;{"command":"git status","start_ms":1700000000000}"#,
+            r#"goonware;preexec;{"command":"git status","start_ms":1700000000000}"#,
         ));
         bytes.extend_from_slice(&osc("133;C"));
         bytes.extend_from_slice(b"output\n");
@@ -2712,7 +2717,7 @@ mod tests {
         bytes.extend_from_slice(&osc("133;C"));
         bytes.extend_from_slice(b"oops\n");
         bytes.extend_from_slice(&dcs(
-            r#"gli;cmd_finished;{"exit_code":127,"duration_ms":42}"#,
+            r#"goonware;cmd_finished;{"exit_code":127,"duration_ms":42}"#,
         ));
         // OSC 133 D claims success — DCS must win.
         bytes.extend_from_slice(&osc("133;D;0"));
@@ -2729,7 +2734,7 @@ mod tests {
         // boundary landing mid-payload.
         let mut seg = BlockSegmenter::new();
         seg.feed(&osc("133;A"));
-        seg.feed(b"\x1b\x50gli;preexec;{\"comm");
+        seg.feed(b"\x1b\x50goonware;preexec;{\"comm");
         seg.feed(b"and\":\"echo hi\",\"start_ms\":42}");
         seg.feed(&[0x1b, 0x5c]); // ST in its own chunk
         seg.feed(&osc("133;C"));
@@ -2740,10 +2745,10 @@ mod tests {
     }
 
     #[test]
-    fn dcs_ignores_non_gli_prefix() {
+    fn dcs_ignores_non_goonware_prefix() {
         // Terminfo definitions, tmux passthrough, and other tools all
         // use DCS for their own purposes. We must not interpret any
-        // DCS sequence whose prefix isn't `gli;` — confirm by feeding
+        // DCS sequence whose prefix isn't `goonware;` — confirm by feeding
         // a tmux-style payload and verifying no command gets latched.
         let mut seg = BlockSegmenter::new();
         seg.feed(&dcs(r#"tmux;\033[31mred\033[0m"#));
@@ -2763,7 +2768,7 @@ mod tests {
         // Bad JSON must not crash the segmenter — the rest of the
         // session keeps working.
         let mut seg = BlockSegmenter::new();
-        seg.feed(&dcs(r#"gli;preexec;{not really json"#));
+        seg.feed(&dcs(r#"goonware;preexec;{not really json"#));
         seg.feed(&osc("133;A"));
         seg.feed(&osc("133;C"));
         seg.feed(b"output\n");
@@ -2792,7 +2797,7 @@ mod tests {
         // the binary tail (after the JSON close) so the segmenter sees
         // a literal BEL inside the DCS. The literal BEL must NOT close
         // the sequence.
-        bytes.extend_from_slice(b"gli;pree");
+        bytes.extend_from_slice(b"goonware;pree");
         bytes.push(0x07); // raw BEL mid-marker — must NOT terminate DCS
         bytes.extend_from_slice(b"xec;{\"command\":\"hi\",\"start_ms\":1}");
         bytes.extend_from_slice(&[0x1b, 0x5c]); // real ST terminator

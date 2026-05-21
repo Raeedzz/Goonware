@@ -92,11 +92,11 @@ interface Props {
   autoSummarize?: boolean;
   /**
    * Active project id. Forwarded to term_start so the PTY's env has
-   * `GLI_PROJECT_ID` / `RLI_PROJECT_ID` set — agents inside the PTY
+   * `GOONWARE_PROJECT_ID` / `RLI_PROJECT_ID` set — agents inside the PTY
    * read this to identify which project they're running in.
    */
   projectId?: string;
-  /** Active session id, mirrors `GLI_SESSION_ID` / `RLI_SESSION_ID` in PTY env. */
+  /** Active session id, mirrors `GOONWARE_SESSION_ID` / `RLI_SESSION_ID` in PTY env. */
   sessionId?: string;
   /**
    * Fires once when Claude is first detected in this pane's PTY
@@ -1322,7 +1322,7 @@ export function BlockTerminal({
           ref={scrollContainerRef}
           onScroll={onScrollContainerScroll}
           className={
-            allowHorizontalScroll ? "gli-no-horizontal-scrollbar" : undefined
+            allowHorizontalScroll ? "goonware-no-horizontal-scrollbar" : undefined
           }
           style={agentScrollContainerStyle(allowHorizontalScroll)}
         >

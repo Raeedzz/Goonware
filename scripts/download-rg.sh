@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Downloads ripgrep into src-tauri/binaries/ as a Tauri sidecar binary
-# so GLI ships with `rg` baked in — no `brew install ripgrep` required.
+# so Goonware ships with `rg` baked in — no `brew install ripgrep` required.
 #
 # Tauri's `bundle.externalBin` mechanism expects the binary name to be
 # `<name>-<rust-target-triple>` (e.g. rg-aarch64-apple-darwin). On

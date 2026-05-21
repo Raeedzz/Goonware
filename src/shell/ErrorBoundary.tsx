@@ -38,7 +38,7 @@ export class ErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
     // eslint-disable-next-line no-console
-    console.error("[GLI] uncaught render error:", error, info);
+    console.error("[Goonware] uncaught render error:", error, info);
     this.setState({ info });
   }
 
@@ -159,7 +159,7 @@ export class ErrorBoundary extends Component<Props, State> {
               lineHeight: 1.5,
             }}
           >
-            GLI hit an unrecoverable render error. Reloading usually clears it.
+            Goonware hit an unrecoverable render error. Reloading usually clears it.
             Full details are in the developer console.
           </div>
           <pre

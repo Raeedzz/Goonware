@@ -194,7 +194,7 @@ function TabStrip({
     >
       <div
         role="tablist"
-        className="gli-no-scrollbar"
+        className="goonware-no-scrollbar"
         style={{
           flex: 1,
           minWidth: 0,
@@ -384,7 +384,7 @@ function TabButton({
       </button>
       {active && (
         <motion.span
-          layoutId="gli-active-tab-underline"
+          layoutId="goonware-active-tab-underline"
           style={{
             position: "absolute",
             left: 8,
@@ -893,7 +893,7 @@ async function notifyAgentFinished(worktreeName: string, tabTitle: string) {
     if (perm !== "granted") return;
     new Notification(`${worktreeName} · agent idle`, {
       body: tabTitle,
-      tag: `gli-agent-idle-${worktreeName}-${tabTitle}`,
+      tag: `goonware-agent-idle-${worktreeName}-${tabTitle}`,
     });
   } catch {
     // Best-effort; notifications are nice-to-have.

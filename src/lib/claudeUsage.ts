@@ -46,7 +46,7 @@ export const CLAUDE_PLAN_BUDGETS: Record<ClaudePlanTier, number> = {
 
 export type ClaudePlanTier = "pro" | "max5" | "max20";
 
-const PLAN_STORAGE_KEY = "gli.claudePlan";
+const PLAN_STORAGE_KEY = "goonware.claudePlan";
 
 export function readClaudePlan(): ClaudePlanTier {
   try {
@@ -117,7 +117,7 @@ export interface ClaudeUsageStatus {
  *  keeps the displayed % reasonably current without re-spawning the
  *  macOS App Data TCC popup every five seconds. (In Sequoia 15+ each
  *  ~/.claude/projects/*.jsonl carries the creator app's MACL xattr,
- *  so reading it from GLI triggers a "would like to access data from
+ *  so reading it from Goonware triggers a "would like to access data from
  *  other apps" prompt — the cadence change is half of the fix; the
  *  Rust-side circuit breaker stops the retry loop once any read
  *  fails.) The full transcript walk is bounded by the 5h lookback

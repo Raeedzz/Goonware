@@ -16,8 +16,8 @@
 //! ```
 //!
 //! Bind preference: 4000, falling back through 4001..4099 if taken.
-//! Chosen port is written to `~/Library/Application Support/dev.raeedz.gli/browser-port`
-//! so other tools (a `claude` running in a GLI terminal pane, hand-
+//! Chosen port is written to `~/Library/Application Support/dev.raeedz.goonware/browser-port`
+//! so other tools (a `claude` running in a Goonware terminal pane, hand-
 //! rolled scripts, etc.) can discover it programmatically.
 
 use std::sync::Arc;
@@ -80,7 +80,7 @@ pub async fn start<R: Runtime>(app: AppHandle<R>) -> Result<u16, String> {
     let (listener, port) = bind_with_retry().await?;
     // Publish the bound port to BrowserState BEFORE writing the file
     // — that's the in-memory source of truth that `term.rs` reads to
-    // inject `GLI_BROWSER_URL` into PTY children. The port file is
+    // inject `GOONWARE_BROWSER_URL` into PTY children. The port file is
     // for the React frontend, which can't reach managed state
     // directly.
     state
@@ -169,7 +169,7 @@ async fn bind_with_retry() -> Result<(TcpListener, u16), String> {
 fn write_port_file<R: Runtime>(app: &AppHandle<R>, port: u16) {
     // CRITICAL: we MUST write into the same directory Tauri's frontend
     // resolves via `appDataDir()` — that's the bundle-id-scoped
-    // `~/Library/Application Support/dev.raeedz.gli/` on macOS. The
+    // `~/Library/Application Support/dev.raeedz.goonware/` on macOS. The
     // previous `dirs::data_dir().join("RLI")` resolved to a sibling
     // directory the frontend never read, so any non-default port the
     // daemon ended up on (4001+, e.g. after a port collision) was

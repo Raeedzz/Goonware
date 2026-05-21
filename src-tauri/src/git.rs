@@ -490,7 +490,7 @@ fn explain_push_error(stderr: &str) -> String {
             "git rejected your SSH key. To fix:\n\
              • Make sure the key is registered with the remote (e.g. github.com/settings/keys).\n\
              • Make sure ssh-agent has it loaded — run `ssh-add ~/.ssh/id_ed25519` (or your key path) from a terminal.\n\
-             • If push works from your terminal but not from GLI, relaunch GLI from a terminal as a workaround — GLI tries to pick up SSH_AUTH_SOCK automatically but if it failed, launching from a terminal is the bypass.\n\n\
+             • If push works from your terminal but not from Goonware, relaunch Goonware from a terminal as a workaround — Goonware tries to pick up SSH_AUTH_SOCK automatically but if it failed, launching from a terminal is the bypass.\n\n\
              Original: {trimmed}"
         )
     } else if stderr.contains("Could not resolve host") {

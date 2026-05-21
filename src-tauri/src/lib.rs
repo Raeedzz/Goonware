@@ -5,7 +5,7 @@
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::doc_overindented_list_items)]
 
-/// GLI Tauri entry point.
+/// Goonware Tauri entry point.
 ///
 /// Plugin set is the minimum needed for v1 features:
 ///   - shell:   spawn `git`, `rg`, etc. from the frontend
@@ -206,59 +206,91 @@ pub fn run() {
             browser::browser_restart,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running GLI");
+        .expect("error while running Goonware");
 }
 
-/// One-shot migration of the previous `dev.raeedz.rli` Application
-/// Support directory to the new `dev.raeedz.gli` location. Tauri's
-/// `app_data_dir()` resolves off the bundle identifier, so a rename
-/// of the identifier orphans state.json and the worktrees archive.
-/// We move the old tree across once on first launch under the new
-/// identifier — no-op afterwards.
+/// One-shot migration of the previous `dev.raeedz.rli` / `dev.raeedz.gli`
+/// Application Support directories to the new `dev.raeedz.goonware`
+/// location. Tauri's `app_data_dir()` resolves off the bundle
+/// identifier, so a rename of the identifier orphans state.json and
+/// the worktrees archive. We move the old tree across once on first
+/// launch under the new identifier — no-op afterwards.
 #[cfg(target_os = "macos")]
 fn migrate_legacy_app_data() {
     let Some(home) = dirs::home_dir() else { return };
     let support = home.join("Library").join("Application Support");
 
-    // Bundle-id rename: dev.raeedz.rli → dev.raeedz.gli. Tauri's
-    // `app_data_dir()` resolves off the bundle identifier so a rename
-    // would otherwise orphan state.json and the worktrees archive.
-    let bundle_old = support.join("dev.raeedz.rli");
-    let bundle_new = support.join("dev.raeedz.gli");
-    if bundle_old.exists() && !bundle_new.exists() {
-        if let Err(e) = std::fs::rename(&bundle_old, &bundle_new) {
-            eprintln!(
-                "[migrate] couldn't rename {} → {}: {e}",
-                bundle_old.display(),
-                bundle_new.display()
-            );
-        } else {
-            eprintln!(
-                "[migrate] moved app data {} → {}",
-                bundle_old.display(),
-                bundle_new.display()
-            );
+    // Bundle-id rename chain: dev.raeedz.rli → dev.raeedz.gli →
+    // dev.raeedz.goonware. Tauri's `app_data_dir()` resolves off the
+    // bundle identifier so a rename would otherwise orphan
+    // state.json and the worktrees archive. Prefer the most recent
+    // legacy dir (gli) so users on current GLI don't lose their state.
+    let bundle_new = support.join("dev.raeedz.goonware");
+    for legacy in ["dev.raeedz.gli", "dev.raeedz.rli"] {
+        let bundle_old = support.join(legacy);
+        if bundle_old.exists() && !bundle_new.exists() {
+            if let Err(e) = std::fs::rename(&bundle_old, &bundle_new) {
+                eprintln!(
+                    "[migrate] couldn't rename {} → {}: {e}",
+                    bundle_old.display(),
+                    bundle_new.display()
+                );
+            } else {
+                eprintln!(
+                    "[migrate] moved app data {} → {}",
+                    bundle_old.display(),
+                    bundle_new.display()
+                );
+            }
+            break;
         }
     }
 
-    // Shared-cache rename: ~/Library/Application Support/RLI → GLI.
-    // Holds the downloaded Chrome-for-Testing binary + per-PID chrome
-    // profiles. Rename in place so the user doesn't re-download a
-    // ~200 MB Chrome on first launch under the new name.
-    let cache_old = support.join("RLI");
-    let cache_new = support.join("GLI");
-    if cache_old.exists() && !cache_new.exists() {
-        if let Err(e) = std::fs::rename(&cache_old, &cache_new) {
+    // Shared-cache rename chain: ~/Library/Application Support/RLI →
+    // GLI → Goonware. Holds the downloaded Chrome-for-Testing binary
+    // + per-PID chrome profiles. Rename in place so the user doesn't
+    // re-download a ~200 MB Chrome on first launch under the new
+    // name.
+    let cache_new = support.join("Goonware");
+    for legacy in ["GLI", "RLI"] {
+        let cache_old = support.join(legacy);
+        if cache_old.exists() && !cache_new.exists() {
+            if let Err(e) = std::fs::rename(&cache_old, &cache_new) {
+                eprintln!(
+                    "[migrate] couldn't rename {} → {}: {e}",
+                    cache_old.display(),
+                    cache_new.display()
+                );
+            } else {
+                eprintln!(
+                    "[migrate] moved cache {} → {}",
+                    cache_old.display(),
+                    cache_new.display()
+                );
+            }
+            break;
+        }
+    }
+
+    // Workspace dir rename: ~/GLI/workspaces → ~/Goonware/workspaces.
+    // Worktrees archived inside live here; the parent is a plain dir
+    // we can rename in place without touching the worktrees
+    // themselves (so their absolute paths in flat_storage still
+    // resolve once the parent is renamed).
+    let workspaces_new = home.join("Goonware");
+    let workspaces_old = home.join("GLI");
+    if workspaces_old.exists() && !workspaces_new.exists() {
+        if let Err(e) = std::fs::rename(&workspaces_old, &workspaces_new) {
             eprintln!(
                 "[migrate] couldn't rename {} → {}: {e}",
-                cache_old.display(),
-                cache_new.display()
+                workspaces_old.display(),
+                workspaces_new.display()
             );
         } else {
             eprintln!(
-                "[migrate] moved cache {} → {}",
-                cache_old.display(),
-                cache_new.display()
+                "[migrate] moved workspaces {} → {}",
+                workspaces_old.display(),
+                workspaces_new.display()
             );
         }
     }
@@ -271,7 +303,7 @@ fn migrate_legacy_app_data() {}
 /// own process env, so child processes (git, ssh, claude, codex,
 /// gemini) inherit them.
 ///
-/// Why this exists: when GLI is launched from Finder / Dock /
+/// Why this exists: when Goonware is launched from Finder / Dock /
 /// Spotlight on macOS, launchd hands it a near-empty environment.
 /// `SSH_AUTH_SOCK` is missing, so `git push` over SSH can't reach
 /// ssh-agent and falls back to passphrase-prompting the key file —
@@ -293,18 +325,18 @@ fn inherit_login_shell_env() {
 
     // SSH_AUTH_SOCK: required for ssh-agent–backed git pushes.
     // Don't overwrite if we already have one (e.g. user launched
-    // GLI from a terminal where it was already set).
+    // Goonware from a terminal where it was already set).
     if std::env::var_os("SSH_AUTH_SOCK").is_none() {
         if let Some(sock) = env.get("SSH_AUTH_SOCK") {
             if !sock.is_empty() && std::path::Path::new(sock).exists() {
                 std::env::set_var("SSH_AUTH_SOCK", sock);
-                eprintln!("[gli] inherited SSH_AUTH_SOCK from login shell");
+                eprintln!("[goonware] inherited SSH_AUTH_SOCK from login shell");
             }
         }
     }
 
     // PATH: merge, login-shell first. Without this, spawned `git` /
-    // `claude` / `codex` / `gemini` may be unfindable when GLI is
+    // `claude` / `codex` / `gemini` may be unfindable when Goonware is
     // launched outside a terminal.
     if let Some(shell_path) = env.get("PATH") {
         if !shell_path.is_empty() {
@@ -330,7 +362,7 @@ fn read_login_shell_env() -> Option<std::collections::HashMap<String, String>> {
         .ok()?;
     if !output.status.success() {
         eprintln!(
-            "[gli] login-shell env probe exited {} — leaving env alone",
+            "[goonware] login-shell env probe exited {} — leaving env alone",
             output.status.code().unwrap_or(-1)
         );
         return None;

@@ -5,13 +5,13 @@
 //!
 //! Archive convention:
 //!   - JSON metadata: `<app_data_dir>/archive/<projectId>/<worktreeId>.json`
-//!   - Optional stash: `git stash push -u -m "gli-archive-<worktreeId>"` ran
+//!   - Optional stash: `git stash push -u -m "goonware-archive-<worktreeId>"` ran
 //!     in the worktree before `git worktree remove`. Restores apply the
 //!     matching stash.
 //!   - Branch deletion is opt-in (deleteBranch flag).
 //!
 //! Worktree checkouts live under `<app_data_dir>/worktrees/<projectId>/<id>`
-//! so they don't pollute the user's repo with `.gli/sessions/...` dirs.
+//! so they don't pollute the user's repo with `.goonware/sessions/...` dirs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -96,7 +96,7 @@ fn output_to_string(out: Output) -> Result<String, String> {
 /// Layout (conductor-style — visible to the user, not buried in
 /// Library/Application Support):
 ///
-///   `~/GLI/workspaces/<project-basename>/<worktree-id>`
+///   `~/Goonware/workspaces/<project-basename>/<worktree-id>`
 ///
 /// `<project-basename>` is the last path segment of the project's
 /// repo root (e.g. `OG-E_case_comp` for `/Users/raeedz/Developer/OG-E_case_comp`).
@@ -110,7 +110,7 @@ fn worktrees_root(project_path: &str, project_id: &str) -> Result<PathBuf, Strin
         .map(|s| s.to_string())
         .unwrap_or_else(|| project_id.to_string());
     let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
-    let dir = home.join("GLI").join("workspaces").join(&basename);
+    let dir = home.join("Goonware").join("workspaces").join(&basename);
     fs::create_dir_all(&dir).map_err(|e| format!("create workspaces root: {e}"))?;
     Ok(dir)
 }
@@ -445,7 +445,7 @@ pub async fn worktree_archive(
     }
     let mut stash_ref = None;
     if stash {
-        let msg = format!("gli-archive-{}", worktree_id);
+        let msg = format!("goonware-archive-{}", worktree_id);
         // Best effort — clean worktree → no stash → git returns non-zero.
         let _ = git(&path, &["stash", "push", "-u", "-m", &msg]).await;
         stash_ref = Some(msg);
@@ -506,8 +506,8 @@ pub async fn worktree_restore(
     }
 
     // git worktree add creates the leaf dir but not its parents. The
-    // archive was made under `~/GLI/workspaces/<basename>/<id>`; the
-    // parent `~/GLI/workspaces/<basename>` may have been emptied or
+    // archive was made under `~/Goonware/workspaces/<basename>/<id>`; the
+    // parent `~/Goonware/workspaces/<basename>` may have been emptied or
     // collected since. Create it eagerly so the add never trips on a
     // missing intermediate.
     if let Some(parent) = Path::new(&record.original_path).parent() {

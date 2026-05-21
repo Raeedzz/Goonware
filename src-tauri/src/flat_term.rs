@@ -912,7 +912,7 @@ impl Handler for FlatTerm {
 
     fn set_keypad_application_mode(&mut self) {
         // Tracked alongside app_cursor by some callers, but DECPAM
-        // is keypad-only; the GLI wire format doesn't expose it
+        // is keypad-only; the Goonware wire format doesn't expose it
         // separately. No-op.
     }
     fn unset_keypad_application_mode(&mut self) {}

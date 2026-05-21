@@ -325,7 +325,7 @@ body { font-variant-numeric: tabular-nums; }
 
 /* The running-agent loader is a 3×3 snake-wave grid (
    `src/primitives/Loader.tsx`) driven by a scoped CSS keyframe
-   `.gli-loader-cell` defined in motion.css. The previous React-state
+   `.goonware-loader-cell` defined in motion.css. The previous React-state
    tick was vulnerable to main-thread stalls under load — the keyframe
    version runs on the compositor and stays smooth regardless. No
    global `.rli-loader` rule lives here; the new class is uniquely
@@ -336,12 +336,12 @@ body { font-variant-numeric: tabular-nums; }
    pulse. Eased so the peak sits at the middle of the loop, giving a
    gentle "in / out / in / out" rhythm. 1.4s loop length picks up
    continuity with the loader's 1.2s rotation without phase-locking. */
-@keyframes gli-tab-dot-pulse {
+@keyframes goonware-tab-dot-pulse {
   0%, 100% { opacity: 0.4; }
   50%      { opacity: 1; }
 }
-.gli-tab-dot-computing {
-  animation: gli-tab-dot-pulse 1.4s ease-in-out infinite;
+.goonware-tab-dot-computing {
+  animation: goonware-tab-dot-pulse 1.4s ease-in-out infinite;
 }
 
 /* Search-jump flash. Applied as a line decoration by the editor when
@@ -350,11 +350,11 @@ body { font-variant-numeric: tabular-nums; }
    slightly translucent so the line text stays readable through it.
    1.4s feels long enough to "register" without overstaying its
    welcome; ease-out lets the tint dissipate rather than pulse. */
-@keyframes gli-editor-flash {
+@keyframes goonware-editor-flash {
   0%   { background-color: oklch(72% 0.13 220 / 0.32); }
   60%  { background-color: oklch(72% 0.13 220 / 0.18); }
   100% { background-color: transparent; }
 }
 .cm-editor-flash {
-  animation: gli-editor-flash 1.4s ease-out forwards;
+  animation: goonware-editor-flash 1.4s ease-out forwards;
 }

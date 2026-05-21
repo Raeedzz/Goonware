@@ -278,11 +278,11 @@ function useGitInfo(cwd: string): {
       const detail = (e as CustomEvent<{ cwd?: string }>).detail;
       if (!detail?.cwd || detail.cwd === cwd) void pull();
     };
-    window.addEventListener("gli-git-refresh", onRefresh);
+    window.addEventListener("goonware-git-refresh", onRefresh);
     return () => {
       cancelled = true;
       window.clearInterval(id);
-      window.removeEventListener("gli-git-refresh", onRefresh);
+      window.removeEventListener("goonware-git-refresh", onRefresh);
     };
   }, [cwd, trigger]);
 

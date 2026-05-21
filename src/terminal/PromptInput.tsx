@@ -959,7 +959,7 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
               // kind "file" with an `image/*` MIME. PTYs can't carry
               // image bytes, so spool them to /tmp and splice the
               // resolved path into the textarea at the caret. The user
-              // sees `'/tmp/gli-paste/paste-…png' ` appear inline and
+              // sees `'/tmp/goonware-paste/paste-…png' ` appear inline and
               // can Enter to send it to claude / cat / file / etc.
               const items = Array.from(e.clipboardData?.items ?? []);
               const imageItem = items.find(
@@ -1017,7 +1017,7 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
               color: "transparent",
               caretColor: "var(--accent-bright)",
             }}
-            className="gli-prompt-input"
+            className="goonware-prompt-input"
           />
         </PromptHighlight>
         <div

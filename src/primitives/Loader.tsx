@@ -25,8 +25,8 @@ import type { CSSProperties } from "react";
  *     same dark stop (seamless wrap).
  *
  * Motion:
- *   - Pure CSS keyframes. Perimeter cells carry `--gli-loader-snake-pos`
- *     (their 0..7 position along the cycle); `.gli-loader-cell` runs a
+ *   - Pure CSS keyframes. Perimeter cells carry `--goonware-loader-snake-pos`
+ *     (their 0..7 position along the cycle); `.goonware-loader-cell` runs a
  *     1.2s walk through the palette with a negative `animation-delay`
  *     derived from that position, so each cell sits at its own phase
  *     and the wave reads as a single crest drifting around the ring.
@@ -95,16 +95,16 @@ export function Loader({
     >
       {Array.from({ length: 9 }).map((_, gridIndex) => {
         if (gridIndex === CENTER_GRID_INDEX) {
-          return <span key={gridIndex} className="gli-loader-cell-center" />;
+          return <span key={gridIndex} className="goonware-loader-cell-center" />;
         }
         const snakePos = SNAKE_POS_BY_GRID[gridIndex];
         return (
           <span
             key={gridIndex}
-            className="gli-loader-cell"
+            className="goonware-loader-cell"
             style={
               {
-                "--gli-loader-snake-pos": snakePos,
+                "--goonware-loader-snake-pos": snakePos,
               } as CSSProperties
             }
           />

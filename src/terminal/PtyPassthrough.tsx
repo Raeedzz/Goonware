@@ -162,7 +162,7 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
       // markers when DECSET 2004 is on) as the onInput path below.
       //
       // Image clipboard items get the same path-spool treatment as the
-      // PromptInput textarea: write the bytes to /tmp/gli-paste and
+      // PromptInput textarea: write the bytes to /tmp/goonware-paste and
       // send the quoted path. Claude / codex / aider all accept inline
       // file paths as image references, so a Cmd+Shift+Ctrl+4 → Cmd+V
       // delivers a usable screenshot to the agent in two keystrokes.

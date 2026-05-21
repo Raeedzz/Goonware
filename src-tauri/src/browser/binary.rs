@@ -9,7 +9,7 @@
 //!   1. `RLI_CHROME_PATH` env var (escape hatch for unusual installs).
 //!   2. /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 //!   3. /Applications/Chromium.app/Contents/MacOS/Chromium
-//!   4. ~/Library/Application Support/dev.raeedz.gli/chrome/<arch>/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+//!   4. ~/Library/Application Support/dev.raeedz.goonware/chrome/<arch>/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
 //!   5. None → download CFT from googlechromelabs.github.io
 //!
 //! Progress events are emitted on `browser://download/progress` so the
@@ -54,7 +54,7 @@ fn cft_platform() -> &'static str {
 
 /// Where we cache the downloaded Chrome-for-Testing.
 fn cache_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("GLI").join("chrome").join(cft_platform()))
+    dirs::data_dir().map(|d| d.join("Goonware").join("chrome").join(cft_platform()))
 }
 
 fn cft_executable_in(dir: &Path) -> PathBuf {
@@ -70,10 +70,10 @@ fn cft_executable_in(dir: &Path) -> PathBuf {
 /// Walk known locations, return the first existing Chrome binary, or
 /// `None` if nothing is installed yet.
 pub fn locate_chrome() -> Option<PathBuf> {
-    // Accept both env-var spellings during the RLI → GLI rename. New
-    // code should set GLI_CHROME_PATH; RLI_CHROME_PATH stays so an
-    // already-configured shell keeps working.
-    for var in ["GLI_CHROME_PATH", "RLI_CHROME_PATH"] {
+    // Accept all env-var spellings through the RLI → GLI → Goonware
+    // rename chain. New code should set GOONWARE_CHROME_PATH; the
+    // older names stay so an already-configured shell keeps working.
+    for var in ["GOONWARE_CHROME_PATH", "GLI_CHROME_PATH", "RLI_CHROME_PATH"] {
         if let Ok(env_path) = std::env::var(var) {
             let p = PathBuf::from(env_path);
             if p.is_file() {

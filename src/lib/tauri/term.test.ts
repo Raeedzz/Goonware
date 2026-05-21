@@ -46,7 +46,7 @@ const SAMPLE_ARGS: TermStartArgs = {
   id: "pty_test",
   command: "zsh",
   args: ["-l"],
-  cwd: "/tmp/gli-test",
+  cwd: "/tmp/goonware-test",
   rows: 24,
   cols: 80,
   project_id: "p_test",

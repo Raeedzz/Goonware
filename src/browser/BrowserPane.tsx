@@ -50,7 +50,7 @@ const COMMON_DEV_PORTS = [5173, 3000, 8080, 4321, 1420];
 const CONSOLE_MIN_HEIGHT = 80;
 const CONSOLE_MAX_HEIGHT = 600;
 const CONSOLE_DEFAULT_HEIGHT = 220;
-const CONSOLE_HEIGHT_STORAGE_KEY = "gli.browser.consoleHeight";
+const CONSOLE_HEIGHT_STORAGE_KEY = "goonware.browser.consoleHeight";
 
 function loadConsoleHeight(): number {
   if (typeof window === "undefined") return CONSOLE_DEFAULT_HEIGHT;
@@ -237,7 +237,7 @@ export function BrowserPane({
     // this, a slow boot could sit in the offline UI for a full
     // FAILURE_THRESHOLD window before the next poll cycle even tries.
     let unlistenReady: UnlistenFn | null = null;
-    void listen<number>("gli://browser-daemon-ready", () => {
+    void listen<number>("goonware://browser-daemon-ready", () => {
       if (cancelled) return;
       invalidateBrowserBaseCache();
       failuresRef.current = 0;

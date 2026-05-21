@@ -34,7 +34,7 @@ export function useOpenUrlInBrowser() {
         }
       });
     };
-    window.addEventListener("gli:open-url", onOpen);
-    return () => window.removeEventListener("gli:open-url", onOpen);
+    window.addEventListener("goonware:open-url", onOpen);
+    return () => window.removeEventListener("goonware:open-url", onOpen);
   }, []);
 }

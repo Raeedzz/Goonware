@@ -17,7 +17,7 @@ export const fs = {
    * icon, Next.js icon, etc. — returned as a `data:` URI ready to drop
    * into `<img src>`. Resolves to `null` when nothing matched. The
    * sidebar renders this in place of the first-letter glyph so e.g.
-   * GLI itself shows the GLI app icon instead of "G".
+   * Goonware itself shows the Goonware app icon instead of "G".
    */
   scanProjectIcon: (path: string) =>
     invoke<string | null>("fs_scan_project_icon", { path }),
@@ -36,7 +36,7 @@ export const system = {
   openWith: (path: string, app: string) =>
     invoke<void>("system_open_with", { path, app }),
   /**
-   * Persist clipboard / dropped image bytes to `/tmp/gli-paste/...` and
+   * Persist clipboard / dropped image bytes to `/tmp/goonware-paste/...` and
    * return the absolute path. The terminal pastes that path into the
    * focused input so agents (claude, codex, gemini) can read the
    * image inline.

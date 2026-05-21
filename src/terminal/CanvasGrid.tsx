@@ -240,7 +240,7 @@ export function CanvasGrid({
   //
   // This matches Warp's split between expensive PTY reflow (debounced
   // via warpdotdev/warp `app/src/throttle.rs`) and the visual render
-  // loop (every frame, no throttle). GLI's SIGWINCH side already has a
+  // loop (every frame, no throttle). Goonware's SIGWINCH side already has a
   // 140 ms debounce in BlockTerminal.tsx; the canvas paint must NOT be
   // delayed.
   useEffect(() => {
@@ -261,7 +261,7 @@ export function CanvasGrid({
     return () => observer.disconnect();
   }, []);
 
-  // Repaint at the new DPR when the user drags GLI between a Retina
+  // Repaint at the new DPR when the user drags Goonware between a Retina
   // and an external 1x monitor mid-session. Without this, the canvas
   // stays at its mount-time DPR — glyphs look fuzzy (1x → 2x) or
   // pixel-doubled (2x → 1x) until the user resizes the pane.

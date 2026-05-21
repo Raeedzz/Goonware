@@ -1,5 +1,5 @@
 [package]
-name = "gli"
+name = "goonware"
 version = "0.0.1"
 description = "A confident dark instrument for running CLI coding agents."
 authors = ["raeedz"]
@@ -7,7 +7,7 @@ edition = "2021"
 rust-version = "1.78"
 
 [lib]
-name = "gli_lib"
+name = "goonware_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

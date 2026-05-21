@@ -48,10 +48,10 @@ export function AllChangesView({ projectPath }: { projectPath: string }) {
       const detail = (e as CustomEvent<{ cwd?: string }>).detail;
       if (!detail?.cwd || detail.cwd === projectPath) refresh();
     };
-    window.addEventListener("gli-git-refresh", onRefresh);
+    window.addEventListener("goonware-git-refresh", onRefresh);
     return () => {
       cancelled = true;
-      window.removeEventListener("gli-git-refresh", onRefresh);
+      window.removeEventListener("goonware-git-refresh", onRefresh);
     };
   }, [projectPath]);
 

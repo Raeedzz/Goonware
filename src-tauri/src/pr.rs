@@ -274,7 +274,7 @@ pub(crate) async fn prepare_branch_for_pr(
 /// Run a `git push`, and if it fails with `Permission denied (publickey)`
 /// retry through HTTPS using `gh`'s credential helper.
 ///
-/// Why: GLI inherits SSH_AUTH_SOCK from the login shell at startup, but
+/// Why: Goonware inherits SSH_AUTH_SOCK from the login shell at startup, but
 /// users who keep their key in a graphical agent (1Password, Secretive,
 /// macOS keychain unlocked on-demand) sometimes have a socket path
 /// their login shell can't see — the SSH push then fails even though
@@ -361,7 +361,7 @@ fn explain_push_error(err: &str) -> String {
         format!(
             "git rejected your SSH key.\n\nTo fix:\n\
              • Make sure your key is loaded — run `ssh-add ~/.ssh/id_ed25519` (or your key path) from a terminal.\n\
-             • Or relaunch GLI from a terminal so it inherits your SSH_AUTH_SOCK.\n\
+             • Or relaunch Goonware from a terminal so it inherits your SSH_AUTH_SOCK.\n\
              • Or switch the remote to HTTPS: `gh auth setup-git && git remote set-url origin <https-url>`.\n\n\
              Original: {trimmed}"
         )

@@ -394,7 +394,7 @@ function relPath(abs: string, root: string): string {
  * poll. The count is dispatched into worktree state for the badge.
  *
  * Refresh hooks:
- *   - 4 s interval — ambient edits made outside GLI (e.g. VS Code,
+ *   - 4 s interval — ambient edits made outside Goonware (e.g. VS Code,
  *     manual `git checkout`) land in the badge within one tick.
  *   - `rli-git-refresh` CustomEvent — emitted by commit / push /
  *     merge paths so the UI doesn't lag the action by 4 s.
@@ -466,11 +466,11 @@ function useWorktreeStatus(
         void tick();
       }
     };
-    window.addEventListener("gli-git-refresh", onRefresh);
+    window.addEventListener("goonware-git-refresh", onRefresh);
     return () => {
       cancelled = true;
       window.clearInterval(t);
-      window.removeEventListener("gli-git-refresh", onRefresh);
+      window.removeEventListener("goonware-git-refresh", onRefresh);
     };
   }, [worktreeId, worktreePath, refresh]);
 
@@ -585,7 +585,7 @@ function ChangesView({
       setMessage("");
       await refresh();
       window.dispatchEvent(
-        new CustomEvent("gli-git-refresh", {
+        new CustomEvent("goonware-git-refresh", {
           detail: { cwd: worktree.path },
         }),
       );
@@ -603,7 +603,7 @@ function ChangesView({
       toast.show({ message: "Pushed." });
       await refresh();
       window.dispatchEvent(
-        new CustomEvent("gli-git-refresh", {
+        new CustomEvent("goonware-git-refresh", {
           detail: { cwd: worktree.path },
         }),
       );
@@ -636,7 +636,7 @@ function ChangesView({
       setMessage("");
       await refresh();
       window.dispatchEvent(
-        new CustomEvent("gli-git-refresh", {
+        new CustomEvent("goonware-git-refresh", {
           detail: { cwd: worktree.path },
         }),
       );
@@ -651,7 +651,7 @@ function ChangesView({
       toast.show({ message: "Committed & pushed." });
       await refresh();
       window.dispatchEvent(
-        new CustomEvent("gli-git-refresh", {
+        new CustomEvent("goonware-git-refresh", {
           detail: { cwd: worktree.path },
         }),
       );
@@ -1769,7 +1769,7 @@ function SecondaryTerminals({ worktree }: { worktree: Worktree }) {
               // would otherwise clip against the pane edge. Allow
               // horizontal scrolling here so the user can pan with
               // a trackpad. The track itself is hidden via
-              // `gli-no-horizontal-scrollbar` so it doesn't sit
+              // `goonware-no-horizontal-scrollbar` so it doesn't sit
               // under the prompt input.
               allowHorizontalScroll
             />
@@ -1786,12 +1786,12 @@ function PreviewUrlButton({ worktree }: { worktree: Worktree }) {
   const cfg = projectSettings(project);
   const url = cfg.previewUrl.trim();
   if (!url) return null;
-  // Accept both $GLI_* (current) and $RLI_* (legacy) placeholder names
+  // Accept both $GOONWARE_* (current) and $RLI_* (legacy) placeholder names
   // so existing previewUrl values keep working after the rename.
   const resolved = url
-    .replace(/\$(?:GLI|RLI)_WORKTREE_NAME/g, worktree.name)
-    .replace(/\$(?:GLI|RLI)_PROJECT_ID/g, worktree.projectId)
-    .replace(/\$(?:GLI|RLI)_PORT/g, "3000");
+    .replace(/\$(?:Goonware|RLI)_WORKTREE_NAME/g, worktree.name)
+    .replace(/\$(?:Goonware|RLI)_PROJECT_ID/g, worktree.projectId)
+    .replace(/\$(?:Goonware|RLI)_PORT/g, "3000");
   return (
     <button
       type="button"

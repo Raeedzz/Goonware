@@ -760,7 +760,7 @@ function nextPow2(n: number): number {
 
 /**
  * Bootstrap a renderer for a given canvas. Throws if WebGPU is not
- * available — GLI ships only as a Tauri DMG on macOS 14+, so this
+ * available — Goonware ships only as a Tauri DMG on macOS 14+, so this
  * is a configuration error worth surfacing loudly rather than a
  * fallback path.
  */
@@ -772,7 +772,7 @@ export async function createGridRenderer(
   onDeviceLost?: (info: { reason: string; message: string }) => void,
 ): Promise<GridRenderer> {
   if (!navigator.gpu) {
-    throw new Error("WebGPU not available — GLI requires macOS 14+");
+    throw new Error("WebGPU not available — Goonware requires macOS 14+");
   }
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error("No GPU adapter available");
