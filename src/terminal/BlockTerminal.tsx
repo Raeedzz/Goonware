@@ -1326,38 +1326,67 @@ export function BlockTerminal({
           }
           style={agentScrollContainerStyle(allowHorizontalScroll)}
         >
-          {/* BlockList must render in BOTH shell and agent modes so the
-              user can always scroll back into closed-block history.
-              The earlier "hide it during agent mode" workaround broke
-              scrollback while a live agent was running (user-reported
-              "i cant scroll in the terminal while an agent is
-              running"). Squashing of the LiveBlock by a tall BlockList
-              is now prevented by the fill-mode LiveBlock's hard
-              min-height: 100cqh (see `liveBlockOuterStyle`), not by
-              hiding history. `shouldRenderBlockList` always returns
-              true and exists so the regression is pinned by a test. */}
-          {shouldRenderBlockList(foregroundIsAgent) && (
-            <BlockList blocks={blocks} noWrap={allowHorizontalScroll} />
-          )}
-          {liveFrame?.command_running && !exited && (
-            <LiveBlock
-              command={activeCommand}
-              frame={liveFrame}
-              cwd={effectiveCwd}
-              preserveGrid={foregroundIsAgent}
-              noWrap={allowHorizontalScroll}
-              // Agent TUIs own the surface — let the LiveBlock fill
-              // the pane instead of sizing to content. Without this,
-              // a tall agent grid (claude with the slash-command
-              // picker open) draws below an empty BlockList region,
-              // the outer scroll anchors that combined column at the
-              // bottom, and the user sees a fat band of blank canvas
-              // above the picker. Filling the pane puts the picker's
-              // first row at the visible top edge — what users mean
-              // by "I want to see what I'm picking."
-              fill={foregroundIsAgent}
-            />
-          )}
+          {/* Width-sizing wrapper. In `allowHorizontalScroll` mode,
+              CellRows render with `whiteSpace: pre` and the LiveBlock
+              body has `overflowX: visible`, so individual lines can
+              extend past the scroll container's viewport. Without this
+              wrapper, the LiveBlock outer (and each closed Block) is
+              sized to the scroll container's CLIENT width — so when
+              the user pans right, the block frames (border-top of
+              LiveBlock, border-bottom of the command-line divider,
+              the "RUNNING" header row) end short of the visible right
+              edge while the inner text keeps going. The user-reported
+              symptom is "white space on the side on the right." The
+              wrapper takes `min-width: max-content` so it expands to
+              the widest line across all blocks; combined with `100%`
+              minimum so a narrow transcript still fills the pane. All
+              block frames inside stretch to this wrapper's width, so
+              every divider and pill spans the full panned content. */}
+          <div
+            style={
+              allowHorizontalScroll
+                ? {
+                    display: "flex",
+                    flexDirection: "column",
+                    minWidth: "max-content",
+                    width: "100%",
+                  }
+                : { display: "contents" }
+            }
+          >
+            {/* BlockList must render in BOTH shell and agent modes so the
+                user can always scroll back into closed-block history.
+                The earlier "hide it during agent mode" workaround broke
+                scrollback while a live agent was running (user-reported
+                "i cant scroll in the terminal while an agent is
+                running"). Squashing of the LiveBlock by a tall BlockList
+                is now prevented by the fill-mode LiveBlock's hard
+                min-height: 100cqh (see `liveBlockOuterStyle`), not by
+                hiding history. `shouldRenderBlockList` always returns
+                true and exists so the regression is pinned by a test. */}
+            {shouldRenderBlockList(foregroundIsAgent) && (
+              <BlockList blocks={blocks} noWrap={allowHorizontalScroll} />
+            )}
+            {liveFrame?.command_running && !exited && (
+              <LiveBlock
+                command={activeCommand}
+                frame={liveFrame}
+                cwd={effectiveCwd}
+                preserveGrid={foregroundIsAgent}
+                noWrap={allowHorizontalScroll}
+                // Agent TUIs own the surface — let the LiveBlock fill
+                // the pane instead of sizing to content. Without this,
+                // a tall agent grid (claude with the slash-command
+                // picker open) draws below an empty BlockList region,
+                // the outer scroll anchors that combined column at the
+                // bottom, and the user sees a fat band of blank canvas
+                // above the picker. Filling the pane puts the picker's
+                // first row at the visible top edge — what users mean
+                // by "I want to see what I'm picking."
+                fill={foregroundIsAgent}
+              />
+            )}
+          </div>
         </div>
       )}
 
