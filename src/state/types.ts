@@ -190,7 +190,7 @@ export function projectSettings(project: Project | null | undefined): ProjectSet
    target, and a secondary terminal in the right panel.
    ------------------------------------------------------------------ */
 
-export type RightPanelTab = "files" | "changes" | "browser";
+export type RightPanelTab = "files" | "changes" | "skills" | "browser";
 export type SecondaryTab = "setup" | "run" | "terminal";
 
 export interface Worktree {

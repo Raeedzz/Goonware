@@ -579,8 +579,20 @@ function tabLabel(tab: Tab): string {
   if (tab.kind === "all-changes") {
     return tab.title || "Changes";
   }
-  // diff / markdown — show the filename basename.
-  return tab.filePath.split("/").pop() ?? tab.title;
+  // diff / markdown — show the filename basename, unless the basename
+  // is a generic per-directory file (SKILL.md, README.md) — in that
+  // case the explicit title carries the meaningful name (e.g. the skill
+  // name set by SkillsView when opening the tab), so prefer it.
+  const basename = tab.filePath.split("/").pop() ?? tab.title;
+  if (
+    tab.kind === "markdown" &&
+    /^(SKILL|README)\.md$/i.test(basename) &&
+    tab.title &&
+    tab.title !== basename
+  ) {
+    return tab.title;
+  }
+  return basename;
 }
 
 /**

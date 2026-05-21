@@ -2,8 +2,9 @@ import { AnimatePresence, motion } from "motion/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { backdropVariants, paletteVariants } from "@/design/motion";
 import { search, type SearchHit } from "@/lib/search";
-import { fs } from "@/lib/fs";
+import { fs, claudeConfig, type McpEntry, type SkillEntry } from "@/lib/fs";
 import { FileTypeIcon } from "@/files/FileTypeIcon";
+import { IconSparkles } from "@/design/icons";
 import { useToast } from "@/primitives/Toast";
 import {
   useActiveProject,
@@ -12,28 +13,34 @@ import {
   useAppState,
 } from "@/state/AppState";
 
-type Mode = "files" | "text" | "regex";
+type Mode = "files" | "text" | "regex" | "skills";
 
 const MODE_LABELS: Record<Mode, string> = {
   files: "files",
   text: "literal",
   regex: "regex",
+  skills: "skills",
 };
 
 // Tab cycles through these in order. Files is first because that's
 // what opens by default and what most users will want; literal and
 // regex are progressively-more-precise alternates for power users.
-const MODE_ORDER: Mode[] = ["files", "text", "regex"];
+// Skills lives at the end of the rotation — same set the user can
+// browse from the right-panel Skills tab, here exposed as a fuzzy
+// pop-up search.
+const MODE_ORDER: Mode[] = ["files", "text", "regex", "skills"];
 
 /**
- * A row in the overlay's result list. Either a `SearchHit` (content
- * match — has line/column/snippet text) or a `FileHit` (file picker
- * — path only). Discriminated on `kind` so the row renderer + the
- * open handler can branch on shape without duck-typing.
+ * A row in the overlay's result list. Files / matches come from rg;
+ * skill / mcp entries come from the local Claude Code config and live
+ * entirely client-side. Discriminated on `kind` so the row renderer
+ * and the open handler can branch on shape without duck-typing.
  */
 type ResultItem =
   | { kind: "file"; path: string }
-  | { kind: "match"; hit: SearchHit };
+  | { kind: "match"; hit: SearchHit }
+  | { kind: "skill"; skill: SkillEntry }
+  | { kind: "mcp"; mcp: McpEntry };
 
 /**
  * ⌘⇧F search overlay (Task #15).
@@ -125,6 +132,29 @@ function SearchInner({ onClose }: { onClose: () => void }) {
   // Tauri promises landing out of order and the user sees old hits
   // overwrite new ones.
   const searchIdRef = useRef(0);
+  // Skills / MCPs are loaded once when the palette opens and cached
+  // for the life of this mount. The lists are small (dozens of items
+  // total) and don't change while the user is searching, so filtering
+  // happens client-side — no IPC per keystroke.
+  const [skills, setSkills] = useState<SkillEntry[]>([]);
+  const [mcps, setMcps] = useState<McpEntry[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([claudeConfig.listSkills(), claudeConfig.listMcps()])
+      .then(([s, m]) => {
+        if (cancelled) return;
+        setSkills(s);
+        setMcps(m);
+      })
+      .catch(() => {
+        // Silent: the palette still works for the other modes if the
+        // skills enumerator fails, and the empty list will surface a
+        // helpful "no skills found" message.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   /**
    * Open the file behind a result row as a markdown tab in the active
@@ -140,6 +170,43 @@ function SearchInner({ onClose }: { onClose: () => void }) {
       onClose();
       return;
     }
+
+    // Skill rows open the SKILL.md directly without any project-root
+    // resolution — the path is already absolute (under ~/.claude).
+    // MCP rows are descriptive only; there's no markdown body to route
+    // into a tab, so we surface the summary as a toast and keep the
+    // palette open so the user can pick another result.
+    if (item.kind === "skill") {
+      const id = `t_skill_${Date.now().toString(36)}_${Math.random()
+        .toString(36)
+        .slice(2, 6)}`;
+      dispatch({
+        type: "open-tab",
+        tab: {
+          id,
+          worktreeId: worktree.id,
+          kind: "markdown",
+          filePath: item.skill.path,
+          mode: "preview",
+          content: null,
+          savedContent: null,
+          title: item.skill.name,
+          summary: `skill · ${item.skill.source}`,
+          summaryUpdatedAt: Date.now(),
+        },
+      });
+      onClose();
+      return;
+    }
+    if (item.kind === "mcp") {
+      toast.show({
+        message:
+          `${item.mcp.name} (${item.mcp.kind})` +
+          (item.mcp.summary ? ` — ${item.mcp.summary}` : ""),
+      });
+      return;
+    }
+
     const rawPath = item.kind === "file" ? item.path : item.hit.path;
     // Strip the `./` rg sometimes emits, then join with project.path
     // if the path isn't already absolute. macOS absolute paths start
@@ -186,8 +253,29 @@ function SearchInner({ onClose }: { onClose: () => void }) {
   // is empty so the modal opens with something useful no matter what
   // the user last left the mode as; once they type, the content
   // modes (literal / regex) switch to actual content search while
-  // files mode just fuzzy-filters the same list.
+  // files mode just fuzzy-filters the same list. Skills mode is
+  // client-side only — the data was loaded once when the palette
+  // opened, so there's no debounce, no IPC, and no error path.
   useEffect(() => {
+    if (mode === "skills") {
+      const q = query.trim().toLowerCase();
+      const filteredSkills = q
+        ? skills.filter((s) => matchesSkill(s, q))
+        : skills;
+      const filteredMcps = q ? mcps.filter((m) => matchesMcp(m, q)) : mcps;
+      const next: ResultItem[] = [
+        ...filteredSkills.map<ResultItem>((skill) => ({
+          kind: "skill",
+          skill,
+        })),
+        ...filteredMcps.map<ResultItem>((mcp) => ({ kind: "mcp", mcp })),
+      ];
+      setError(null);
+      setResults(next);
+      setCursor(0);
+      return;
+    }
+
     if (!project) return;
 
     const isFileMode = mode === "files";
@@ -231,7 +319,7 @@ function SearchInner({ onClose }: { onClose: () => void }) {
       }
     }, isFileMode || !hasQuery ? 80 : 220);
     return () => window.clearTimeout(t);
-  }, [project, query, mode]);
+  }, [project, query, mode, skills, mcps]);
 
   const cycleMode = () => {
     setMode((m) => {
@@ -263,6 +351,7 @@ function SearchInner({ onClose }: { onClose: () => void }) {
   const placeholder = useMemo(() => {
     if (mode === "files") return "Search files…";
     if (mode === "text") return "Search literal text…";
+    if (mode === "skills") return "Search skills & MCPs…";
     return "Search regex…";
   }, [mode]);
 
@@ -319,18 +408,18 @@ function SearchInner({ onClose }: { onClose: () => void }) {
               query.trim()
                 ? mode === "files"
                   ? "no matching files"
-                  : "no matches"
-                : "no files in this project"
+                  : mode === "skills"
+                    ? "no matching skills or MCPs"
+                    : "no matches"
+                : mode === "skills"
+                  ? "no skills or MCPs installed"
+                  : "no files in this project"
             }
           />
         )}
         {results.map((item, i) => (
           <ResultRow
-            key={
-              item.kind === "file"
-                ? `file:${item.path}:${i}`
-                : `match:${item.hit.path}:${item.hit.line}:${item.hit.column}:${i}`
-            }
+            key={resultKey(item, i)}
             item={item}
             active={i === cursor}
             onClick={() => void openItem(item)}
@@ -346,13 +435,47 @@ function SearchInner({ onClose }: { onClose: () => void }) {
         // an empty-query literal mode still shows files, and saying
         // "0 matches · literal" while a file list is on screen
         // would be lying about what's there.
-        countNoun={
-          results.length > 0 && results[0].kind === "match"
-            ? "match"
-            : "file"
-        }
+        countNoun={countNounFor(results)}
       />
     </>
+  );
+}
+
+function resultKey(item: ResultItem, i: number): string {
+  switch (item.kind) {
+    case "file":
+      return `file:${item.path}:${i}`;
+    case "match":
+      return `match:${item.hit.path}:${item.hit.line}:${item.hit.column}:${i}`;
+    case "skill":
+      return `skill:${item.skill.id}`;
+    case "mcp":
+      return `mcp:${item.mcp.id}`;
+  }
+}
+
+function countNounFor(results: ResultItem[]): "file" | "match" | "item" {
+  if (results.length === 0) return "file";
+  const first = results[0].kind;
+  if (first === "match") return "match";
+  if (first === "skill" || first === "mcp") return "item";
+  return "file";
+}
+
+function matchesSkill(s: SkillEntry, q: string): boolean {
+  return (
+    s.name.toLowerCase().includes(q) ||
+    s.description.toLowerCase().includes(q) ||
+    s.source.toLowerCase().includes(q)
+  );
+}
+
+function matchesMcp(m: McpEntry, q: string): boolean {
+  return (
+    m.name.toLowerCase().includes(q) ||
+    m.summary.toLowerCase().includes(q) ||
+    m.source.toLowerCase().includes(q) ||
+    m.kind.toLowerCase().includes(q)
   );
 }
 
@@ -391,6 +514,16 @@ function ResultRow({
   onClick: () => void;
   onMouseEnter: () => void;
 }) {
+  if (item.kind === "skill" || item.kind === "mcp") {
+    return (
+      <SkillResultRow
+        item={item}
+        active={active}
+        onClick={onClick}
+        onMouseEnter={onMouseEnter}
+      />
+    );
+  }
   // The file-type icon uses the same library + sizing as the right-
   // panel file tree, so a `.ts` hit in the overlay reads as the same
   // glyph the user sees in the tree — no visual stutter when they
@@ -519,6 +652,123 @@ function ResultRow({
   );
 }
 
+function SkillResultRow({
+  item,
+  active,
+  onClick,
+  onMouseEnter,
+}: {
+  item: { kind: "skill"; skill: SkillEntry } | { kind: "mcp"; mcp: McpEntry };
+  active: boolean;
+  onClick: () => void;
+  onMouseEnter: () => void;
+}) {
+  const isSkill = item.kind === "skill";
+  const name = isSkill ? item.skill.name : item.mcp.name;
+  const detail = isSkill ? item.skill.description : item.mcp.summary;
+  const source = isSkill ? item.skill.source : item.mcp.source;
+  const sourceLabel = source === "user" ? "user" : source;
+  return (
+    <div
+      role="option"
+      aria-selected={active}
+      onClick={onClick}
+      onMouseEnter={onMouseEnter}
+      style={{
+        display: "flex",
+        alignItems: "flex-start",
+        gap: "var(--space-2)",
+        padding: "var(--space-1-5) var(--space-4)",
+        backgroundColor: active ? "var(--surface-3)" : "transparent",
+        cursor: "default",
+      }}
+    >
+      <span
+        aria-hidden
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: 16,
+          height: 16,
+          marginTop: 2,
+          flexShrink: 0,
+          color: "var(--text-tertiary)",
+        }}
+      >
+        <IconSparkles size={14} />
+      </span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "baseline",
+            gap: "var(--space-2)",
+          }}
+        >
+          <span
+            style={{
+              fontFamily: "var(--font-sans)",
+              fontSize: "var(--text-sm)",
+              fontWeight: "var(--weight-medium)",
+              color: "var(--text-primary)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {name}
+          </span>
+          <span
+            className="tabular"
+            style={{
+              fontSize: "var(--text-2xs)",
+              color: "var(--text-tertiary)",
+              padding: "0 5px",
+              border: "var(--border-1)",
+              borderRadius: "var(--radius-xs)",
+              backgroundColor: "var(--surface-2)",
+              flexShrink: 0,
+            }}
+          >
+            {isSkill ? "skill" : `mcp · ${item.mcp.kind}`}
+          </span>
+          <span
+            style={{
+              fontFamily: "var(--font-mono)",
+              fontSize: "var(--text-2xs)",
+              color: "var(--text-disabled)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              minWidth: 0,
+            }}
+          >
+            {sourceLabel}
+          </span>
+        </div>
+        {detail && (
+          <div
+            style={{
+              fontFamily: "var(--font-sans)",
+              fontSize: "var(--text-xs)",
+              color: "var(--text-tertiary)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              display: "-webkit-box",
+              WebkitLineClamp: 2,
+              WebkitBoxOrient: "vertical",
+              marginTop: 2,
+            }}
+          >
+            {detail}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Hint({
   label,
   tone = "neutral",
@@ -549,8 +799,20 @@ function Footer({
 }: {
   mode: Mode;
   count: number;
-  countNoun: "file" | "match";
+  countNoun: "file" | "match" | "item";
 }) {
+  const noun =
+    countNoun === "file"
+      ? count === 1
+        ? "file"
+        : "files"
+      : countNoun === "match"
+        ? count === 1
+          ? "match"
+          : "matches"
+        : count === 1
+          ? "item"
+          : "items";
   return (
     <div
       style={{
@@ -573,15 +835,7 @@ function Footer({
       </span>
       <span style={{ display: "inline-flex", alignItems: "center", gap: "var(--space-2)" }}>
         <span className="tabular">
-          {count}{" "}
-          {countNoun === "file"
-            ? count === 1
-              ? "file"
-              : "files"
-            : count === 1
-              ? "match"
-              : "matches"}{" "}
-          · {MODE_LABELS[mode]}
+          {count} {noun} · {MODE_LABELS[mode]}
         </span>
         <span
           style={{

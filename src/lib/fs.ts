@@ -25,6 +25,31 @@ export const fs = {
 };
 
 /* ------------------------------------------------------------------
+   Claude Code: enumerate the user's installed skills and MCP servers
+   ------------------------------------------------------------------ */
+
+export interface SkillEntry {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  path: string;
+}
+
+export interface McpEntry {
+  id: string;
+  name: string;
+  kind: string;
+  source: string;
+  summary: string;
+}
+
+export const claudeConfig = {
+  listSkills: () => invoke<SkillEntry[]>("skills_list"),
+  listMcps: () => invoke<McpEntry[]>("mcps_list"),
+};
+
+/* ------------------------------------------------------------------
    System actions — right-click "Open in Finder/VS Code/browser"
    ------------------------------------------------------------------ */
 
