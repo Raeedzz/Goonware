@@ -593,6 +593,44 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
         setCompletions([]);
         return;
       }
+      // ⌃V — paste on Windows/Linux muscle memory. macOS native ⌘V
+      // already routes through the textarea's onPaste handler (the
+      // OS synthesizes a paste event), but ⌃V does not — it would
+      // otherwise bubble out as a global-chord miss and do nothing.
+      // Read the clipboard and splice in at the caret. Multi-line
+      // payloads route through onPaste so bracketed-paste fires.
+      if (
+        e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "v"
+      ) {
+        e.preventDefault();
+        void (async () => {
+          try {
+            const text = await navigator.clipboard.readText();
+            if (text.length === 0) return;
+            if (text.includes("\n") && onPaste) {
+              onPaste(text);
+              return;
+            }
+            const ta = textareaRef.current;
+            const start = ta?.selectionStart ?? value.length;
+            const end = ta?.selectionEnd ?? value.length;
+            const next = value.slice(0, start) + text + value.slice(end);
+            setValue(next);
+            requestAnimationFrame(() => {
+              const el = textareaRef.current;
+              if (!el) return;
+              el.selectionStart = el.selectionEnd = start + text.length;
+            });
+          } catch {
+            // Clipboard access denied — silently no-op.
+          }
+        })();
+        return;
+      }
       // Don't intercept other global chords — let ⌘1..9, ⌘⇧1..9,
       // ⌘K, ⌘N, etc. bubble up to the global keybinding handler.
       if (meta && e.key.length === 1) {

@@ -532,35 +532,20 @@ export function BlockTerminal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Snap to the bottom the moment agent mode turns on — i.e. a
-  // new agent is detected in this pane. The input bar hides, the
-  // PTY re-fits to claim that ~80px, and `term_resize` bumps the
-  // next liveFrame; without this, the user lands wherever scrollTop
-  // was before the layout shift, which is usually NOT pinned to
-  // the textbox the agent now owns. Two-rAF mirrors the visibility-
-  // flip handler so the resize re-fit lands within the snap window.
+  // Force re-anchoring when agent mode turns on — i.e. a new agent
+  // is detected in this pane. The input bar hides, the PTY re-fits
+  // to claim that ~80px, and `term_resize` bumps the next liveFrame.
+  // We just flip stickToBottomRef back on so the existing scroll
+  // anchor (above) snaps on the next frame. Snapping IMMEDIATELY
+  // here would land the user in empty space, because the buffer
+  // hasn't grown yet to fill the new container height — the agent's
+  // first paint is still in flight.
   const prevAgentModeRef = useRef(agentMode);
   useLayoutEffect(() => {
     const wasAgent = prevAgentModeRef.current;
     prevAgentModeRef.current = agentMode;
     if (wasAgent || !agentMode) return;
     stickToBottomRef.current = true;
-    const snap = () => {
-      const el = scrollContainerRef.current;
-      if (!el) return;
-      el.scrollTop = el.scrollHeight;
-    };
-    snap();
-    const raf1 = requestAnimationFrame(() => {
-      snap();
-      const raf2 = requestAnimationFrame(snap);
-      (snap as unknown as { _raf2?: number })._raf2 = raf2;
-    });
-    return () => {
-      cancelAnimationFrame(raf1);
-      const raf2 = (snap as unknown as { _raf2?: number })._raf2;
-      if (typeof raf2 === "number") cancelAnimationFrame(raf2);
-    };
   }, [agentMode]);
 
   // PTY died (process crashed, backend restarted on a Rust hot-reload,
