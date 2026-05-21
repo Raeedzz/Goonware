@@ -478,7 +478,7 @@ export function BlockTerminal({
     if (!el) return;
     if (!stickToBottomRef.current) return;
     el.scrollTop = el.scrollHeight;
-  }, [liveFrame?.seq, blocks.length, altScreen]);
+  }, [liveFrame?.seq, blocks.length, altScreen, foregroundIsAgent]);
 
   // Force-stick when the terminal transitions from hidden to visible.
   // The keepalive layer in MainColumn flips `display: none` ↔
@@ -567,17 +567,33 @@ export function BlockTerminal({
   // Force re-anchoring when agent mode turns on — i.e. a new agent
   // is detected in this pane. The input bar hides, the PTY re-fits
   // to claim that ~80px, and `term_resize` bumps the next liveFrame.
-  // We just flip stickToBottomRef back on so the existing scroll
-  // anchor snaps on the next frame. Snapping IMMEDIATELY here would
-  // land the user in empty space, because the buffer hasn't grown
-  // yet to fill the new container height — the agent's first paint
-  // is still in flight.
+  // Flip stickToBottomRef back on AND snap across a few rAFs so the
+  // user lands at the agent's input box, not stranded mid-history.
+  // Multiple rAFs because the buffer grows over several frames as the
+  // agent's first paint streams in; a single snap can hit empty space.
   const prevAgentModeRef = useRef(agentMode);
   useLayoutEffect(() => {
     const wasAgent = prevAgentModeRef.current;
     prevAgentModeRef.current = agentMode;
     if (wasAgent || !agentMode) return;
     stickToBottomRef.current = true;
+    const snap = () => {
+      const el = scrollContainerRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+    };
+    snap();
+    const rafs: number[] = [];
+    const schedule = (depth: number) => {
+      if (depth === 0) return;
+      const id = requestAnimationFrame(() => {
+        snap();
+        schedule(depth - 1);
+      });
+      rafs.push(id);
+    };
+    schedule(4);
+    return () => rafs.forEach(cancelAnimationFrame);
   }, [agentMode]);
 
   // Bell visualization — a brief, soft pulse on the input zone every

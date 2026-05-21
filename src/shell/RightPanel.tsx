@@ -27,6 +27,7 @@ import { useToast } from "@/primitives/Toast";
 import { Loader } from "@/primitives/Loader";
 import { BrowserPane } from "@/browser/BrowserPane";
 import { SkillsView } from "@/skills/SkillsView";
+import { forgetPtys } from "@/terminal/sessionMemory";
 
 /**
  * Right panel: top tabs (All files / Changes / Checks / Memory) + Review
@@ -1706,6 +1707,9 @@ function TerminalTabButton({
           aria-label="Close terminal"
           onClick={(e) => {
             e.stopPropagation();
+            // Explicit close: forget the PTY's SQLite history so it
+            // doesn't outlive the strip entry the user just dismissed.
+            forgetPtys([ptyId]);
             dispatch({
               type: "close-secondary-terminal",
               worktreeId,

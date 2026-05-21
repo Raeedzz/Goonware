@@ -11,6 +11,7 @@ import {
   primaryTerminalTab,
   worktreeCreate,
 } from "@/lib/worktrees";
+import { forgetPtys } from "@/terminal/sessionMemory";
 import { applyBranchPrefix, projectSettings } from "@/state/types";
 
 /**
@@ -201,6 +202,12 @@ export function useKeyboardShortcuts() {
 
       if (cmd && !shift && !e.altKey && e.key.toLowerCase() === "w" && worktree?.activeTabId) {
         e.preventDefault();
+        // Cascade-delete the SQLite block history for explicit shell
+        // closes so the next pane minted with the same id (unlikely)
+        // doesn't replay stale scrollback. App-restart / tab-hide
+        // paths skip this — only deliberate user dismissal forgets.
+        const tab = state.tabs[worktree.activeTabId];
+        if (tab && tab.kind === "terminal") forgetPtys([tab.ptyId]);
         dispatch({ type: "close-tab", id: worktree.activeTabId });
         return;
       }
