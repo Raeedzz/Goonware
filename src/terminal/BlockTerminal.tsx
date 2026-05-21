@@ -647,7 +647,19 @@ export function BlockTerminal({
       // The prior 24 px only covered the LiveBlock padding and the
       // user reported the symptom directly as "text spills behind
       // the right sidebar."
-      const cols = Math.max(20, Math.floor((rect.width - 36) / cellWidth));
+      const fitCols = Math.max(20, Math.floor((rect.width - 36) / cellWidth));
+      // In `allowHorizontalScroll` mode (the narrow right-panel
+      // secondary terminal) the visual pane width is much smaller than
+      // a normal terminal. If we sized the PTY to that width the shell
+      // would hard-wrap every long line server-side and the DOM
+      // `whiteSpace: pre` would have nothing to overflow — there'd be
+      // nothing to pan. Pin a generous floor so the PTY believes it
+      // has a wide terminal; the outer scroll container then handles
+      // horizontal panning over the wider rendered grid.
+      const PAN_MIN_COLS = 120;
+      const cols = allowHorizontalScroll
+        ? Math.max(fitCols, PAN_MIN_COLS)
+        : fitCols;
       return { rows, cols };
     };
 
@@ -729,7 +741,7 @@ export function BlockTerminal({
       observer.disconnect();
       if (timerId !== null) window.clearTimeout(timerId);
     };
-  }, [resize, agentMode, foregroundIsAgent]);
+  }, [resize, agentMode, foregroundIsAgent, allowHorizontalScroll]);
 
   // Sniff the live frame for the Claude banner so the 5h usage bar
   // attaches automatically AND we know to hide PromptInput in favor
