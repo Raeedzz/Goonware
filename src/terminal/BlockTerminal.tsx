@@ -532,22 +532,6 @@ export function BlockTerminal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Force re-anchoring when agent mode turns on — i.e. a new agent
-  // is detected in this pane. The input bar hides, the PTY re-fits
-  // to claim that ~80px, and `term_resize` bumps the next liveFrame.
-  // We just flip stickToBottomRef back on so the existing scroll
-  // anchor (above) snaps on the next frame. Snapping IMMEDIATELY
-  // here would land the user in empty space, because the buffer
-  // hasn't grown yet to fill the new container height — the agent's
-  // first paint is still in flight.
-  const prevAgentModeRef = useRef(agentMode);
-  useLayoutEffect(() => {
-    const wasAgent = prevAgentModeRef.current;
-    prevAgentModeRef.current = agentMode;
-    if (wasAgent || !agentMode) return;
-    stickToBottomRef.current = true;
-  }, [agentMode]);
-
   // PTY died (process crashed, backend restarted on a Rust hot-reload,
   // user `exit`-ed the shell, etc.). Drop out of agent mode so the
   // user isn't staring at a blank pane that used to be claude. The
@@ -580,6 +564,22 @@ export function BlockTerminal({
   // After the PTY exits, downshift back to shell-mode chrome regardless
   // of what the last frame's flags were — those readings are stale.
   const agentMode = !exited && (altScreen || foregroundIsAgent);
+
+  // Force re-anchoring when agent mode turns on — i.e. a new agent
+  // is detected in this pane. The input bar hides, the PTY re-fits
+  // to claim that ~80px, and `term_resize` bumps the next liveFrame.
+  // We just flip stickToBottomRef back on so the existing scroll
+  // anchor snaps on the next frame. Snapping IMMEDIATELY here would
+  // land the user in empty space, because the buffer hasn't grown
+  // yet to fill the new container height — the agent's first paint
+  // is still in flight.
+  const prevAgentModeRef = useRef(agentMode);
+  useLayoutEffect(() => {
+    const wasAgent = prevAgentModeRef.current;
+    prevAgentModeRef.current = agentMode;
+    if (wasAgent || !agentMode) return;
+    stickToBottomRef.current = true;
+  }, [agentMode]);
 
   // Bell visualization — a brief, soft pulse on the input zone every
   // time the shell emits BEL. We just track "is currently flashing"
