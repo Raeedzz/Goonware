@@ -6,6 +6,12 @@ import type { Block as BlockType } from "./types";
 
 interface Props {
   block: BlockType;
+  /**
+   * Disable soft-wrap on shell output rows. Used by the narrow
+   * right-panel secondary terminal so long lines pan via horizontal
+   * scroll instead of wrapping. Agent blocks already render no-wrap.
+   */
+  noWrap?: boolean;
 }
 
 /**
@@ -24,7 +30,7 @@ interface Props {
  * blocks with empty input keep the full transcript so we don't drop
  * content.
  */
-export function Block({ block }: Props) {
+export function Block({ block, noWrap = false }: Props) {
   const isAgent = useMemo(() => isAgentInput(block.input), [block.input]);
   const lines = useMemo(
     () => computeClosedBlockLines(block.blockRows, block.transcript, isAgent),
@@ -128,7 +134,7 @@ export function Block({ block }: Props) {
       {hasBody && (
         <div style={{ color: "var(--text-secondary)" }}>
           {bodyLines.map((spans, i) => (
-            <CellRow key={i} spans={spans} wrap={!isAgent} />
+            <CellRow key={i} spans={spans} wrap={!isAgent && !noWrap} />
           ))}
         </div>
       )}

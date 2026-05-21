@@ -1286,7 +1286,7 @@ export function BlockTerminal({
               hiding history. `shouldRenderBlockList` always returns
               true and exists so the regression is pinned by a test. */}
           {shouldRenderBlockList(foregroundIsAgent) && (
-            <BlockList blocks={blocks} />
+            <BlockList blocks={blocks} noWrap={allowHorizontalScroll} />
           )}
           {liveFrame?.command_running && !exited && (
             <LiveBlock
@@ -1294,6 +1294,7 @@ export function BlockTerminal({
               frame={liveFrame}
               cwd={effectiveCwd}
               preserveGrid={foregroundIsAgent}
+              noWrap={allowHorizontalScroll}
               // Agent TUIs own the surface — let the LiveBlock fill
               // the pane instead of sizing to content. Without this,
               // a tall agent grid (claude with the slash-command
