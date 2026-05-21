@@ -227,22 +227,43 @@ export function CanvasGrid({
   }, [frame, rows]);
 
   // Resize the canvas when the container changes.
+  //
+  // rAF-coalesced. `renderer.resize` reallocates the canvas's WebGPU
+  // backbuffer (canvas.width = …) and forces a full repaint by
+  // invalidating `lastSeq`. During a live window-drag in the bundled
+  // DMG the ResizeObserver fires up to 120× per second, and without
+  // coalescing the GPU sees a backbuffer realloc per OS sample —
+  // visible as the "super jittery" resize the user reported. The
+  // splitter-drag path in AppShell.tsx already uses the same rAF
+  // pattern, and Warp's Throttle stream (warpdotdev/warp
+  // `app/src/throttle.rs`) solves the same problem on the desktop
+  // side. Folding to one resize per frame matches the GPU's render
+  // cadence.
   useEffect(() => {
     const wrapper = wrapperRef.current;
     if (!wrapper) return;
-    const observer = new ResizeObserver((entries) => {
+    let rafId: number | null = null;
+    let pending: { width: number; height: number } | null = null;
+    const flush = () => {
+      rafId = null;
+      const next = pending;
+      pending = null;
+      if (!next) return;
       const renderer = rendererRef.current;
       if (!renderer) return;
-      const rect = entries[0].contentRect;
-      renderer.resize(
-        rect.width,
-        rect.height,
-        window.devicePixelRatio || 1,
-      );
+      renderer.resize(next.width, next.height, window.devicePixelRatio || 1);
       renderRequest(renderer);
+    };
+    const observer = new ResizeObserver((entries) => {
+      const rect = entries[0].contentRect;
+      pending = { width: rect.width, height: rect.height };
+      if (rafId === null) rafId = window.requestAnimationFrame(flush);
     });
     observer.observe(wrapper);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+    };
   }, []);
 
   // Repaint at the new DPR when the user drags GLI between a Retina
