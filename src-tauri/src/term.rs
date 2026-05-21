@@ -47,7 +47,27 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State, Wry};
 
-const SCROLLBACK_LIMIT: usize = 10_000;
+/// Effectively unbounded scrollback. We expose this as `total_lines()`
+/// from the `Dimensions` trait (added to `rows`), so the value MUST
+/// leave headroom for that addition without overflowing `usize`. Half
+/// of `usize::MAX` is the canonical "infinity that survives `+ rows`"
+/// pattern; on 64-bit platforms it's ~9.2e18 lines, which no real
+/// session will ever reach. alacritty initializes scrollback rows
+/// dynamically, so a sky-high cap doesn't pre-allocate memory — rows
+/// are only stored when the user actually scrolls into them.
+const SCROLLBACK_LIMIT: usize = usize::MAX / 2;
+
+/// `alacritty_terminal::term::Config` with our unbounded scrollback
+/// applied. `Config::default()` ships `scrolling_history: 10_000`,
+/// which would silently truncate long agent sessions to the most
+/// recent 10k rows once they overflow. Always go through this helper
+/// instead of calling `TermConfig::default()` directly.
+fn term_config() -> TermConfig {
+    TermConfig {
+        scrolling_history: SCROLLBACK_LIMIT,
+        ..TermConfig::default()
+    }
+}
 /// Frame throttle while the session is visible to the user AND the
 /// Goonware window has focus. 8 ms ≈ one frame at 120 Hz, matching the
 /// MacBook Pro / Pro Display XDR ProMotion refresh rate. On non-
@@ -1339,7 +1359,7 @@ fn snapshot_transcript(transcript: &str, cols: u16, rows: u16) -> Vec<RowSnapsho
     // agent's final TUI state as scrollable history, mirroring
     // Warp's "Ctrl+C preserves the conversation" behaviour.
     let trimmed = strip_trailing_screen_destruction(transcript);
-    let mut term = Term::new(TermConfig::default(), &dims, NullEventProxy);
+    let mut term = Term::new(term_config(), &dims, NullEventProxy);
     let mut parser: Processor = Processor::new();
     parser.advance(&mut term, trimmed.as_bytes());
     // Walk visible + scrollback. With the default TermConfig the
@@ -1994,7 +2014,7 @@ pub fn term_start(
         cols: args.cols as usize,
         rows: args.rows as usize,
     };
-    let term = Term::new(TermConfig::default(), &dims, proxy);
+    let term = Term::new(term_config(), &dims, proxy);
     let initial_snapshot = snapshot_grid(&term);
 
     let session = Arc::new(Mutex::new(Session {
@@ -2987,7 +3007,7 @@ mod tests {
 
     fn run_both_paths(transcript: &[u8], cols: usize, rows: usize) -> (Vec<RowSnapshot>, Vec<RowSnapshot>) {
         let dims = Dims { cols: cols.max(1), rows: rows.max(1) };
-        let mut term = Term::new(TermConfig::default(), &dims, NullEventProxy);
+        let mut term = Term::new(term_config(), &dims, NullEventProxy);
         let mut parser: Processor = Processor::new();
         parser.advance(&mut term, transcript);
         let new_path = snapshot_grid(&term);

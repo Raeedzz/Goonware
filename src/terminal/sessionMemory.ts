@@ -16,13 +16,13 @@
  * when the session is permanently deleted, via forgetSession (which
  * fires term_close for each matching ptyId).
  *
- * Caps: blocks are capped per session at MAX_BLOCKS to bound memory.
+ * Caps: none. Block scrollback and typed-input history grow without
+ * bound — the user wants to see every row of every agent that ever
+ * ran in this session. Memory is bounded in practice by how much an
+ * actual session produces.
  */
 import { invoke } from "@tauri-apps/api/core";
 import type { Block, RenderFrame, Span } from "./types";
-
-const MAX_BLOCKS = 500;
-const MAX_HISTORY = 100;
 
 interface Memory {
   blocks: Block[];
@@ -64,8 +64,7 @@ export function getBlocks(id: string): Block[] {
 }
 
 export function setBlocks(id: string, blocks: Block[]): void {
-  const m = ensure(id);
-  m.blocks = blocks.length > MAX_BLOCKS ? blocks.slice(-MAX_BLOCKS) : blocks;
+  ensure(id).blocks = blocks;
 }
 
 export function getHistory(id: string): string[] {
@@ -73,8 +72,7 @@ export function getHistory(id: string): string[] {
 }
 
 export function setHistory(id: string, history: string[]): void {
-  const m = ensure(id);
-  m.history = history.length > MAX_HISTORY ? history.slice(0, MAX_HISTORY) : history;
+  ensure(id).history = history;
 }
 
 export function getRows(id: string): Span[][] {

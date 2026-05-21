@@ -304,9 +304,17 @@ pub struct FlatStorage {
 }
 
 impl FlatStorage {
-    /// Construct an empty grid with `max_rows` scrollback cap.
+    /// Construct an empty grid with `max_rows` scrollback cap. The cap
+    /// and the initial Vec capacity are decoupled — callers can pass
+    /// `usize::MAX` for "unbounded scrollback" without trying to
+    /// pre-allocate a usize::MAX-sized Vec. Actual storage grows
+    /// dynamically as rows are pushed.
     pub fn with_capacity(max_rows: usize) -> Self {
-        let mut row_index = Vec::with_capacity(max_rows + 1);
+        // Cap the initial Vec allocation. The row index grows on demand
+        // via the usual amortized doubling — this is just a hint to
+        // avoid the first few reallocations.
+        let initial_capacity = max_rows.saturating_add(1).min(4096);
+        let mut row_index = Vec::with_capacity(initial_capacity);
         row_index.push(0);
         Self {
             text: String::new(),
