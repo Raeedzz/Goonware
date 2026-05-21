@@ -388,7 +388,15 @@ mod tests {
         for i in 1..=(CAP + 5) {
             w.save_block(mk_block(i, &format!("cmd-{i}")));
         }
-        wait_for(|| load_blocks(&path, "pty-A").map(|v| v.len() as i64).unwrap_or(0) == CAP);
+        // Each insert is atomic with its own eviction, so len pins at
+        // CAP as soon as the 500th block lands — checking len alone
+        // races against the trailing 5 inserts still in the writer
+        // mailbox. Wait until the *final* block_id is visible.
+        wait_for(|| {
+            load_blocks(&path, "pty-A")
+                .map(|v| v.last().map(|b| b.block_id) == Some(CAP + 5))
+                .unwrap_or(false)
+        });
 
         let blocks = load_blocks(&path, "pty-A").unwrap();
         assert_eq!(blocks.len(), CAP as usize);
