@@ -255,6 +255,21 @@ pub fn fs_cwd() -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Bulk path existence check. Used on app startup to mark worktrees
+/// whose backing directory was deleted between launches so the sidebar
+/// can surface a clear "missing" state instead of letting every
+/// downstream call (term_start, git_status, etc.) fail with the cryptic
+/// `cwd does not exist` error.
+///
+/// Returns a vec of the same length and order as `paths` — each entry
+/// is `true` if the path exists on disk, `false` otherwise. Errors
+/// land as `false` rather than failing the batch; the caller can
+/// always assume a result for every input.
+#[tauri::command]
+pub fn fs_paths_exist(paths: Vec<String>) -> Vec<bool> {
+    paths.iter().map(|p| Path::new(p).exists()).collect()
+}
+
 #[tauri::command]
 pub fn system_home_dir() -> Result<String, String> {
     dirs::home_dir()

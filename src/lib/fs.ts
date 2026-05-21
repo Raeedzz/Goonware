@@ -22,6 +22,8 @@ export const fs = {
   scanProjectIcon: (path: string) =>
     invoke<string | null>("fs_scan_project_icon", { path }),
   cwd: () => invoke<string>("fs_cwd"),
+  pathsExist: (paths: string[]) =>
+    invoke<boolean[]>("fs_paths_exist", { paths }),
 };
 
 /* ------------------------------------------------------------------

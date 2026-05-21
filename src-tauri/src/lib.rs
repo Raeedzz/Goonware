@@ -193,6 +193,7 @@ pub fn run() {
             fs::fs_write_text_file,
             fs::fs_scan_project_icon,
             fs::fs_cwd,
+            fs::fs_paths_exist,
             fs::system_home_dir,
             fs::system_open,
             fs::system_open_with,

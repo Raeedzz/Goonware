@@ -14,7 +14,11 @@ import {
   useAppState,
   useWorktreeTabs,
 } from "@/state/AppState";
-import type { Tab, TerminalTab, Worktree } from "@/state/types";
+import type { Project, Tab, TerminalTab, Worktree } from "@/state/types";
+import { projectSettings } from "@/state/types";
+import { worktreeArchive } from "@/lib/worktrees";
+import { useToast } from "@/primitives/Toast";
+import { FolderOffIcon } from "hugeicons-react";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { DiffView } from "@/git/DiffView";
@@ -53,6 +57,19 @@ export function MainColumn() {
       >
         Open a project to begin.
       </div>
+    );
+  }
+
+  // Worktree's directory was deleted between launches. Render a
+  // recovery panel instead of trying to start a PTY (which would fail
+  // with `cwd does not exist: …` and leave the user staring at the
+  // raw Rust error). The two actions mirror what the user can do:
+  // archive it (force-forget on the backend — no git ops on the
+  // missing path) or, if they re-created the directory manually,
+  // close & reopen the app to retrigger the validation sweep.
+  if (worktree.missing) {
+    return (
+      <MissingWorktreeView worktree={worktree} project={project} />
     );
   }
 
@@ -1273,6 +1290,154 @@ function Kbd({ children }: { children: React.ReactNode }) {
     >
       {children}
     </kbd>
+  );
+}
+
+/**
+ * Recovery panel shown in place of the terminal when the active
+ * worktree's backing directory has been deleted on disk. Without this,
+ * activating the row cascades into `cwd does not exist: …` errors from
+ * every command that takes a cwd (term_start, git_status, helper-agent
+ * spawn) and the user is stuck — they can't even archive the row to
+ * get rid of it, because archive also tried to `git -C <missing-path>`.
+ *
+ * The "Remove from sidebar" action calls `worktreeArchive` with the
+ * project_path argument the backend uses to fall back to a force-forget
+ * path (no git ops on the missing dir, `git worktree prune` from the
+ * project root to clean up stale metadata).
+ */
+function MissingWorktreeView({
+  worktree,
+  project,
+}: {
+  worktree: Worktree;
+  project: Project;
+}) {
+  const dispatch = useAppDispatch();
+  const state = useAppState();
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+
+  const onForgetWorktree = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const cfg = projectSettings(project);
+      const record = await worktreeArchive(worktree, project.path, {
+        stash: false,
+        force: false,
+        deleteBranch: state.settings.deleteBranchOnArchive,
+        archiveScript: cfg.archiveScript,
+      });
+      dispatch({ type: "archive-worktree", id: worktree.id, record });
+      toast.show({ message: `Removed missing worktree ${worktree.name}` });
+    } catch (err) {
+      toast.show({ message: `Couldn't remove: ${err}` });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        height: "100%",
+        display: "grid",
+        placeItems: "center",
+        padding: "var(--space-4)",
+        backgroundColor: "var(--surface-2)",
+        color: "var(--text-secondary)",
+        fontFamily: "var(--font-sans)",
+      }}
+    >
+      <div
+        style={{
+          width: "min(440px, 100%)",
+          padding: "20px 22px 18px",
+          backgroundColor: "var(--surface-1)",
+          border: "1px solid var(--border-strong)",
+          borderRadius: "var(--radius-md)",
+          display: "flex",
+          flexDirection: "column",
+          gap: 12,
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            color: "var(--state-error)",
+          }}
+        >
+          <FolderOffIcon size={18} />
+          <h2
+            style={{
+              margin: 0,
+              fontSize: "var(--text-md)",
+              fontWeight: "var(--weight-semibold)",
+              color: "var(--text-primary)",
+            }}
+          >
+            Worktree directory is missing
+          </h2>
+        </div>
+        <p
+          style={{
+            margin: 0,
+            fontSize: "var(--text-sm)",
+            color: "var(--text-secondary)",
+            lineHeight: 1.5,
+          }}
+        >
+          Goonware can't find the folder backing{" "}
+          <span style={{ color: "var(--text-primary)", fontWeight: 500 }}>
+            {worktree.name}
+          </span>
+          . It was deleted from disk or the volume isn't mounted.
+        </p>
+        <code
+          style={{
+            display: "block",
+            padding: "8px 10px",
+            backgroundColor: "var(--surface-3)",
+            border: "var(--border-1)",
+            borderRadius: "var(--radius-sm)",
+            fontFamily: "var(--font-mono)",
+            fontSize: "var(--text-xs)",
+            color: "var(--text-tertiary)",
+            wordBreak: "break-all",
+          }}
+        >
+          {worktree.path}
+        </code>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 8,
+            marginTop: 4,
+          }}
+        >
+          <DialogButton
+            variant="primary"
+            onClick={() => void onForgetWorktree()}
+          >
+            {busy ? "Removing…" : "Remove from sidebar"}
+          </DialogButton>
+        </div>
+        <p
+          style={{
+            margin: 0,
+            fontSize: "var(--text-xs)",
+            color: "var(--text-tertiary)",
+          }}
+        >
+          If you recreated the folder, restart Goonware to retry the
+          path check.
+        </p>
+      </div>
+    </div>
   );
 }
 
