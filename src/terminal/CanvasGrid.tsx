@@ -389,10 +389,65 @@ export function CanvasGrid({
           pendingTimers.push(id);
         });
     };
-    attemptBootstrap(0);
+    // Defer bootstrap until WKWebView's compositor has allocated the
+    // canvas's IOSurface. React's useEffect fires AFTER the commit
+    // but BEFORE the next paint cycle — at which point the brand-new
+    // canvas has no compositor layer yet. If `context.configure()`
+    // (inside createGridRenderer) runs in that window, WKWebView
+    // hands back a swapchain bound to a pending-and-never-resolved
+    // surface handle: getCurrentTexture() succeeds, draws are
+    // submitted, but the pixels never reach the screen. User sees
+    // the wrapper's surface-0 background through the canvas =
+    // "agent opens with a black canvas, but typing still works."
+    //
+    // The compositor allocates the layer during the next paint
+    // cycle. A requestAnimationFrame callback fires right before
+    // each paint, so by the time TWO rAFs have fired, the previous
+    // frame's paint (and its compositor work) is fully complete on
+    // both the main and compositor threads. We bootstrap then.
+    //
+    // The 100 ms setTimeout is a fallback for when rAFs aren't
+    // firing — e.g. the Goonware window is occluded by another
+    // macOS window. Whichever fires first kicks the bootstrap.
+    // Under normal foreground use the rAFs win (~32 ms);
+    // backgrounded windows progress on the timeout (100 ms).
+    let rafA: number | null = null;
+    let rafB: number | null = null;
+    let timeoutId: number | null = null;
+    let bootstrapKicked = false;
+    const kickBootstrap = () => {
+      if (bootstrapKicked || cancelled) return;
+      bootstrapKicked = true;
+      if (rafA !== null) {
+        cancelAnimationFrame(rafA);
+        rafA = null;
+      }
+      if (rafB !== null) {
+        cancelAnimationFrame(rafB);
+        rafB = null;
+      }
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+      attemptBootstrap(0);
+    };
+    rafA = requestAnimationFrame(() => {
+      rafA = null;
+      if (cancelled || bootstrapKicked) return;
+      rafB = requestAnimationFrame(() => {
+        rafB = null;
+        if (cancelled || bootstrapKicked) return;
+        kickBootstrap();
+      });
+    });
+    timeoutId = window.setTimeout(kickBootstrap, 100);
 
     return () => {
       cancelled = true;
+      if (rafA !== null) cancelAnimationFrame(rafA);
+      if (rafB !== null) cancelAnimationFrame(rafB);
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
       for (const id of pendingTimers) window.clearTimeout(id);
       rendererRef.current?.destroy();
       rendererRef.current = null;

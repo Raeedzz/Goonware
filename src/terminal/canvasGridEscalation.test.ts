@@ -205,3 +205,56 @@ describe("source pin — GridRenderer exposes successfulDrawCount", () => {
     expect(rendererSrc).toMatch(/successfulDraws\+\+/);
   });
 });
+
+/**
+ * Source pin: CanvasGrid must defer createGridRenderer until after
+ * WKWebView's compositor has had a chance to allocate the canvas's
+ * IOSurface. React useEffect fires before the next paint cycle, so
+ * if context.configure() runs synchronously on mount, the swapchain
+ * binds to a not-yet-existing surface handle and the user sees a
+ * permanently black canvas. The fix is to wait two requestAnimation-
+ * Frame callbacks (each fires after a completed paint), with a
+ * setTimeout fallback for when the window is occluded and rAFs
+ * stop firing.
+ *
+ * If a future refactor removes the deferral and bootstraps
+ * synchronously on mount, these tests trip — instead of regressing
+ * back to "second agent opens with a black canvas."
+ */
+describe("source pin — CanvasGrid defers bootstrap past the compositor race", () => {
+  const canvasGridSrc = readFileSync(
+    join(import.meta.dir, "CanvasGrid.tsx"),
+    "utf8",
+  );
+
+  test("bootstrap is scheduled via requestAnimationFrame, not called synchronously", () => {
+    // The kick path goes through requestAnimationFrame in the
+    // bootstrap useEffect. Without these calls the bootstrap would
+    // fire synchronously and hit the zombie-swapchain race.
+    expect(canvasGridSrc).toMatch(/requestAnimationFrame\s*\(/);
+  });
+
+  test("two rAFs are chained (compositor needs a full frame to settle)", () => {
+    // The inner rAF nested inside the outer rAF's callback is what
+    // gives WKWebView a full paint cycle (not just a layout) before
+    // configure() binds the swapchain.
+    const matches = canvasGridSrc.match(/requestAnimationFrame\s*\(/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("setTimeout fallback exists for occluded windows where rAFs stall", () => {
+    // rAFs don't fire while the page isn't rendering. Without a
+    // wall-clock fallback, opening a worktree behind another macOS
+    // window would deadlock bootstrap until the window returned.
+    expect(canvasGridSrc).toMatch(
+      /window\.setTimeout\s*\(\s*kickBootstrap\s*,\s*100\s*\)/,
+    );
+  });
+
+  test("rAF + timeout cleanup happens on unmount", () => {
+    // Without cancelAnimationFrame the deferred bootstrap would
+    // race a rendererEpoch bump or component unmount and fire
+    // attemptBootstrap against a destroyed canvas.
+    expect(canvasGridSrc).toMatch(/cancelAnimationFrame\s*\(/);
+  });
+});
