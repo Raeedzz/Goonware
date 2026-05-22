@@ -403,6 +403,94 @@ pub async fn system_clipboard_read_text() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Try to extract an image from the macOS pasteboard, write it to
+/// `/tmp/goonware-paste/`, and return the file path. Returns Ok(None)
+/// when the clipboard does not hold an image (so the caller knows to
+/// fall back to text paste).
+///
+/// Why this exists: the frontend used to call
+/// `navigator.clipboard.read()` to fish image bytes out of the
+/// clipboard for Cmd+V'd screenshots. That browser API triggers the
+/// macOS "Apps want to read your clipboard" TCC dialog — the
+/// user-perceived "weird paste popup that shouldn't show up." This
+/// command runs through AppKit's NSPasteboard via osascript, which is
+/// treated by macOS as a first-party paste — no popup, no prompt.
+///
+/// Implementation: osascript reads the pasteboard `«class PNGf»`
+/// flavor (PNG image data) and writes the raw bytes to disk. AppKit
+/// automatically transcodes whatever's on the pasteboard (raw NSImage,
+/// TIFF, PICT, BMP, …) into PNG on read, which makes "screenshot →
+/// Cmd+V" deterministic regardless of how the screenshot tool stored
+/// the image (Cmd+Shift+4 lands as TIFF, web image copies land as
+/// raw bytes of whatever MIME the page provided, etc.).
+///
+/// Returns the absolute path on success. Returns Ok(None) for an empty
+/// pasteboard or one holding only text. Returns Err only on filesystem
+/// errors (mkdir, write) — the osascript call itself never fails the
+/// command (it always exits zero, even when the pasteboard has no
+/// image data; we detect that by checking the temp file's size after
+/// the write).
+#[tauri::command]
+pub async fn system_clipboard_save_image_to_temp() -> Result<Option<String>, String> {
+    let dir = std::env::temp_dir().join("goonware-paste");
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let nonce: u32 = (stamp as u32).wrapping_mul(2654435761);
+    let path = dir.join(format!("paste-{stamp}-{nonce:08x}.png"));
+
+    // AppleScript: grab «class PNGf» from the pasteboard, write the
+    // bytes to the target path. The `try` block makes the script
+    // exit cleanly when there's no image on the pasteboard (instead
+    // of erroring out with "Can't make data … into PNG"), so the
+    // caller can distinguish "no image" (empty file) from "write
+    // failed" (filesystem error).
+    let script = format!(
+        r#"try
+    set theData to the clipboard as «class PNGf»
+    set theFile to open for access POSIX file "{}" with write permission
+    write theData to theFile
+    close access theFile
+on error
+    try
+        close access POSIX file "{}"
+    end try
+end try"#,
+        path.to_string_lossy(),
+        path.to_string_lossy(),
+    );
+
+    let status = Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("spawn osascript: {e}"))?;
+    if !status.success() {
+        // osascript itself failed (rare — we wrapped the body in a
+        // try block). Clean up any partial file we may have written
+        // and report no image; the caller will fall back to text.
+        let _ = fs::remove_file(&path);
+        return Ok(None);
+    }
+
+    // No image on the pasteboard → the `try` block exited without
+    // writing anything; either the file was never created or it's
+    // zero bytes.
+    match fs::metadata(&path) {
+        Ok(meta) if meta.len() > 0 => Ok(Some(path.to_string_lossy().into_owned())),
+        _ => {
+            let _ = fs::remove_file(&path);
+            Ok(None)
+        }
+    }
+}
+
 /// Opens a path in a named application (e.g. "Visual Studio Code",
 /// "Sublime Text", "Safari", "Google Chrome"). Uses `open -a` on macOS.
 #[tauri::command]

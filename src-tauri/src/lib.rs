@@ -229,6 +229,7 @@ pub fn run() {
             fs::system_open_with,
             fs::system_save_image_to_temp,
             fs::system_clipboard_read_text,
+            fs::system_clipboard_save_image_to_temp,
             // State persistence
             state::state_save,
             state::state_load,
@@ -708,26 +709,25 @@ mod clipboard_handler_gating_tests {
     }
 
     #[test]
-    fn pbpaste_fallback_command_is_registered() {
-        // The Ctrl+V fallback chain ends in a Tauri command that
-        // shells out to `/usr/bin/pbpaste`. macOS Sequoia silently
-        // returns "" from `navigator.clipboard.readText()` after a
-        // denied per-app clipboard prompt — Ctrl+V then no-ops in
-        // PromptInput / PtyPassthrough.
+    fn pbpaste_primary_path_command_is_registered() {
+        // Cmd+V's primary clipboard-read path is a Tauri command
+        // that shells out to `/usr/bin/pbpaste`. Going through
+        // AppKit's NSPasteboard (the path pbpaste uses) does NOT
+        // trigger the macOS "Apps want to read your clipboard" TCC
+        // popup — exactly the "weird paste popup" the user reported.
         //
-        // The fallback ONLY works if (a) the command exists in
-        // fs.rs, and (b) lib.rs registers it in invoke_handler.
-        // Either gap on its own re-introduces the bug. Pin both
-        // points here so a future commit dropping either of them
-        // flunks `cargo test --lib`.
+        // The path ONLY works if (a) the command exists in fs.rs,
+        // and (b) lib.rs registers it in invoke_handler. Either gap
+        // re-introduces the bug. Pin both points here so a future
+        // commit dropping either flunks `cargo test --lib`.
         let fs_rs = read_repo_file("src-tauri/src/fs.rs");
         assert!(
             fs_rs.contains("pub async fn system_clipboard_read_text"),
             "src-tauri/src/fs.rs must declare a `system_clipboard_read_text` \
-             #[tauri::command] — that's the pbpaste fallback the Ctrl+V \
-             handlers in PromptInput.tsx / PtyPassthrough.tsx call when \
-             navigator.clipboard.readText() silently returns \"\" on \
-             macOS Sequoia. Without this command, Ctrl+V silently breaks."
+             #[tauri::command] — that's the pbpaste path the Cmd+V \
+             handlers in PromptInput.tsx / PtyPassthrough.tsx call FIRST. \
+             Without this command, the fallback drops to WebKit's \
+             clipboard API and the macOS TCC popup re-surfaces."
         );
         assert!(
             fs_rs.contains("Command::new(\"/usr/bin/pbpaste\")"),
@@ -737,15 +737,105 @@ mod clipboard_handler_gating_tests {
              see inherit_login_shell_env() in lib.rs for the same gotcha \
              on the spawned-PTY side."
         );
+        // Pin the image clipboard reader — second part of the no-
+        // popup contract. Without this, the image-paste branch in
+        // PtyPassthrough falls back to `navigator.clipboard.read()`
+        // which fires the same TCC popup as readText().
+        assert!(
+            fs_rs.contains("pub async fn system_clipboard_save_image_to_temp"),
+            "src-tauri/src/fs.rs must declare \
+             `system_clipboard_save_image_to_temp` — the AppKit-routed \
+             image clipboard reader. The PtyPassthrough Cmd+V handler \
+             calls this BEFORE the text path so screenshot pastes \
+             (Cmd+Shift+Ctrl+4 → Cmd+V) don't fire the TCC popup. \
+             Drop this command and image paste silently fails OR \
+             re-introduces the popup."
+        );
         let lib_rs = read_repo_file("src-tauri/src/lib.rs");
         assert!(
             lib_rs.contains("fs::system_clipboard_read_text"),
             "lib.rs invoke_handler must register \
              `fs::system_clipboard_read_text` or the frontend's \
              invoke(\"system_clipboard_read_text\") rejects with \
-             \"command not found\" and the fallback returns null — \
-             Ctrl+V silently no-ops again."
+             \"command not found\" and Cmd+V drops to the WebKit \
+             API + its TCC popup."
         );
+        assert!(
+            lib_rs.contains("fs::system_clipboard_save_image_to_temp"),
+            "lib.rs invoke_handler must register \
+             `fs::system_clipboard_save_image_to_temp` or the image \
+             clipboard branch in PtyPassthrough rejects with \"command \
+             not found\" and screenshot paste silently no-ops."
+        );
+    }
+
+    #[test]
+    fn clipboard_read_helper_tries_native_before_webkit() {
+        // The whole point of the inverted fallback order is to skip
+        // the macOS TCC clipboard popup on every Cmd+V. The browser
+        // `navigator.clipboard.readText()` is the layer that triggers
+        // it — calling that BEFORE the native pbpaste path defeats
+        // the purpose. Pin the structural ordering so a future
+        // "WebKit is faster, try it first" refactor regresses loudly
+        // instead of silently.
+        //
+        // Strip line comments from the source before searching — the
+        // doc-comment at the top of clipboardRead.ts legitimately
+        // mentions `navigator.clipboard.readText()` to explain why
+        // we route around it, and we don't want that comment to
+        // confuse the ordering grep.
+        let raw = read_repo_file("src/terminal/clipboardRead.ts");
+        let src: String = raw
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("*")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let native_idx = src
+            .find("nativeReader()")
+            .expect("clipboardRead.ts must call the native reader in code");
+        let web_idx = src
+            .find("navigator.clipboard.readText()")
+            .expect("clipboardRead.ts must reference navigator.clipboard.readText as the fallback in code");
+        assert!(
+            native_idx < web_idx,
+            "clipboardRead.ts must call the native (pbpaste) reader BEFORE \
+             navigator.clipboard.readText(). Reversing the order re-introduces \
+             the macOS TCC clipboard popup on every Cmd+V."
+        );
+    }
+
+    #[test]
+    fn keepalive_layers_use_visibility_not_display_none() {
+        // WKWebView releases a canvas's WebGPU swapchain under
+        // `display: none` without firing `device.lost`. The next
+        // paint after un-hiding lands on a dead surface and the
+        // user sees a fully-black agent pane. Switching the
+        // keepalive layers to `visibility: hidden` keeps the GPU
+        // surface alive across tab/worktree switches — structural
+        // fix that doesn't depend on a recovery layer holding up.
+        for path in [
+            "src/shell/MainColumn.tsx",
+            "src/shell/RightPanel.tsx",
+        ] {
+            let src = read_repo_file(path);
+            // Locate the keepalive slot's style block and assert the
+            // visibility toggle is present. We don't grep the full
+            // file for `display: "none"` because legitimate non-
+            // keepalive callsites use it (e.g. modal close, dropdown
+            // hide). The visibility chord is unique enough to the
+            // keepalive contract that finding it is sufficient.
+            assert!(
+                src.contains("visibility:") && src.contains("\"hidden\""),
+                "{} must use `visibility: \"hidden\"` (not `display: \"none\"`) \
+                 for its terminal keepalive slot. `display: none` releases \
+                 WKWebView's WebGPU swapchain and the user sees a black \
+                 pane on tab/worktree switch.",
+                path,
+            );
+        }
     }
 
     #[test]

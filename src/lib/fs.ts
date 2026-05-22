@@ -80,10 +80,10 @@ export const system = {
     }),
   /**
    * Read the system clipboard as plain text via the native macOS
-   * `pbpaste`. Used as a fallback by Ctrl+V handlers when
-   * `navigator.clipboard.readText()` returns empty — see the doc on
-   * `system_clipboard_read_text` in src-tauri/src/fs.rs for the
-   * macOS 15+ permission gate that motivates this path.
+   * `pbpaste`. This is the PRIMARY clipboard-read path (not a
+   * fallback) — see the doc on `system_clipboard_read_text` in
+   * src-tauri/src/fs.rs for why we route around the WebKit clipboard
+   * API on macOS to avoid the TCC popup.
    *
    * Returns "" rather than rejecting when the clipboard is empty or
    * pbpaste exits non-zero, so callers can chain a simple
@@ -91,6 +91,19 @@ export const system = {
    * if the IPC bridge itself failed (Tauri host gone).
    */
   readClipboardText: () => invoke<string>("system_clipboard_read_text"),
+  /**
+   * Try to extract an image from the macOS pasteboard, write it to
+   * `/tmp/goonware-paste/`, and return the file path. Resolves to
+   * null when the pasteboard does not hold an image (so the caller
+   * knows to fall back to a text paste).
+   *
+   * Goes through AppKit's NSPasteboard (via osascript), which macOS
+   * treats as a first-party paste — no TCC clipboard popup. The
+   * previous browser-side `navigator.clipboard.read()` path fired
+   * the popup on every screenshot Cmd+V.
+   */
+  saveClipboardImageToTemp: () =>
+    invoke<string | null>("system_clipboard_save_image_to_temp"),
 };
 
 function bytesToBase64(bytes: Uint8Array): string {

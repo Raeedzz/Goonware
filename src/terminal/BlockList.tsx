@@ -11,6 +11,21 @@ interface Props {
    * closed blocks already render no-wrap regardless of this flag.
    */
   noWrap?: boolean;
+  /**
+   * Phase 4 — Warp-style block interactions. Optional so the
+   * component still renders standalone (tests, secondary panes).
+   *
+   *   onClickInput  Lift a past block's command into the active
+   *                 prompt for editing. Fired by the bold command
+   *                 line of each Block.
+   *   onRerun       Submit the command verbatim, the same way an
+   *                 Enter press would.
+   *   onShare       Forward the whole block to a parent share
+   *                 handler (copy permalink, paste-to-issue, …).
+   */
+  onClickInput?: (command: string) => void;
+  onRerun?: (command: string) => void;
+  onShare?: (block: BlockType) => void;
 }
 
 /**
@@ -26,15 +41,32 @@ interface Props {
  * The scroll position naturally pins at the bottom: no scrollIntoView
  * jitter, no autoscroll race.
  */
-export function BlockList({ blocks, noWrap = false }: Props) {
+export function BlockList({
+  blocks,
+  noWrap = false,
+  onClickInput,
+  onRerun,
+  onShare,
+}: Props) {
   const items = useMemo(() => {
     const out: { id: string; node: React.ReactNode }[] = [];
     for (let i = blocks.length - 1; i >= 0; i--) {
       const block = blocks[i];
-      out.push({ id: block.id, node: <Block block={block} noWrap={noWrap} /> });
+      out.push({
+        id: block.id,
+        node: (
+          <Block
+            block={block}
+            noWrap={noWrap}
+            onClickInput={onClickInput}
+            onRerun={onRerun}
+            onShare={onShare}
+          />
+        ),
+      });
     }
     return out;
-  }, [blocks, noWrap]);
+  }, [blocks, noWrap, onClickInput, onRerun, onShare]);
 
   return (
     <div

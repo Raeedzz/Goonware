@@ -2,30 +2,35 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { readClipboardTextWithFallback } from "./clipboardRead";
 
 /**
- * Regression guards for the layered clipboard-read fallback chain.
+ * Regression guards for the clipboard-read helper.
  *
- * The user-facing bug these tests pin:
- *   "Ctrl+V is still not working in the text box of the terminal,
- *    I can't ctrl+v anything into it."
+ * Two user-facing bugs these tests pin:
  *
- * Root cause: on macOS 15+ (Sequoia), Tauri's WKWebView shows a
- * per-app "Apps want to read your clipboard" prompt the first time
- * `navigator.clipboard.readText()` fires. If the user dismissed or
- * denied it (intentionally or because the prompt appeared behind
- * another window), the web API thereafter returns `""` without
- * throwing — and the Ctrl+V handler in PromptInput / PtyPassthrough
- * silently no-ops.
+ *   1. "Ctrl+V is broken — when I press it nothing happens / a popup
+ *      appears asking permission." On macOS 15+ (Sequoia), the
+ *      WKWebView's `navigator.clipboard.readText()` triggers a per-
+ *      app TCC dialog that the user perceives as a "weird paste
+ *      popup." Even a granted prompt can re-fire on a schedule, and
+ *      a declined prompt silently returns `""` thereafter — making
+ *      Ctrl+V no-op forever.
  *
- * `readClipboardTextWithFallback()` is the load-bearing helper that
- * fixes this: when the web API returns empty (or throws), it falls
- * through to a Tauri command that shells out to `/usr/bin/pbpaste`,
- * which goes through AppKit's first-party clipboard channel and
- * survives the WebKit-level denial.
+ *   2. "I want it to just paste, like every other macOS app." The
+ *      fix is to bypass the WebKit clipboard layer entirely and read
+ *      through AppKit's NSPasteboard (via pbpaste). AppKit treats a
+ *      pbpaste read as a first-party paste — same trust level as
+ *      Cmd+V in TextEdit — so no TCC popup ever fires.
  *
- * If either layer regresses — the helper stops trying pbpaste when
- * the web API came up empty, or it stops returning a non-empty
- * fallback result — Ctrl+V silently breaks again. These tests catch
- * that before it ships.
+ * The contract these tests pin:
+ *   - The native (pbpaste) reader is the PRIMARY path.
+ *   - The WebKit `navigator.clipboard.readText()` is the LAST-RESORT
+ *     fallback, used only when the native bridge isn't reachable
+ *     (running under `vite dev` outside of `tauri dev`, jsdom tests,
+ *     etc.). A user running the real Goonware macOS DMG should never
+ *     touch the WebKit clipboard API for reads.
+ *
+ * If a future refactor flips the order back ("web API is faster"),
+ * every Cmd+V will surface the popup again — these tests catch that
+ * regression before it ships.
  *
  * The pbpaste reader is dependency-injected; we drive it through the
  * `nativeReader` parameter so the test can simulate the Tauri command
@@ -51,7 +56,8 @@ afterEach(() => {
 /**
  * Install a stubbed `navigator.clipboard.readText()` for one test.
  * Returns a counter so assertions can check "did we even try the web
- * API path before falling back?"
+ * API path?" — we EXPECT it not to be called on the happy native
+ * path.
  */
 function stubNavigatorClipboard(impl: () => Promise<string>): { calls: number } {
   const counter = { calls: 0 };
@@ -66,123 +72,113 @@ function stubNavigatorClipboard(impl: () => Promise<string>): { calls: number } 
   return counter;
 }
 
-describe("readClipboardTextWithFallback — web API is the fast path when allowed", () => {
-  test("returns the web API value directly when non-empty", async () => {
-    stubNavigatorClipboard(async () => "hello world");
-    let nativeCalled = false;
-    const text = await readClipboardTextWithFallback(async () => {
-      nativeCalled = true;
-      throw new Error("pbpaste should NOT be reached on a happy web path");
+describe("readClipboardTextWithFallback — native (pbpaste) is the primary path", () => {
+  test("returns the native value directly when non-empty", async () => {
+    const counter = stubNavigatorClipboard(async () => {
+      throw new Error("WebKit clipboard must NOT be touched on the happy native path");
     });
+    const text = await readClipboardTextWithFallback(async () => "hello world");
     expect(text).toBe("hello world");
-    expect(nativeCalled).toBe(false);
+    // Critical: navigator.clipboard.readText() was never invoked, so
+    // the macOS TCC popup never had a chance to surface.
+    expect(counter.calls).toBe(0);
   });
 
-  test("preserves multi-line clipboard contents from the web API", async () => {
+  test("preserves multi-line clipboard contents from pbpaste", async () => {
     // Bracketed-paste downstream depends on the helper returning the
     // raw clipboard text including embedded newlines. If a future
     // refactor were to e.g. split on \n and return only the first
-    // line, every multi-line Ctrl+V would land as just the header.
-    stubNavigatorClipboard(async () => "line one\nline two\nline three");
-    const text = await readClipboardTextWithFallback(async () => "");
+    // line, every multi-line Cmd+V would land as just the header.
+    stubNavigatorClipboard(async () => {
+      throw new Error("WebKit clipboard must NOT be touched");
+    });
+    const text = await readClipboardTextWithFallback(
+      async () => "line one\nline two\nline three",
+    );
     expect(text).toBe("line one\nline two\nline three");
+  });
+
+  test("returns null (no WebKit retry) when pbpaste returns empty", async () => {
+    // pbpaste returning "" means the clipboard is genuinely empty
+    // (or holds a non-text item). Asking the WebKit API would just
+    // re-confirm with the TCC popup — useless. The helper must bail
+    // with null here, NOT fall through to navigator.clipboard.
+    const counter = stubNavigatorClipboard(async () => {
+      throw new Error("WebKit retry on empty clipboard would re-introduce the popup");
+    });
+    const text = await readClipboardTextWithFallback(async () => "");
+    expect(text).toBeNull();
+    expect(counter.calls).toBe(0);
   });
 });
 
-describe("readClipboardTextWithFallback — pbpaste fallback on the broken-permission path", () => {
-  test("falls back to pbpaste when the web API returns empty string", async () => {
-    // This is the EXACT macOS Sequoia symptom: readText() resolves
-    // with "" instead of throwing. The fallback must engage.
-    stubNavigatorClipboard(async () => "");
-    let nativeCalled = false;
-    const text = await readClipboardTextWithFallback(async () => {
-      nativeCalled = true;
-      return "fallback succeeded";
-    });
-    expect(text).toBe("fallback succeeded");
-    expect(nativeCalled).toBe(true);
-  });
-
-  test("falls back to pbpaste when the web API throws", async () => {
-    // The other failure mode: readText() rejects because the WebKit
-    // permission policy outright denied the call (no Permissions API
-    // grant, no user gesture chain established, etc.). Same outcome
-    // expected from the user's perspective.
-    stubNavigatorClipboard(async () => {
-      throw new DOMException("NotAllowedError", "NotAllowedError");
-    });
-    let nativeCalled = false;
-    const text = await readClipboardTextWithFallback(async () => {
-      nativeCalled = true;
-      return "rust path picked up";
-    });
-    expect(text).toBe("rust path picked up");
-    expect(nativeCalled).toBe(true);
-  });
-
-  test("returns null when BOTH layers come up empty (clipboard is truly empty)", async () => {
-    // If the user really has nothing on the clipboard, both paths
-    // resolve with "". The helper signals this with `null` so the
-    // caller can early-return without splicing an empty string into
-    // the textarea or sending an empty paste to the PTY.
-    stubNavigatorClipboard(async () => "");
-    const text = await readClipboardTextWithFallback(async () => "");
-    expect(text).toBeNull();
-  });
-
-  test("returns null when web API is empty and pbpaste IPC bridge fails", async () => {
-    // Non-Tauri host, test harness without invoke handler, command
-    // not registered, etc. Helper must not bubble the error — the
-    // Ctrl+V handler should silently fall through, not crash the
-    // app.
-    stubNavigatorClipboard(async () => "");
+describe("readClipboardTextWithFallback — WebKit fallback only when native is unreachable", () => {
+  test("falls back to navigator.clipboard.readText when pbpaste throws", async () => {
+    // The Tauri command isn't reachable — e.g. running the
+    // frontend under plain `vite dev` (no `tauri dev`), or a test
+    // harness without the invoke handler registered. ONLY in that
+    // case do we try the browser clipboard API.
+    const counter = stubNavigatorClipboard(async () => "rescued by webkit");
     const text = await readClipboardTextWithFallback(async () => {
       throw new Error("invoke handler missing");
     });
+    expect(text).toBe("rescued by webkit");
+    expect(counter.calls).toBe(1);
+  });
+
+  test("returns null when native throws and webkit also returns empty", async () => {
+    stubNavigatorClipboard(async () => "");
+    const text = await readClipboardTextWithFallback(async () => {
+      throw new Error("no tauri here");
+    });
     expect(text).toBeNull();
   });
 
-  test("returns null when navigator.clipboard is undefined and pbpaste fails", async () => {
-    // Stripped global (some test harnesses don't install a
-    // navigator). Helper should still bail gracefully.
+  test("returns null when native throws and webkit also throws", async () => {
+    stubNavigatorClipboard(async () => {
+      throw new DOMException("NotAllowedError", "NotAllowedError");
+    });
+    const text = await readClipboardTextWithFallback(async () => {
+      throw new Error("no tauri here");
+    });
+    expect(text).toBeNull();
+  });
+
+  test("returns null when navigator.clipboard is undefined and pbpaste throws", async () => {
     g.navigator = {};
     const text = await readClipboardTextWithFallback(async () => {
-      throw new Error("no Tauri here either");
+      throw new Error("no tauri, no navigator");
     });
     expect(text).toBeNull();
   });
 });
 
-describe("readClipboardTextWithFallback — fallback ordering is web → pbpaste, never reversed", () => {
-  // The cost matrix:
-  //   - Web API: in-process, ~0 ms when granted, can show a
-  //     permission prompt on first use.
-  //   - pbpaste: forks a subprocess, ~5–20 ms.
+describe("readClipboardTextWithFallback — ordering is native → webkit, never reversed", () => {
+  // The cost matrix has flipped relative to a browser-only world:
+  //   - pbpaste: forks a subprocess, ~5–20 ms, NO popup ever.
+  //   - WebKit API: in-process, ~0 ms when granted, BUT fires a
+  //     macOS TCC popup on first call and on schedule thereafter.
   //
-  // The web path MUST be tried first or every Ctrl+V on a healthy
-  // install pays subprocess latency for no reason. This test pins
-  // the ordering against a future "always use pbpaste, it's more
-  // reliable" refactor.
-  test("does NOT call pbpaste when the web API succeeds", async () => {
-    stubNavigatorClipboard(async () => "web won");
-    let pbpasteCalled = false;
-    await readClipboardTextWithFallback(async () => {
-      pbpasteCalled = true;
-      return "should not be reached";
-    });
-    expect(pbpasteCalled).toBe(false);
+  // The popup is the dominant user-experience cost, swamping the
+  // subprocess latency. Going native-first eliminates it. This test
+  // pins the ordering against a future "WebKit is faster, try it
+  // first" refactor that would re-introduce the popup.
+  test("does NOT call WebKit clipboard when pbpaste succeeds", async () => {
+    const counter = stubNavigatorClipboard(async () => "should not be reached");
+    await readClipboardTextWithFallback(async () => "native won");
+    expect(counter.calls).toBe(0);
   });
 
-  test("calls the web API before pbpaste when both layers would yield text", async () => {
+  test("calls pbpaste before WebKit when both layers would be reachable", async () => {
     const order: string[] = [];
     stubNavigatorClipboard(async () => {
-      order.push("web");
-      return "";
+      order.push("webkit");
+      return "from webkit";
     });
     await readClipboardTextWithFallback(async () => {
       order.push("pbpaste");
-      return "from pbpaste";
+      throw new Error("force the webkit fallback to demonstrate ordering");
     });
-    expect(order).toEqual(["web", "pbpaste"]);
+    expect(order).toEqual(["pbpaste", "webkit"]);
   });
 });

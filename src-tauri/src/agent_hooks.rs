@@ -282,10 +282,29 @@ fn classify_event(
 
             "PermissionRequest" => Some((SessionStatus::Waiting, in_user_turn)),
 
+            // Notification semantics: any Notification firing while
+            // the agent is mid-turn means the user is being asked
+            // SOMETHING (permission, disambiguation, missing-input,
+            // tool-confirmation, …). The spinner must stop — the
+            // agent is no longer the actor, the user is.
+            //
+            // Claude documents two notification_type values:
+            // `permission_prompt` and `idle_prompt`. Future Claude
+            // versions add more (`question`, `tool_confirm`,
+            // `disambiguation`, etc. have been seen in betas). The
+            // safe default for unknown types is Waiting — better to
+            // park the spinner on a Notification we don't recognize
+            // than to leave it spinning while the agent silently
+            // waits for the user to answer.
+            //
+            // `idle_prompt` is the one carve-out: it's not a
+            // question, it's Claude noting that the user hasn't
+            // responded for a while. Clear the turn so a follow-up
+            // PreToolUse from a state-stuck session can't re-light
+            // the spinner.
             "Notification" => match aux {
-                "permission_prompt" => Some((SessionStatus::Waiting, in_user_turn)),
                 "idle_prompt" => Some((SessionStatus::Idle, false)),
-                _ => None,
+                _ => Some((SessionStatus::Waiting, in_user_turn)),
             },
 
             "Stop" => Some((SessionStatus::Idle, false)),
@@ -301,6 +320,11 @@ fn classify_event(
             "UserPromptSubmit" => Some((SessionStatus::Working, true)),
             "SessionStart" => Some((SessionStatus::Idle, false)),
             "Stop" => Some((SessionStatus::Idle, false)),
+            // Codex's notification taxonomy isn't fully documented;
+            // mirror Claude's "Notification = the user is being
+            // asked something" heuristic so codex's permission /
+            // tool-confirm prompts also stop the spinner.
+            "Notification" => Some((SessionStatus::Waiting, in_user_turn)),
             _ => None,
         },
 
@@ -317,10 +341,10 @@ fn classify_event(
             "PreCompress" => Some((SessionStatus::Compacting, in_user_turn)),
             "SessionStart" => Some((SessionStatus::Idle, false)),
             "SessionEnd" => Some((SessionStatus::Ended, false)),
-            "Notification" => match aux {
-                "permission_prompt" => Some((SessionStatus::Waiting, in_user_turn)),
-                _ => None,
-            },
+            // Same liberal default as Claude — any Notification is
+            // "user is being asked something," not "agent is
+            // working." Park the spinner.
+            "Notification" => Some((SessionStatus::Waiting, in_user_turn)),
             _ => None,
         },
     }
@@ -1115,15 +1139,62 @@ mod tests {
 
     #[test]
     fn classify_claude_notification_by_aux() {
+        // idle_prompt is the carve-out: the user has been idle, the
+        // session is genuinely Idle (turn cleared). Not a question.
         assert_eq!(
             classify_in_turn(Provider::Claude, "Notification", "idle_prompt"),
             Some(SessionStatus::Idle)
         );
+        // permission_prompt is the documented question type.
         assert_eq!(
             classify_in_turn(Provider::Claude, "Notification", "permission_prompt"),
             Some(SessionStatus::Waiting)
         );
-        assert_eq!(classify_in_turn(Provider::Claude, "Notification", ""), None);
+        // Empty / unknown notification_type: still treated as
+        // Waiting. Claude (and Codex / Gemini) keep adding new
+        // notification types in beta builds — `question`,
+        // `tool_confirm`, `disambiguation`, etc. The safe default
+        // is Waiting: any Notification means the user is being
+        // asked SOMETHING, so the spinner must stop. Leaving it
+        // spinning is the user-reported bug.
+        assert_eq!(
+            classify_in_turn(Provider::Claude, "Notification", ""),
+            Some(SessionStatus::Waiting),
+        );
+        assert_eq!(
+            classify_in_turn(
+                Provider::Claude,
+                "Notification",
+                "tool_confirm",
+            ),
+            Some(SessionStatus::Waiting),
+        );
+    }
+
+    #[test]
+    fn classify_codex_and_gemini_notifications_park_spinner() {
+        // The user-reported bug: "spinner should stop if a question
+        // is being asked to the user." Codex and Gemini both fire
+        // Notification events when their TUI asks the user
+        // something (tool confirm, permission, disambiguation, …).
+        // Each must map to Waiting so the worktree spinner stops
+        // the moment the question lands.
+        assert_eq!(
+            classify_in_turn(Provider::Codex, "Notification", ""),
+            Some(SessionStatus::Waiting),
+        );
+        assert_eq!(
+            classify_in_turn(Provider::Codex, "Notification", "permission_prompt"),
+            Some(SessionStatus::Waiting),
+        );
+        assert_eq!(
+            classify_in_turn(Provider::Gemini, "Notification", ""),
+            Some(SessionStatus::Waiting),
+        );
+        assert_eq!(
+            classify_in_turn(Provider::Gemini, "Notification", "permission_prompt"),
+            Some(SessionStatus::Waiting),
+        );
     }
 
     #[test]

@@ -32,6 +32,55 @@
    without a chunky 8px track running under the prompt input. */
 .goonware-no-horizontal-scrollbar::-webkit-scrollbar:horizontal { height: 0; }
 
+/* ------------------------------------------------------------------
+   Shell command block (Warp-style)
+   ------------------------------------------------------------------
+   Per-block container in BlockList. Mirrors Warp's interaction model:
+   - Hairline separator between blocks (no rounded corners — Warp's
+     blocks read as connected rows in a list, not floating cards).
+   - Subtle background lift on hover.
+   - Floating action button group appears on hover at the right edge.
+   - Failed commands (nonzero exit) get a colored left "flag pole" and
+     a 10% tint over the body — see blockStyles.ts for the constants.
+   ------------------------------------------------------------------ */
+.goonware-block-card {
+  position: relative;
+  transition: background-color 80ms ease-out;
+}
+.goonware-block-card:hover {
+  background-color: var(--surface-1);
+}
+.goonware-block-actions {
+  opacity: 0;
+  transition: opacity 80ms ease-out;
+  pointer-events: none;
+}
+.goonware-block-card:hover .goonware-block-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+.goonware-block-action-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  border: var(--border-1);
+  background-color: var(--surface-2);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: 0;
+  transition: background-color 80ms ease-out, color 80ms ease-out;
+}
+.goonware-block-action-button:hover {
+  background-color: var(--surface-3);
+  color: var(--text-primary);
+}
+.goonware-block-action-button:active {
+  background-color: var(--surface-2);
+}
+
 /* Resize-handle styling lives in design/motion.css. The earlier
    "8px gap between floating panes" styles that lived here have been
    removed — panes are now flush rectangles separated by a 0.5px

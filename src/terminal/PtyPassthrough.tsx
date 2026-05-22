@@ -72,6 +72,14 @@ const PASTE_END = encoder.encode("\x1b[201~");
  * control byte, plain printable chars route through `onChange` so
  * OS IME composition still works. Off-screen via fixed positioning
  * so the textarea is invisible but focusable.
+ *
+ * Crucially, this component does NOT render its own slash-command
+ * picker. Warp's host-side picker is for Warp's own proprietary
+ * agent; for third-party CLI agents (Claude Code, Codex, Gemini)
+ * Warp passes `/` straight through and the agent renders its own
+ * picker inside its TUI. We do the same — Claude's `/` menu is the
+ * source of truth for slash commands, with its own keyboard nav and
+ * fuzzy filter.
  */
 export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
   function PtyPassthrough(
@@ -162,15 +170,20 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
       // explicitly and forward — same wire encoding (bracketed paste
       // markers when DECSET 2004 is on) as the onInput path below.
       //
-      // Image clipboard items get the same path-spool treatment as the
-      // PromptInput textarea: write the bytes to /tmp/goonware-paste and
-      // send the quoted path. Claude / codex / aider all accept inline
-      // file paths as image references, so a Cmd+Shift+Ctrl+4 → Cmd+V
-      // delivers a usable screenshot to the agent in two keystrokes.
       // Accept both ⌘V (macOS native) and ⌃V (Windows/Linux muscle
       // memory). Without the Ctrl branch, ⌃V falls through to
       // keyToBytes and gets encoded as 0x16, which is useless to
       // every agent TUI we ship.
+      //
+      // Image paste: we used to call `navigator.clipboard.read()` here
+      // to grab raw image bytes for /tmp spooling. That call fires the
+      // macOS "Apps want to read your clipboard" TCC popup — the
+      // "weird paste popup that shouldn't show up" users complained
+      // about. The Rust-side `system_clipboard_save_image_to_temp`
+      // path now handles screenshot pastes via NSPasteboard's PNG
+      // pasteboard type, which AppKit serves without a TCC prompt
+      // (first-party paste). Same UX (screenshot in, /tmp path out)
+      // with zero popup surface.
       if (
         ((e.metaKey && !e.ctrlKey) || (e.ctrlKey && !e.metaKey)) &&
         !e.altKey &&
@@ -179,35 +192,21 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
       ) {
         e.preventDefault();
         void (async () => {
-          // Image branch first: navigator.clipboard.read() surfaces
-          // every MIME the OS attached (image + html + plain text);
-          // readText() would silently strip the image and we'd lose
-          // the screenshot. We still try this even though it shares
-          // the same WebKit-level clipboard-read permission as
-          // readText(), because there's no Rust-side equivalent for
-          // image clipboard items (pbpaste prints text only).
+          // Image branch first: ask Rust to peek at the pasteboard
+          // for an image item and spool it. If there's no image, the
+          // command returns null and we drop to the text fallback —
+          // all without a single WebKit clipboard-read call.
           try {
-            const items = await navigator.clipboard.read();
-            for (const item of items) {
-              const imageType = item.types.find((t) => t.startsWith("image/"));
-              if (!imageType) continue;
-              const blob = await item.getType(imageType);
-              const buf = new Uint8Array(await blob.arrayBuffer());
-              const ext = mimeToExt(imageType);
-              const path = await system.saveImageToTemp(buf, ext);
-              // Trailing space so a follow-up "describe this screenshot"
-              // doesn't smash against the closing quote.
+            const path = await system.saveClipboardImageToTemp();
+            if (path) {
               sendPasteText(`${shellQuotePath(path)} `);
               return;
             }
           } catch {
-            // clipboard.read() denied or unavailable — fall through
-            // to the text fallback chain below.
+            // IPC bridge unavailable — fall through to text.
           }
-          // Text branch with the layered fallback (see
-          // clipboardRead.ts) — survives the macOS Sequoia
-          // clipboard-read denial that makes
-          // `navigator.clipboard.readText()` return "" silently.
+          // Text branch — pbpaste first, WebKit only as a last
+          // resort on non-Tauri hosts. See clipboardRead.ts.
           const text = await readClipboardTextWithFallback();
           if (text === null || text.length === 0) return;
           sendPasteText(text);
@@ -309,23 +308,3 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
     );
   },
 ));
-
-/**
- * Map a clipboard image MIME to a file extension that the OS + the
- * receiving agent will both recognize. Defaults to PNG — that's what
- * macOS screenshots produce and it's the most lossless choice when
- * the MIME is something exotic.
- */
-function mimeToExt(mime: string): string {
-  const m = mime.toLowerCase();
-  if (m === "image/jpeg" || m === "image/jpg") return "jpg";
-  if (m === "image/png") return "png";
-  if (m === "image/gif") return "gif";
-  if (m === "image/webp") return "webp";
-  if (m === "image/bmp") return "bmp";
-  if (m === "image/tiff") return "tiff";
-  if (m === "image/heic") return "heic";
-  if (m === "image/svg+xml") return "svg";
-  return "png";
-}
-

@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { joinShellPaths } from "@/lib/shellQuote";
 import { BlockList } from "./BlockList";
+import { AgentChrome } from "./AgentChrome";
 import { CanvasGrid } from "./CanvasGrid";
 import { LiveBlock } from "./LiveBlock";
 import { PromptInput, type PromptInputHandle } from "./PromptInput";
@@ -31,6 +32,7 @@ import {
 import { detectClaude } from "@/lib/claudeUsage";
 import { termKillForeground, termResetGrid } from "@/lib/tauri/term";
 import { decideCtrlCAction } from "./ctrlCEscalation";
+import { forceIdleForCwd } from "@/state/agentActivityStore";
 import {
   agentScrollContainerStyle,
   shouldRenderBlockList,
@@ -649,7 +651,12 @@ export function BlockTerminal({
       // the terminal grid (38px + a 6px breathing strip = 44).
       const inputChrome = agentMode ? 44 : 80;
       const liveBlockChrome = 50;
-      const reserved = inputChrome + liveBlockChrome;
+      // Warp-style status strip rendered above the agent canvas (see
+      // AgentChrome.tsx). 6px top + ~16px content + 6px bottom + 1px
+      // border ≈ 29; round to 32 so a row of the canvas never tucks
+      // behind the chrome at sub-pixel boundaries.
+      const agentChromeHeight = agentMode ? 32 : 0;
+      const reserved = inputChrome + liveBlockChrome + agentChromeHeight;
       const usableHeight = Math.max(120, rect.height - reserved);
       const cellHeight = 13 * 1.35;
       // JetBrains Mono at 13px has a raw glyph advance of ~7.8px, but
@@ -665,9 +672,20 @@ export function BlockTerminal({
       // of the "fresh sta[te]" right-edge clipping in agent panes.
       const cellWidth = 13 * 0.66;
       const visibleRows = Math.max(8, Math.floor(usableHeight / cellHeight));
-      const AGENT_ROW_HEADROOM = 80;
+      // Warp behavior: Claude's PTY is constrained so its slash menu
+      // paints ~9 visible items (12 PTY rows minus ~3 rows of chrome
+      // for input box + status). Arrow keys then scroll *within*
+      // Claude's picker for the rest of the list. Trade-off: Claude's
+      // normal conversation view is also bounded — this matches
+      // Warp's "agent lives in a small block" aesthetic. Tune
+      // AGENT_PTY_MAX_ROWS to taste; 12 is the minimum that still
+      // shows 9 picker items.
+      const AGENT_PTY_MAX_ROWS = 12;
+      // For panes smaller than the cap we follow the visible viewport
+      // — never tell Claude its PTY is taller than the canvas can
+      // render or its TUI footer slides off-screen.
       const rows = foregroundIsAgent
-        ? visibleRows + AGENT_ROW_HEADROOM
+        ? Math.min(visibleRows, AGENT_PTY_MAX_ROWS)
         : visibleRows;
       // Horizontal gutter:
       //   12 px LiveBlock left padding
@@ -850,13 +868,35 @@ export function BlockTerminal({
   ]);
 
 
+  // Cwd ref so the Ctrl+C interrupt path can read the live worktree
+  // path without forcing the byte-send callback to rebind on every cwd
+  // change. Mirrors the foregroundIsAgentRef pattern.
+  const cwdRef = useRef(cwd);
+  useEffect(() => {
+    cwdRef.current = cwd;
+  }, [cwd]);
+
   // Memoized `onSendBytes` adapter — `sendBytes` returns a Promise but
   // the input components want a void-returning callback. Wrapping with
   // useCallback (with `sendBytes` as the only dep) keeps the reference
   // stable across renders, so the React.memo'd PromptInput +
   // PtyPassthrough don't re-render every time a PTY frame lands.
+  //
+  // SIDE EFFECT: when the user sends a raw ⌃C (byte 0x03) and an agent
+  // is foregrounded in this pane, force-flip its hook-driven status
+  // to Idle locally. Claude/Codex don't fire their Stop hook on a
+  // mid-turn SIGINT — Stop is the end-of-turn signal, not the abort
+  // signal. Without this, the worktree spinner keeps spinning after
+  // the user interrupted the agent, because the hook event for the
+  // status flip-back never arrives. Force-idle locally; the next
+  // real hook event (e.g. UserPromptSubmit on the next prompt) will
+  // re-set Working through the normal applyRecord path.
   const onSendBytesVoid = useCallback(
     (b: Uint8Array) => {
+      if (b.length === 1 && b[0] === 0x03) {
+        const path = cwdRef.current;
+        if (path && foregroundIsAgentRef.current) forceIdleForCwd(path);
+      }
       void sendBytes(b);
     },
     [sendBytes],
@@ -867,7 +907,14 @@ export function BlockTerminal({
   // Ctrl+C and a single SIGINT didn't take. The Rust side reads the
   // foreground process group via tcgetpgrp(master_fd) and SIGKILLs
   // it, bypassing whatever signal trap the running process installed.
+  //
+  // Always force-idle here. A double-tap escalation means the user
+  // really wants the agent dead — even if it traps SIGINT, the
+  // foreground process group is about to receive SIGKILL. The
+  // spinner must reflect that intent immediately.
   const onForceKill = useCallback(() => {
+    const path = cwdRef.current;
+    if (path) forceIdleForCwd(path);
     void termKillForeground(ptyId).catch(() => {
       // Backend may have torn the session down between the read and
       // the kill (rare race on tab close). Nothing useful to do; the
@@ -909,6 +956,31 @@ export function BlockTerminal({
       }
     },
     [sendLine, id],
+  );
+
+  // Click a past block's command line → lift it into the PromptInput
+  // for editing. Same behavior as Warp's click-to-edit on closed
+  // blocks. PromptInput's imperative `insertText` splices at the
+  // current caret/selection so the user can chain or modify without
+  // first clearing.
+  const handleBlockClickInput = useCallback((command: string) => {
+    if (!command) return;
+    const handle = promptRef.current;
+    if (!handle) return;
+    handle.focus();
+    handle.insertText(command);
+  }, []);
+
+  // Re-run a past command verbatim. Routes through onSubmit so the
+  // history pruning + grid-reset paths fire the same as a typed
+  // submission — re-runs end up in history and trigger the agent
+  // grid reset when the command is `claude`/`codex`/`gemini`.
+  const handleBlockRerun = useCallback(
+    (command: string) => {
+      if (!command) return;
+      onSubmit(command);
+    },
+    [onSubmit],
   );
 
   // Track previous command_running so we only react to the
@@ -1198,7 +1270,13 @@ export function BlockTerminal({
       if (decision.action === "sigkill") {
         onForceKill();
       } else {
-        void sendBytes(new Uint8Array([0x03]));
+        // Route through onSendBytesVoid (not raw sendBytes) so the
+        // shared 0x03 → forceIdleForCwd side effect fires here too.
+        // The user pressed Ctrl+C via the window-level fallback —
+        // exactly the same intent ("stop the running agent") as a
+        // textarea-focused Ctrl+C. Without this, the spinner stays
+        // on after a window-fallback interrupt.
+        onSendBytesVoid(new Uint8Array([0x03]));
       }
       if (foregroundIsAgentRef.current) {
         passthroughRef.current?.focus();
@@ -1208,7 +1286,7 @@ export function BlockTerminal({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [id, isVisible, sendBytes, onForceKill]);
+  }, [id, isVisible, onSendBytesVoid, onForceKill]);
 
   // Window-level Cmd+C copy. Closed blocks are plain divs with
   // userSelect: "text"; users can drag-select inside them. But our
@@ -1341,6 +1419,13 @@ export function BlockTerminal({
         </div>
       )}
 
+      {/* Warp-style agent status strip. Visible whenever the pane is
+          in agent mode — covers both alt-screen TUIs (claude / codex /
+          gemini in their full-screen editor) AND the non-alt-screen
+          agent case (a print-mode invocation that still trips the
+          banner sniffer). The strip is driven by hook events, so it
+          stays accurate without polling the PTY. */}
+      {agentMode && <AgentChrome cwd={liveCwd ?? cwd} />}
       {!exited && altScreen && (
         // Alt-screen TUI (vim, htop, claude-in-alt-screen) renders
         // exclusively through the WebGPU CanvasGrid. The previous
@@ -1420,7 +1505,12 @@ export function BlockTerminal({
                 hiding history. `shouldRenderBlockList` always returns
                 true and exists so the regression is pinned by a test. */}
             {shouldRenderBlockList(foregroundIsAgent) && (
-              <BlockList blocks={blocks} noWrap={allowHorizontalScroll} />
+              <BlockList
+                blocks={blocks}
+                noWrap={allowHorizontalScroll}
+                onClickInput={handleBlockClickInput}
+                onRerun={handleBlockRerun}
+              />
             )}
             {liveFrame?.command_running && !exited && (
               <LiveBlock
