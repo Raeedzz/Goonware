@@ -515,7 +515,7 @@ function ProjectGlyph({ project }: { project: Project }) {
         height: 18,
         borderRadius: 4,
         backgroundColor: project.color
-          ? `color-mix(in oklch, var(--surface-3), var(--tag-${project.color}) 35%)`
+          ? `color-mix(in oklch, var(--surface-3), var(--tag-${project.color}) 65%)`
           : "var(--surface-3)",
         display: "inline-flex",
         alignItems: "center",
@@ -904,13 +904,13 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   // the rest of the chrome.
   const colored = !!worktree.color;
   const restingBg = colored
-    ? `color-mix(in oklch, transparent, var(--tag-${worktree.color}) 25%)`
+    ? `color-mix(in oklch, transparent, var(--tag-${worktree.color}) 45%)`
     : "transparent";
   const hoverBg = colored
-    ? `color-mix(in oklch, var(--surface-3), var(--tag-${worktree.color}) 35%)`
+    ? `color-mix(in oklch, var(--surface-3), var(--tag-${worktree.color}) 55%)`
     : "var(--surface-3)";
   const activeBg = colored
-    ? `color-mix(in oklch, var(--surface-4), var(--tag-${worktree.color}) 35%)`
+    ? `color-mix(in oklch, var(--surface-4), var(--tag-${worktree.color}) 60%)`
     : "var(--surface-4)";
   const startBg = isActive ? activeBg : restingBg;
   const textColor = isActive ? "var(--text-primary)" : "var(--text-secondary)";
@@ -985,11 +985,11 @@ const WorktreeRow = memo(function WorktreeRowImpl({
               ? "var(--state-warn, var(--state-error))"
               : isRunning
                 ? "var(--accent)"
-                : iconEntry
-                  ? worktree.color
-                    ? `var(--tag-${worktree.color})`
-                    : "var(--text-secondary)"
-                  : "var(--text-tertiary)",
+                : worktree.color
+                  ? `var(--tag-${worktree.color})`
+                  : iconEntry
+                    ? "var(--text-secondary)"
+                    : "var(--text-tertiary)",
             transition: "color var(--motion-fast) var(--ease-out-quart)",
             flexShrink: 0,
           }}
