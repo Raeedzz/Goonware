@@ -14,6 +14,13 @@ import {
   decideVisibilityAction,
   executeVisibilityAction,
 } from "./gpu/visibilityRestore";
+import {
+  BOOTSTRAP_RETRY_DELAYS_MS,
+  decideEscalation,
+  ESCALATION_DELAYS_MS,
+  LADDER_GIVE_UP_MS,
+  MAX_REBUILD_ATTEMPTS,
+} from "./canvasGridEscalation";
 import { isGlobalChord, keyToBytes } from "./keyEncoding";
 import type { DirtyRow, RenderFrame } from "./types";
 
@@ -94,6 +101,26 @@ interface Props {
    * working unchanged.
    */
   isVisible?: boolean;
+  /**
+   * Fired when the canvas's recovery ladder has exhausted its budget
+   * (max rebuild attempts + bootstrap retries) without ever producing
+   * a successful paint. The parent should swap this block to DOM
+   * rendering so the user sees text rather than indefinite black.
+   *
+   * Called at most once per CanvasGrid mount. After it fires, the
+   * canvas stops scheduling further recovery work — the parent's
+   * fallback path takes over.
+   *
+   * The signal exists because WKWebView occasionally hands back a GPU
+   * surface that silently paints into the void: no `device.lost`, no
+   * thrown error, no way to detect it except observing that
+   * `successfulDrawCount` never advances. The user sees that as
+   * "Claude opens, the entire block is black, killing the agent is
+   * the only way back to readable text." This callback is the
+   * structural escape hatch when no amount of reconfigure /
+   * rebuild gets us live pixels.
+   */
+  onCanvasUnrecoverable?: () => void;
 }
 
 /**
@@ -120,7 +147,30 @@ export function CanvasGrid({
   lineHeight = 1.35,
   firstRowOffset,
   isVisible = true,
+  onCanvasUnrecoverable,
 }: Props) {
+  // Cache the latest unrecoverable callback so the bootstrap effect's
+  // setTimeout closures always fire the current parent's handler even
+  // if React swaps the callback identity between renders.
+  const onCanvasUnrecoverableRef = useRef(onCanvasUnrecoverable);
+  onCanvasUnrecoverableRef.current = onCanvasUnrecoverable;
+  // Per-mount flag set when the escalation ladder gives up. Once set,
+  // the timer chain no-ops itself so a retry that arrives mid-tear-
+  // down can't double-fire the callback or schedule new rebuilds.
+  const gaveUpRef = useRef(false);
+  // Cumulative rebuild attempts this mount. Each timer fire that
+  // decides "escalate" increments this; the next timer compares
+  // against MAX_REBUILD_ATTEMPTS to decide whether the budget is
+  // spent. Refs (not state) because we don't want to re-render on
+  // ticks — only the rendererEpoch bump should trigger a React commit.
+  const rebuildAttemptRef = useRef(0);
+  // Mirror of the latest `isVisible` prop so the escalation ladder's
+  // setTimeout callbacks read the current state when they fire (not
+  // the value at scheduling time). The `frame` prop already has a
+  // synchronously-updated `frameRef` below (used by the render path),
+  // so the ladder reads from that — no second ref needed for it.
+  const isVisibleRefForLadder = useRef(isVisible);
+  isVisibleRefForLadder.current = isVisible;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -204,13 +254,6 @@ export function CanvasGrid({
   // and bootstraps a fresh one. Users see a single frame of black
   // during the swap, then painting resumes from the next backend seq.
   const [rendererEpoch, setRendererEpoch] = useState(0);
-  // Tracks whether the one-shot proactive rebuild has already fired
-  // for THIS CanvasGrid instance. Without the ref the rebuild would
-  // re-arm itself every time the bumped epoch re-runs the bootstrap,
-  // pegging the user in a permanent destroy/recreate loop. Reset
-  // implicitly on remount because refs are re-created with each
-  // component instance.
-  const proactiveRebuildDoneRef = useRef(false);
   useEffect(() => {
     const canvas = canvasRef.current;
     const wrapper = wrapperRef.current;
@@ -240,83 +283,113 @@ export function CanvasGrid({
       setRendererEpoch((n) => n + 1);
     };
 
-    void createGridRenderer(
-      canvas,
-      fontFamily,
-      fontSizeCss,
-      lineHeight,
-      handleDeviceLost,
-    )
-      .then((renderer) => {
-        if (cancelled) {
-          renderer.destroy();
-          return;
-        }
-        rendererRef.current = renderer;
-        const rect = wrapper.getBoundingClientRect();
-        renderer.resize(
-          rect.width,
-          rect.height,
-          window.devicePixelRatio || 1,
-        );
-        renderRequest(renderer);
+    // Final-failure sink. Called when both the bootstrap retry budget
+    // and the rebuild escalation ladder have been exhausted without
+    // ever producing a successful paint. Sets gaveUpRef so any
+    // straggler timer fires no-op, then notifies the parent so it
+    // can swap this block to the DOM fallback path.
+    const giveUp = (reason: string) => {
+      if (gaveUpRef.current) return;
+      gaveUpRef.current = true;
+      // eslint-disable-next-line no-console
+      console.warn(`[CanvasGrid] giving up after ${reason}; DOM fallback`);
+      onCanvasUnrecoverableRef.current?.();
+    };
 
-        // ── Bulletproof black-surface recovery ─────────────────────
-        //
-        // Goonware has spent months fighting the "open agent → all
-        // black, never recovers" bug. Existing safety nets
-        // (visibility restore, 1 s watchdog reconfigure, 60-frame
-        // heartbeat, intersection observer, document.visibilitychange)
-        // all assume the swapchain is recoverable via
-        // `context.configure()`. But on WKWebView the GPU device
-        // itself can die WITHOUT `device.lost` ever resolving —
-        // `getCurrentTexture()` returns a texture that paints into
-        // the void, no error fires, and no amount of reconfigure
-        // helps. The user sees a solid-black pane indefinitely,
-        // which is the exact regression reported in the screenshot
-        // that brought us here. The only fix for a dead device is
-        // a full renderer rebuild (fresh adapter + device + context).
-        //
-        // Two-stage recovery:
-        //
-        // 1. SOFT WARMUP — 50/200/500/1200 ms post-init we
-        //    reconfigure + repaint. Cheap (sub-millisecond
-        //    configure on a healthy surface) and catches the vast
-        //    majority of "first paint into a stale swapchain"
-        //    cases without any rebuild cost.
-        //
-        // 2. HARD REBUILD — at 2500 ms, if the proactive rebuild
-        //    hasn't fired yet, bump `rendererEpoch`. This destroys
-        //    the renderer and creates a fresh adapter/device/
-        //    context. The 50-100 ms swap is visible as a brief
-        //    flicker on a healthy mount, but it's the difference
-        //    between a recoverable black canvas and the user
-        //    forcefully killing the process. The
-        //    `proactiveRebuildDoneRef` guard makes this strictly
-        //    one-shot per CanvasGrid mount so the bumped epoch
-        //    doesn't re-trigger the timer in a loop.
-        for (const delay of [50, 200, 500, 1200]) {
+    // ── Bulletproof black-surface recovery, take 2 ─────────────────
+    //
+    // Goonware has spent months fighting the "open agent → all
+    // black, never recovers" bug. Existing safety nets (visibility
+    // restore, 1 s watchdog reconfigure, 60-frame heartbeat,
+    // intersection observer, document.visibilitychange) all assume
+    // the swapchain is recoverable via `context.configure()`. But on
+    // WKWebView the GPU device itself can die WITHOUT `device.lost`
+    // ever resolving — `getCurrentTexture()` returns a texture that
+    // paints into the void, no error fires, and no amount of
+    // reconfigure helps. Earlier work added a one-shot hard rebuild
+    // at 2500 ms (089ff63) to convert a black canvas into a
+    // recoverable one. That fix assumed a single fresh adapter +
+    // device + context would land on a live surface — but users
+    // are still seeing persistent black: the FIRST rebuild
+    // attempt itself can hand back another dead surface.
+    //
+    // The recovery is now split across two effects:
+    //
+    //   - THIS effect (deps: [rendererEpoch]) handles the bootstrap
+    //     and the soft warmup. It re-runs on each rebuild — soft
+    //     warmups are per-renderer-instance.
+    //
+    //   - The escalation ladder effect (below, deps: []) runs ONCE
+    //     per mount and drives the timer chain that decides when to
+    //     rebuild. Living outside this effect's dep list means a
+    //     rebuild doesn't reset the ladder's clock — the user gets
+    //     an honest 37.5 s budget from initial mount to DOM
+    //     fallback regardless of how many rebuilds happen in
+    //     between.
+    //
+    // This effect's onBootstrapSuccess: bring up the renderer + soft
+    // warmups. The escalation timer chain bumps `rendererEpoch`
+    // independently to trigger fresh-adapter rebuilds.
+    const onBootstrapSuccess = (renderer: GridRenderer) => {
+      if (cancelled) {
+        renderer.destroy();
+        return;
+      }
+      rendererRef.current = renderer;
+      const rect = wrapper.getBoundingClientRect();
+      renderer.resize(
+        rect.width,
+        rect.height,
+        window.devicePixelRatio || 1,
+      );
+      renderRequest(renderer);
+
+      // Soft warmup — reconfigure + repaint at 50/200/500/1200 ms
+      // post-bootstrap. Catches the "first paint into a stale
+      // swapchain" cases without any rebuild cost. Per-renderer-
+      // instance: cleared by this effect's cleanup on epoch bump.
+      for (const delay of [50, 200, 500, 1200]) {
+        const id = window.setTimeout(() => {
+          const r = rendererRef.current;
+          if (!r) return;
+          r.reconfigure();
+          renderRequest(r);
+        }, delay);
+        pendingTimers.push(id);
+      }
+    };
+
+    // Bootstrap with retry-on-failure. `attemptIndex` walks through
+    // BOOTSTRAP_RETRY_DELAYS_MS; once exhausted, give up.
+    const attemptBootstrap = (attemptIndex: number): void => {
+      if (cancelled || gaveUpRef.current) return;
+      createGridRenderer(
+        canvas,
+        fontFamily,
+        fontSizeCss,
+        lineHeight,
+        handleDeviceLost,
+      )
+        .then(onBootstrapSuccess)
+        .catch((err) => {
+          if (cancelled || gaveUpRef.current) return;
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[CanvasGrid] WebGPU init failed (attempt ${attemptIndex}):`,
+            err,
+          );
+          if (attemptIndex >= BOOTSTRAP_RETRY_DELAYS_MS.length) {
+            giveUp(`${attemptIndex + 1} bootstrap attempts`);
+            return;
+          }
+          const delay = BOOTSTRAP_RETRY_DELAYS_MS[attemptIndex];
           const id = window.setTimeout(() => {
-            const r = rendererRef.current;
-            if (!r) return;
-            r.reconfigure();
-            renderRequest(r);
+            attemptBootstrap(attemptIndex + 1);
           }, delay);
           pendingTimers.push(id);
-        }
-        if (!proactiveRebuildDoneRef.current) {
-          const id = window.setTimeout(() => {
-            if (cancelled) return;
-            proactiveRebuildDoneRef.current = true;
-            setRendererEpoch((n) => n + 1);
-          }, 2500);
-          pendingTimers.push(id);
-        }
-      })
-      .catch((err) => {
-        // eslint-disable-next-line no-console
-        console.error("[CanvasGrid] WebGPU init failed:", err);
-      });
+        });
+    };
+    attemptBootstrap(0);
 
     return () => {
       cancelled = true;
@@ -326,6 +399,81 @@ export function CanvasGrid({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rendererEpoch]);
+
+  // Escalation ladder. ABSOLUTE delays from mount, independent of the
+  // bootstrap effect's epoch lifecycle — so a rebuild doesn't reset
+  // the user's recovery budget. Each tick reads
+  // `rendererRef.current?.successfulDrawCount`: 0 means the canvas
+  // has never painted, so the canvas is the persistent-black case
+  // the user reports as "Claude opens, the entire block is black."
+  //
+  // Pure `decideEscalation` keeps the timer body trivial:
+  //   - "stop" — healthy paint observed (or wait state with hasFrame
+  //     /isVisible false), no action this tick.
+  //   - "escalate" — bump `rendererEpoch`; the bootstrap effect
+  //     rebuilds against a fresh adapter + device + context.
+  //   - "give-up" — fire `onCanvasUnrecoverable` so the parent swaps
+  //     to DOM rendering.
+  //
+  // Runs once per mount (`deps: []`). Subsequent renderer rebuilds
+  // do NOT re-schedule this ladder; the timers keep ticking against
+  // whichever renderer instance is current at fire time.
+  useEffect(() => {
+    const timers: number[] = [];
+    const checkAndAct = () => {
+      if (gaveUpRef.current) return;
+      const r = rendererRef.current;
+      const drawCount = r?.successfulDrawCount ?? 0;
+      const decision = decideEscalation({
+        attempt: rebuildAttemptRef.current,
+        currentDrawCount: drawCount,
+        isVisible: isVisibleRefForLadder.current,
+        hasFrame: frameRef.current !== null,
+        maxAttempts: MAX_REBUILD_ATTEMPTS,
+      });
+      if (decision === "stop") return;
+      if (decision === "give-up") {
+        if (!gaveUpRef.current) {
+          gaveUpRef.current = true;
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[CanvasGrid] giving up after ${rebuildAttemptRef.current} rebuild attempts; DOM fallback`,
+          );
+          onCanvasUnrecoverableRef.current?.();
+        }
+        return;
+      }
+      rebuildAttemptRef.current += 1;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[CanvasGrid] escalating to rebuild attempt ${rebuildAttemptRef.current}`,
+      );
+      setRendererEpoch((n) => n + 1);
+    };
+    for (const delay of ESCALATION_DELAYS_MS) {
+      const id = window.setTimeout(checkAndAct, delay);
+      timers.push(id);
+    }
+    // Final give-up timer. Fires after every escalation tick has
+    // had its chance — by then either the canvas painted (no-op) or
+    // attempt is at the cap and decideEscalation returns "give-up".
+    const giveUpId = window.setTimeout(() => {
+      if (gaveUpRef.current) return;
+      const drawCount = rendererRef.current?.successfulDrawCount ?? 0;
+      if (drawCount > 0) return;
+      gaveUpRef.current = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[CanvasGrid] giving up after ${rebuildAttemptRef.current} rebuild attempts at ${LADDER_GIVE_UP_MS}ms; DOM fallback`,
+      );
+      onCanvasUnrecoverableRef.current?.();
+    }, LADDER_GIVE_UP_MS);
+    timers.push(giveUpId);
+    return () => {
+      for (const id of timers) window.clearTimeout(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Repaint on frame / rows / cursor change. Coalesced via rAF so
   // that a burst of backend frame events (or React landing a frame

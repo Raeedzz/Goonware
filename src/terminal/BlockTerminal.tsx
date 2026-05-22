@@ -13,6 +13,7 @@ import { joinShellPaths } from "@/lib/shellQuote";
 import { BlockList } from "./BlockList";
 import { AgentChrome } from "./AgentChrome";
 import { CanvasGrid } from "./CanvasGrid";
+import { CellRow } from "./CellRow";
 import { LiveBlock } from "./LiveBlock";
 import { PromptInput, type PromptInputHandle } from "./PromptInput";
 import { PtyPassthrough, type PtyPassthroughHandle } from "./PtyPassthrough";
@@ -609,6 +610,21 @@ export function BlockTerminal({
     const t = window.setTimeout(() => setBellFlash(false), BELL_FLASH_MS);
     return () => window.clearTimeout(t);
   }, [bellTick]);
+
+  // DOM-fallback latch for the alt-screen CanvasGrid. When the
+  // canvas's recovery ladder gives up (WKWebView surface dead and
+  // no rebuild ever painted), this flips and the alt-screen path
+  // renders alacritty rows through DOM CellRow rows instead. Reset
+  // whenever `altScreen` itself flips off-then-on so a NEW alt-screen
+  // entry attempts the canvas path fresh — the GPU may be healthy
+  // again on the next agent invocation.
+  const [altScreenCanvasFailed, setAltScreenCanvasFailed] = useState(false);
+  useEffect(() => {
+    if (!altScreen) setAltScreenCanvasFailed(false);
+  }, [altScreen]);
+  const handleAltScreenCanvasUnrecoverable = useCallback(() => {
+    setAltScreenCanvasFailed(true);
+  }, []);
 
   // Re-fit on container resize OR when we toggle agent mode (since
   // hiding the PromptInput frees ~80px of vertical real estate that
@@ -1437,26 +1453,60 @@ export function BlockTerminal({
           stays accurate without polling the PTY. */}
       {agentMode && <AgentChrome cwd={liveCwd ?? cwd} />}
       {!exited && altScreen && (
-        // Alt-screen TUI (vim, htop, claude-in-alt-screen) renders
-        // exclusively through the WebGPU CanvasGrid. The previous
-        // DOM-backed FullGrid is retired — CanvasGrid handles
-        // selection, cursor, and the full feature set, and keeping
-        // two paths invited drift bugs. The `autoFocus` prop isn't
-        // forwarded because CanvasGrid manages its own focus through
-        // the hidden textarea overlay.
+        // Alt-screen TUI (vim, htop, claude-in-alt-screen) normally
+        // renders through the WebGPU CanvasGrid — handles selection,
+        // cursor, and the full feature set without two-path drift.
+        // The `autoFocus` prop isn't forwarded because CanvasGrid
+        // manages its own focus through the hidden textarea overlay.
         //
         // `isVisible` IS forwarded — when this terminal is hidden by
         // the keepalive layer (display: none), the canvas needs to
         // skip ResizeObserver-driven 0×0 resizes and force a fresh
         // paint when it comes back, or the alt-screen picker /
-        // model selector lands on a black surface. See
-        // `CanvasGrid.Props.isVisible` for the full rationale.
-        <div style={{ flex: 1, minHeight: 0 }}>
-          <CanvasGrid
-            frame={liveFrame}
-            onSendBytes={sendBytes}
-            isVisible={isVisible}
-          />
+        // model selector lands on a black surface.
+        //
+        // DOM fallback: when CanvasGrid's recovery ladder gives up
+        // (WKWebView returned a persistently-dead GPU surface, no
+        // rebuild ever painted), we render alacritty rows through
+        // CellRow rows instead. No interactive input encoding (the
+        // alt-screen path needs onSendBytes for keystrokes), but at
+        // least the user sees the agent's UI text — and they can
+        // Ctrl+C / kill the agent to start a fresh attempt at the
+        // canvas path.
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          {altScreenCanvasFailed ? (
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                overflowY: "auto",
+                fontFamily: "var(--font-mono)",
+                fontSize: 13,
+                fontVariantLigatures: "none",
+                color: "var(--text-primary)",
+                backgroundColor: "var(--surface-0)",
+                padding: "var(--space-2) var(--space-3)",
+              }}
+            >
+              {(liveFrame?.dirty ?? []).map((row) => (
+                <CellRow key={row.row} spans={row.spans} wrap={false} />
+              ))}
+            </div>
+          ) : (
+            <CanvasGrid
+              frame={liveFrame}
+              onSendBytes={sendBytes}
+              isVisible={isVisible}
+              onCanvasUnrecoverable={handleAltScreenCanvasUnrecoverable}
+            />
+          )}
         </div>
       )}
 

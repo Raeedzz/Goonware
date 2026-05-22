@@ -465,26 +465,32 @@ function ColorSwatch({
   active: boolean;
   onClick: () => void;
 }) {
+  // "default" means "no tag color" — clicking it unsets the row's color.
+  // Render it visually distinct (neutral surface + diagonal slash) so
+  // users don't expect a colored tint to appear when they pick it.
+  const isUnset = id === "default";
   return (
     <button
       type="button"
       role="radio"
       aria-checked={active}
-      aria-label={`color: ${id}`}
-      title={id}
+      aria-label={isUnset ? "no color" : `color: ${id}`}
+      title={isUnset ? "No color" : id}
       onClick={onClick}
       style={{
         width: 32,
         height: 32,
         padding: 0,
         flexShrink: 0,
+        position: "relative",
         borderRadius: "var(--radius-pill)",
         border: "none",
-        backgroundColor: `var(--tag-${id})`,
+        backgroundColor: isUnset ? "var(--surface-3)" : `var(--tag-${id})`,
         boxShadow: active
           ? "inset 0 0 0 2px oklch(0% 0 0 / 0.45), 0 0 0 2px var(--surface-2), 0 0 0 3px var(--accent)"
           : "inset 0 0 0 1px oklch(0% 0 0 / 0.25)",
         cursor: "pointer",
+        overflow: "hidden",
         transition:
           "transform 100ms var(--ease-out-quart), box-shadow 100ms var(--ease-out-quart)",
       }}
@@ -494,7 +500,20 @@ function ColorSwatch({
       onMouseLeave={(e) => {
         e.currentTarget.style.transform = "scale(1)";
       }}
-    />
+    >
+      {isUnset && (
+        <span
+          aria-hidden
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "block",
+            background:
+              "linear-gradient(to top right, transparent calc(50% - 1px), var(--text-tertiary) 50%, transparent calc(50% + 1px))",
+          }}
+        />
+      )}
+    </button>
   );
 }
 

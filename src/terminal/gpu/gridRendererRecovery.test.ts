@@ -860,6 +860,68 @@ describe("GridRenderer source pins — recovery code lives in GridRenderer.ts", 
 });
 
 /**
+ * `successfulDrawCount` — the proof-of-life signal CanvasGrid's
+ * escalation ladder reads to decide whether the WKWebView GPU
+ * surface is alive. Counts CUMULATIVE successful frame submissions
+ * since construction (no reset on reconfigure — see field doc in
+ * GridRenderer.ts for the rationale).
+ *
+ * If the renderer paints fine but this counter doesn't advance,
+ * the React layer cannot distinguish a healthy canvas from a
+ * silently-dead one and the user is stuck on persistent black.
+ * These tests pin the contract so a future refactor that breaks
+ * the signal trips here instead of in production.
+ */
+describe("GridRenderer.successfulDrawCount — proof-of-life counter", () => {
+  const src = readFileSync(
+    join(import.meta.dir, "GridRenderer.ts"),
+    "utf8",
+  );
+
+  test("private field `successfulDraws` declared with initial 0", () => {
+    expect(src).toMatch(/private\s+successfulDraws\s*=\s*0/);
+  });
+
+  test("public getter `successfulDrawCount` exposes the counter", () => {
+    // Use a relaxed match — getter syntax can vary in whitespace but
+    // the name + return identifier must both be present.
+    const getterMatch = src.match(
+      /get\s+successfulDrawCount\s*\([^)]*\)[^{]*\{[\s\S]*?return\s+this\.successfulDraws/,
+    );
+    expect(getterMatch).not.toBeNull();
+  });
+
+  test("draw() increments `successfulDraws` on successful submit", () => {
+    const drawBody = extractMethodBody(src, "private draw");
+    expect(drawBody).toMatch(/successfulDraws\+\+/);
+    // Must live AFTER queue.submit — same "post-submit only" contract
+    // as framesSinceReconfigure, so a failed-then-skipped frame
+    // doesn't fake a success.
+    const submitIdx = drawBody.indexOf("queue.submit");
+    const incIdx = drawBody.indexOf("successfulDraws++");
+    expect(submitIdx).toBeGreaterThanOrEqual(0);
+    expect(incIdx).toBeGreaterThan(submitIdx);
+  });
+
+  test("reconfigure() does NOT reset `successfulDraws`", () => {
+    // CRITICAL: the escalation ladder reads this as "has this
+    // renderer instance EVER painted?". A reset on reconfigure would
+    // make a heartbeat-triggered reconfigure look like a fresh-mount
+    // dead canvas to the ladder, triggering unnecessary rebuilds.
+    const reconfigureBody = extractMethodBody(src, "reconfigure(): void");
+    expect(reconfigureBody).not.toMatch(/successfulDraws\s*=\s*0/);
+  });
+
+  test("counter is capped to MAX_SAFE_INTEGER to avoid overflow", () => {
+    // Defensive — a long-running session could theoretically wrap if
+    // we let the counter grow unchecked. Pin the cap so a future
+    // refactor doesn't drop it.
+    const drawBody = extractMethodBody(src, "private draw");
+    expect(drawBody).toMatch(/MAX_SAFE_INTEGER/);
+  });
+});
+
+/**
  * Crude method-body extractor. Walks braces from the first `{` after
  * `name` to the matching `}`. Good enough for grep-style assertions
  * — we're not parsing the AST, just verifying call patterns live

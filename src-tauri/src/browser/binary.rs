@@ -303,33 +303,47 @@ fn extract_zip<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate the process-global Chrome-path env
+    // vars. Without this, parallel test execution lets one test's
+    // remove_var clobber another test's set_var mid-call, which on a CI
+    // runner with real Chrome installed produces a confusing
+    // "system Chrome returned instead of the override" failure.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_chrome_env() {
+        for var in ["GOONWARE_CHROME_PATH", "GLI_CHROME_PATH", "RLI_CHROME_PATH"] {
+            unsafe {
+                std::env::remove_var(var);
+            }
+        }
+    }
 
     #[test]
     fn locate_chrome_honors_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Use this very test binary as a stand-in for "Chrome" — the
         // resolver only checks that the path is a file, which it is.
-        let exe =
-            std::env::current_exe().expect("current_exe");
+        let exe = std::env::current_exe().expect("current_exe");
+        clear_chrome_env();
         unsafe {
             std::env::set_var("RLI_CHROME_PATH", &exe);
         }
         let resolved = locate_chrome();
-        unsafe {
-            std::env::remove_var("RLI_CHROME_PATH");
-        }
+        clear_chrome_env();
         assert_eq!(resolved.as_deref(), Some(exe.as_path()));
     }
 
     #[test]
     fn locate_chrome_returns_none_when_nothing_installed() {
-        // Force the env override away and pretend the system / cache
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Force the env overrides away and pretend the system / cache
         // candidates aren't installed by checking that the function at
         // least returns a real Option (not panic). We can't reliably
         // assert None on every CI machine because real Chrome may be
         // installed, so the test just exercises the code path.
-        unsafe {
-            std::env::remove_var("RLI_CHROME_PATH");
-        }
+        clear_chrome_env();
         let _ = locate_chrome();
     }
 
