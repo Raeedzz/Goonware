@@ -403,6 +403,52 @@ pub async fn system_clipboard_read_text() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Write plain text to the macOS clipboard via `/usr/bin/pbcopy`.
+///
+/// Mirrors `system_clipboard_read_text`. The browser-side
+/// `navigator.clipboard.writeText()` API silently fails in WKWebView
+/// under TCC restrictions in bundled .app builds — every Cmd+C through
+/// the document selection (closed shell blocks, alt-screen, agent live
+/// frame) lands nothing on the clipboard, so paste in another app
+/// shows the previous clipboard contents.
+///
+/// `pbcopy` goes through AppKit's NSPasteboard, which macOS treats as
+/// a first-party copy. No TCC prompt, no silent failure. This is the
+/// same pattern Warp uses for its `ctx.clipboard().write()` call —
+/// see `crates/warpui/src/platform/mac/clipboard.rs` in warpdotdev/warp.
+///
+/// Pipes `text` to pbcopy's stdin. Returns Ok(()) once pbcopy exits
+/// zero. Errors only on spawn failure (e.g. /usr/bin missing) or a
+/// non-zero exit (e.g. SIGPIPE if the binary went away mid-write).
+#[tauri::command]
+pub async fn system_clipboard_write_text(text: String) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    // Pin the absolute path — same rationale as pbpaste. Finder/Dock
+    // launches strip $PATH, so a bare `pbcopy` would ENOENT.
+    let mut child = Command::new("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn pbcopy: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .await
+            .map_err(|e| format!("write to pbcopy stdin: {e}"))?;
+        // Explicit drop so pbcopy sees EOF and flushes to the pasteboard.
+        drop(stdin);
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("wait pbcopy: {e}"))?;
+    if !status.success() {
+        return Err(format!("pbcopy exit {status}"));
+    }
+    Ok(())
+}
+
 /// Try to extract an image from the macOS pasteboard, write it to
 /// `/tmp/goonware-paste/`, and return the file path. Returns Ok(None)
 /// when the clipboard does not hold an image (so the caller knows to

@@ -31,6 +31,7 @@ import {
 } from "./terminalActivityStore";
 import { detectClaude } from "@/lib/claudeUsage";
 import { termKillForeground, termResetGrid } from "@/lib/tauri/term";
+import { writeClipboardTextWithFallback } from "./clipboardWrite";
 import { decideCtrlCAction } from "./ctrlCEscalation";
 import { forceIdleForCwd } from "@/state/agentActivityStore";
 import {
@@ -1346,7 +1347,16 @@ export function BlockTerminal({
       const container = containerRef.current;
       if (!container || !anchor || !container.contains(anchor)) return;
       e.preventDefault();
-      void navigator.clipboard.writeText(text).catch(() => {});
+      // Rust-side pbcopy first — see clipboardWrite.ts.
+      // `navigator.clipboard.writeText` fails silently in WKWebView
+      // under bundled .app builds (TCC restricts the JS clipboard API
+      // even though the Edit-menu copy: selector is wired up), so a
+      // Cmd+C against a closed-block selection used to leave the
+      // pasteboard untouched. pbcopy goes through AppKit's
+      // NSPasteboard which macOS treats as a first-party copy — no
+      // popup, no silent failure. Matches Warp's
+      // `ctx.clipboard().write()` pattern.
+      void writeClipboardTextWithFallback(text);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -1561,7 +1571,6 @@ export function BlockTerminal({
           onSendBytes={onSendBytesVoid}
           onForceKill={onForceKill}
           commandRunning={liveCommandRunning}
-          onPaste={onPaste}
           historyLength={history.length}
           historyAt={historyAt}
           cwd={effectiveCwd}

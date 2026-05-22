@@ -41,13 +41,6 @@ interface Props {
   onForceKill: () => void;
   /** True while a foreground command is running (OSC 133 C…D). */
   commandRunning: boolean;
-  /**
-   * Wrap a paste in OSC 200/201 and send it directly to the PTY. Lets
-   * zsh's bracketed-paste handler treat multi-line pastes literally
-   * (no line-by-line execute on embedded `\n`s). When omitted, the
-   * default browser behavior runs (paste text into the textarea).
-   */
-  onPaste?: (text: string) => void;
   /** Number of available history entries; used to gate ↑/↓. */
   historyLength: number;
   /** Look up the history entry at offset `n` from the most recent. */
@@ -346,7 +339,7 @@ function resolveDir(parent: string, cwd: string): string {
 /**
  * Memoized to keep the input box independent of the parent BlockTerminal's
  * frame-driven re-renders. As long as the caller stabilizes the callback
- * refs (useCallback for onSubmit / onSendBytes / onPaste in
+ * refs (useCallback for onSubmit / onSendBytes in
  * BlockTerminal), PromptInput won't re-render when a new PTY frame
  * arrives — which is the dominant source of typing-lag during streaming
  * agent output.
@@ -358,7 +351,6 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
       onSendBytes,
       onForceKill,
       commandRunning,
-      onPaste,
       historyLength,
       historyAt,
       onAgentNewLine,
@@ -610,25 +602,33 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
         setCompletions([]);
         return;
       }
-      // ⌃V — paste on Windows/Linux muscle memory. macOS native ⌘V
-      // already routes through the textarea's onPaste handler (the
-      // OS synthesizes a paste event), but ⌃V does not — it would
-      // otherwise bubble out as a global-chord miss and do nothing.
+      // ⌘V / ⌃V — paste into the input box. Intercept BOTH chords
+      // (mac-native ⌘V and Windows/Linux ⌃V muscle memory) so the
+      // paste flow is uniform across platforms and bypass-WKWebView'd
+      // on macOS. Warp's `fn paste(...)` (app/src/terminal/view.rs)
+      // reads from NSPasteboard directly via its Cocoa wrapper and
+      // inserts the entire content into the input editor via
+      // `input.system_insert(&copied, ctx)`. We mirror that: read via
+      // `/usr/bin/pbpaste` and splice at the caret. The previous
+      // implementation only intercepted ⌃V and routed multi-line
+      // pastes to the PTY via bracketed paste — which sent the text
+      // to a hidden shell line buffer that the user never saw,
+      // matching the "Cmd+V doesn't paste into input" report.
       //
       // Multi-layer clipboard read (see clipboardRead.ts): the web
       // `navigator.clipboard.readText()` path silently returns ""
       // on macOS Sequoia after the user declines the per-app
-      // clipboard-read prompt — which is the user-reported "Ctrl+V
-      // does nothing" symptom. The fallback shells out to
-      // `/usr/bin/pbpaste` via a Tauri command so the read survives
-      // a denied WebKit-level prompt.
+      // clipboard-read prompt — the original "Ctrl+V does nothing"
+      // symptom. pbpaste goes through AppKit's NSPasteboard, which
+      // macOS treats as first-party so the read always succeeds.
       //
-      // Multi-line payloads route through onPaste so bracketed-paste
-      // fires (zsh's line editor strips OSC 200/201 markers and
-      // treats the inner text literally — no auto-execute on \n).
+      // Image branch: when the pasteboard holds an image (screenshot,
+      // copied web image, Preview "Copy"), spool it to /tmp via the
+      // Rust-side `system_clipboard_save_image_to_temp` and splice
+      // the file path into the textarea — same UX as the existing
+      // image-drag-drop path.
       if (
-        e.ctrlKey &&
-        !e.metaKey &&
+        ((e.metaKey && !e.ctrlKey) || (e.ctrlKey && !e.metaKey)) &&
         !e.altKey &&
         !e.shiftKey &&
         e.key.toLowerCase() === "v"
@@ -644,12 +644,41 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
         const snapshotEnd = ta?.selectionEnd ?? value.length;
         const snapshotValue = value;
         void (async () => {
+          // Image branch first: ask Rust to peek at the pasteboard
+          // for an image item and spool it. If there's no image, the
+          // command returns null and we drop to the text fallback —
+          // all without a single WebKit clipboard-read call (which
+          // would fire the TCC popup).
+          try {
+            const path = await system.saveClipboardImageToTemp();
+            if (path) {
+              const quoted = shellQuotePath(path);
+              const before = snapshotValue.slice(0, snapshotStart);
+              const after = snapshotValue.slice(snapshotEnd);
+              const needLeading = before.length > 0 && !/\s$/.test(before);
+              const needTrailing = after.length > 0 && !/^\s/.test(after);
+              const insert = `${needLeading ? " " : ""}${quoted}${needTrailing ? " " : ""}`;
+              const next = before + insert + after;
+              setValue(next);
+              requestAnimationFrame(() => {
+                const el = textareaRef.current;
+                if (!el) return;
+                el.focus();
+                const cursor = before.length + insert.length;
+                el.setSelectionRange(cursor, cursor);
+              });
+              return;
+            }
+          } catch {
+            // IPC bridge unavailable — fall through to text.
+          }
+          // Text branch — pbpaste first via readClipboardTextWithFallback.
+          // Multi-line text is spliced into the input box (NOT routed
+          // to the PTY via bracketed paste); the user sees the entire
+          // paste in their input and can edit / Enter to submit. This
+          // matches Warp's `should_paste_in_input` branch.
           const text = await readClipboardTextWithFallback();
           if (text === null || text.length === 0) return;
-          if (text.includes("\n") && onPaste) {
-            onPaste(text);
-            return;
-          }
           const next =
             snapshotValue.slice(0, snapshotStart) +
             text +
@@ -1038,6 +1067,18 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
               // resolved path into the textarea at the caret. The user
               // sees `'/tmp/goonware-paste/paste-…png' ` appear inline and
               // can Enter to send it to claude / cat / file / etc.
+              //
+              // Text paste: let the browser's native textarea paste run.
+              // The keydown handler above intercepts ⌘V / ⌃V to read via
+              // pbpaste (avoiding WKWebView's silent clipboard-read
+              // failure), so this fallback path is exercised only for
+              // right-click context-menu paste — where AppKit synthesizes
+              // the paste event directly. The previous "route multi-line
+              // pastes to the PTY via bracketed paste" shortcut was the
+              // root cause of "Cmd+V doesn't paste into input" — the
+              // text went to a hidden shell line buffer instead of the
+              // visible input box. Matches Warp's `should_paste_in_input`
+              // behaviour: input visible → input gets the paste, period.
               const items = Array.from(e.clipboardData?.items ?? []);
               const imageItem = items.find(
                 (it) => it.kind === "file" && it.type.startsWith("image/"),
@@ -1050,18 +1091,7 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
                   const selStart = ta.selectionStart;
                   const selEnd = ta.selectionEnd;
                   void insertImagePathAtSelection(file, selStart, selEnd);
-                  return;
                 }
-              }
-              if (!onPaste) return;
-              const pasted = e.clipboardData.getData("text/plain");
-              // Only intercept multi-line pastes — single-line pastes
-              // are fine in the textarea (the user might want to edit
-              // before submitting). Multi-line goes straight to the PTY
-              // via bracketed paste.
-              if (pasted.includes("\n")) {
-                e.preventDefault();
-                onPaste(pasted);
               }
             }}
             onKeyDown={onKeyDown}
