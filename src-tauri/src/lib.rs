@@ -229,6 +229,7 @@ pub fn run() {
             fs::system_open_with,
             fs::system_save_image_to_temp,
             fs::system_clipboard_read_text,
+            fs::system_clipboard_write_text,
             fs::system_clipboard_save_image_to_temp,
             // State persistence
             state::state_save,
@@ -766,6 +767,47 @@ mod clipboard_handler_gating_tests {
              `fs::system_clipboard_save_image_to_temp` or the image \
              clipboard branch in PtyPassthrough rejects with \"command \
              not found\" and screenshot paste silently no-ops."
+        );
+    }
+
+    #[test]
+    fn pbcopy_primary_path_command_is_registered() {
+        // Symmetric pin to the pbpaste read path. Cmd+C against a
+        // closed-block selection routes through Rust pbcopy because
+        // `navigator.clipboard.writeText` fails SILENTLY in WKWebView
+        // under bundled .app builds — Cmd+C looks like it worked but
+        // NSPasteboard is unchanged. pbcopy goes through the same
+        // AppKit pathway pbpaste uses, so it's exempt from the same
+        // TCC silent-failure mode that breaks the JS API.
+        //
+        // Both gates must hold: command declared in fs.rs AND
+        // registered in lib.rs. Either gap drops the frontend back
+        // to the silently-broken WebKit path.
+        let fs_rs = read_repo_file("src-tauri/src/fs.rs");
+        assert!(
+            fs_rs.contains("pub async fn system_clipboard_write_text"),
+            "src-tauri/src/fs.rs must declare a `system_clipboard_write_text` \
+             #[tauri::command] — that's the pbcopy path the Cmd+C \
+             handlers in BlockTerminal.tsx and PtyPassthrough.tsx call \
+             via clipboardWrite.ts. Without this command, the fallback \
+             drops to WebKit's writeText which fails silently in bundled \
+             builds and the user's Cmd+C copies nothing."
+        );
+        assert!(
+            fs_rs.contains("Command::new(\"/usr/bin/pbcopy\")"),
+            "system_clipboard_write_text must shell out to the absolute \
+             path `/usr/bin/pbcopy`. A bare `pbcopy` would ENOENT when \
+             Goonware is launched from the Dock with a stripped PATH — \
+             same gotcha as pbpaste."
+        );
+        let lib_rs = read_repo_file("src-tauri/src/lib.rs");
+        assert!(
+            lib_rs.contains("fs::system_clipboard_write_text"),
+            "lib.rs invoke_handler must register \
+             `fs::system_clipboard_write_text` or the frontend's \
+             invoke(\"system_clipboard_write_text\") rejects with \
+             \"command not found\" and Cmd+C drops to WebKit's \
+             writeText, which fails silently in bundled .app builds."
         );
     }
 

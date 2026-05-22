@@ -9,6 +9,7 @@ import {
 } from "react";
 import { system } from "@/lib/fs";
 import { shellQuotePath } from "@/lib/shellQuote";
+import { writeClipboardTextWithFallback } from "./clipboardWrite";
 import { readClipboardTextWithFallback } from "./clipboardRead";
 import { isGlobalChord, keyToBytes } from "./keyEncoding";
 import { decideCtrlCAction } from "./ctrlCEscalation";
@@ -158,7 +159,11 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
           sel && !sel.isCollapsed ? sel.toString() : "";
         if (text.length > 0) {
           e.preventDefault();
-          void navigator.clipboard.writeText(text).catch(() => {});
+          // Rust-side pbcopy first — see clipboardWrite.ts. WKWebView's
+          // navigator.clipboard.writeText fails silently in bundled
+          // .app builds, so the previous direct call left the
+          // pasteboard unchanged.
+          void writeClipboardTextWithFallback(text);
         }
         return;
       }

@@ -92,6 +92,19 @@ export const system = {
    */
   readClipboardText: () => invoke<string>("system_clipboard_read_text"),
   /**
+   * Write plain text to the macOS clipboard via `/usr/bin/pbcopy`.
+   * This is the PRIMARY clipboard-write path on macOS — see the doc
+   * on `system_clipboard_write_text` in src-tauri/src/fs.rs for why
+   * we route around `navigator.clipboard.writeText()`. WKWebView's
+   * writeText fails silently in bundled .app builds: Cmd+C looks
+   * like it worked, but the clipboard is unchanged.
+   *
+   * Mirrors Warp's NSPasteboard.setString_forType: call (see
+   * `crates/warpui/src/platform/mac/clipboard.rs` in warpdotdev/warp).
+   */
+  writeClipboardText: (text: string) =>
+    invoke<void>("system_clipboard_write_text", { text }),
+  /**
    * Try to extract an image from the macOS pasteboard, write it to
    * `/tmp/goonware-paste/`, and return the file path. Resolves to
    * null when the pasteboard does not hold an image (so the caller

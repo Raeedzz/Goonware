@@ -54,8 +54,16 @@ describe("PromptInput Ctrl+V uses the native-first helper, not raw readText", ()
   test("the Ctrl+V branch calls readClipboardTextWithFallback", () => {
     const ctrlVAnchor = src.indexOf("e.key.toLowerCase() === \"v\"");
     expect(ctrlVAnchor).toBeGreaterThan(-1);
-    const window = src.slice(ctrlVAnchor, ctrlVAnchor + 2000);
+    // Window is wide enough to span the image branch (Rust-side
+    // `saveClipboardImageToTemp` for screenshot Cmd+V) plus the text
+    // fallback (`readClipboardTextWithFallback`). The two-branch
+    // shape mirrors Warp's `fn paste`, where the image check runs
+    // first and falls through to text on miss.
+    const window = src.slice(ctrlVAnchor, ctrlVAnchor + 4000);
     expect(window).toContain("readClipboardTextWithFallback()");
+    // Also pin the image-first ordering — drift back to text-only
+    // would silently lose screenshot paste support.
+    expect(window).toContain("system.saveClipboardImageToTemp()");
   });
 
   test("does NOT call navigator.clipboard.readText() or .read() in the Ctrl+V path", () => {
