@@ -1,41 +1,32 @@
 /**
- * Read the OS clipboard as plain text, with a fallback chain that
- * survives the macOS-Sequoia "Apps want to read your clipboard"
- * permission gate.
+ * Read the OS clipboard as plain text.
  *
- * The chain:
+ * Order of preference (intentionally Rust-first):
  *
- *   1. `navigator.clipboard.readText()` — fast, in-process, the path
- *      everyone wants first. When WebKit's permission policy and
- *      macOS's per-app clipboard prompt both allow it, this returns
- *      the clipboard contents synchronously enough for the user to
- *      feel a paste land in one frame.
+ *   1. Native pbpaste via the Tauri command. AppKit's NSPasteboard
+ *      read does NOT trigger macOS's "Apps want to read your
+ *      clipboard" TCC dialog — it's a first-party paste, treated by
+ *      the OS the same as `Cmd+V` in TextEdit. This is the path that
+ *      makes Goonware feel like a real macOS app: the user pastes and
+ *      text appears, no popup, no permission dance.
  *
- *   2. A Tauri command that spawns `/usr/bin/pbpaste` Rust-side.
- *      Reached when (1) returned `""` OR threw. macOS routes the
- *      pbpaste read through AppKit's first-party clipboard channel,
- *      so it works even when the user previously declined the
- *      WebKit-level prompt (or the WKWebView's bundle id wasn't
- *      granted clipboard-read at all). This is the load-bearing
- *      fallback that fixes "Ctrl+V silently does nothing."
+ *   2. `navigator.clipboard.readText()` as a last-resort fallback.
+ *      Used only when the Tauri command isn't reachable (non-Tauri
+ *      host: the renderer running under `vite dev` outside `tauri
+ *      dev`, or a test harness). On that path the user may see the
+ *      WebKit prompt — but that case isn't macOS-app users.
  *
- * Two non-obvious rules:
- *
- *   - Empty-string from `navigator.clipboard.readText()` is treated
- *     as a denial, NOT as "the clipboard is empty." On macOS
- *     Sequoia the privacy-gated path returns `""` without throwing
- *     when permission is declined — exactly the same shape an empty
- *     clipboard produces. The fallback can disambiguate: if pbpaste
- *     also returns `""`, the clipboard really IS empty; if pbpaste
- *     returns a value, the web API was the broken layer.
- *
- *   - The fallback is async-only — pbpaste spawns a subprocess, so
- *     callers must `await` this function (or chain `.then`). The
- *     handler should call `e.preventDefault()` synchronously before
- *     awaiting so the textarea's default behavior never races us.
+ * Critically we DO NOT call `navigator.clipboard.readText()` first.
+ * Doing so would fire the macOS clipboard-permission popup on every
+ * Cmd+V/Ctrl+V — the exact "weird paste popup that shouldn't show
+ * up" symptom users report. Even when permission has been granted,
+ * the OS may re-prompt on schedule, and a denied prompt makes the
+ * web API silently return `""` (indistinguishable from an empty
+ * clipboard). Reversing the order isolates us from both quirks.
  *
  * Returns `null` when both layers came up empty (genuinely empty
- * clipboard, or pbpaste binary missing). Returns the text otherwise.
+ * clipboard, or pbpaste binary missing AND no browser API). Returns
+ * the text otherwise.
  *
  * `nativeReader` is dependency-injected so the unit test in
  * `clipboardRead.test.ts` can drive the fallback path without
@@ -46,26 +37,31 @@
 export async function readClipboardTextWithFallback(
   nativeReader: () => Promise<string> = defaultNativeReader,
 ): Promise<string | null> {
-  // Layer 1: browser clipboard API.
-  let webText = "";
-  try {
-    webText = await navigator.clipboard.readText();
-  } catch {
-    // Permission denied / API unavailable. Drop straight to the
-    // native fallback below.
-    webText = "";
-  }
-  if (webText.length > 0) return webText;
-
-  // Layer 2: Rust-side pbpaste. This is what makes Ctrl+V actually
-  // paste on macOS installs where the WebKit clipboard-read prompt
-  // was declined or never surfaced.
+  // Layer 1 (preferred): Rust-side pbpaste. Goes through AppKit's
+  // NSPasteboard, which is treated by macOS as a first-party paste —
+  // no TCC popup. This is the right default for a Tauri/WKWebView
+  // app: WebKit's clipboard-read API was designed for browser pages
+  // that haven't established user trust, and the per-app prompt is
+  // appropriate for them — not for a native app where the user
+  // explicitly pressed Cmd+V.
   try {
     const nativeText = await nativeReader();
     if (nativeText.length > 0) return nativeText;
+    // Native reader returned "" — clipboard is genuinely empty (or
+    // holds a non-text item). No point asking WebKit, which would
+    // just re-confirm with the popup. Bail with null.
+    return null;
   } catch {
-    // IPC bridge unavailable (non-Tauri host, command not registered
-    // in some test harness, etc.). Fall through to null.
+    // Tauri command isn't reachable (running under `vite dev` without
+    // `tauri dev`, jsdom test, etc.). Fall through to the browser API.
+  }
+
+  // Layer 2 (fallback): only used when the native bridge is gone.
+  try {
+    const webText = await navigator.clipboard.readText();
+    if (webText.length > 0) return webText;
+  } catch {
+    // Permission denied / API unavailable. Nothing else to try.
   }
   return null;
 }

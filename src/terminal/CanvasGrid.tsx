@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -335,13 +336,20 @@ export function CanvasGrid({
   // swapchain during `display: none` without firing `device.lost`,
   // and the next render paints into a dead surface = black canvas).
   //
+  // useLayoutEffect (not useEffect) so the reconfigure + paint runs
+  // synchronously during the commit, BEFORE the browser paints. A
+  // useEffect would let the browser paint into a dead swapchain on
+  // the visibility-restore frame, producing one frame of black before
+  // the recovery runs — and on WebKit that single frame can stick
+  // until something else (resize, scroll, etc.) forces a redraw.
+  //
   // `wasVisibleRef` only advances when the decision is "restore" or
   // "noop" — a "defer" leaves it at false so the next ResizeObserver
   // tick (with a real rect this time) can still trigger the restore.
   const wasVisibleRef = useRef(isVisible);
-  useEffect(() => {
+  const deferRafRef = useRef<number | null>(null);
+  useLayoutEffect(() => {
     const renderer = rendererRef.current;
-    const wrapper = wrapperRef.current;
     // On the visible→hidden edge, signal the renderer that its
     // swapchain may be released while we sit behind `display: none`.
     // Without this signal, `resize()`'s dimensions-unchanged fast
@@ -351,32 +359,99 @@ export function CanvasGrid({
     if (renderer && wasVisibleRef.current && !isVisible) {
       renderer.markHidden();
     }
-    const rect = wrapper?.getBoundingClientRect();
-    const rectWidth = rect?.width ?? 0;
-    const rectHeight = rect?.height ?? 0;
-    const action = decideVisibilityAction({
-      wasVisible: wasVisibleRef.current,
-      isVisible,
-      rectWidth,
-      rectHeight,
-    });
-    // On `defer` the ref stays at false so the next observer tick
-    // (with real rect) decides "restore" instead of "noop". On
-    // anything else, the ref advances to mirror the current value.
-    if (action !== "defer") wasVisibleRef.current = isVisible;
-    if (!renderer) return;
-    executeVisibilityAction(
-      action,
-      {
-        reconfigure: () => renderer.reconfigure(),
-        resizeFromRect: (w, h, dpr) => renderer.resize(w, h, dpr),
-        invalidate: () => renderer.invalidate(),
-        paint: () => renderRequest(renderer),
-      },
-      rectWidth,
-      rectHeight,
-      window.devicePixelRatio || 1,
-    );
+    const tryRestore = (): boolean => {
+      const r = rendererRef.current;
+      const w = wrapperRef.current;
+      if (!r) return false;
+      const rect = w?.getBoundingClientRect();
+      const rectWidth = rect?.width ?? 0;
+      const rectHeight = rect?.height ?? 0;
+      const action = decideVisibilityAction({
+        wasVisible: wasVisibleRef.current,
+        isVisible,
+        rectWidth,
+        rectHeight,
+      });
+      if (action !== "defer") wasVisibleRef.current = isVisible;
+      executeVisibilityAction(
+        action,
+        {
+          reconfigure: () => r.reconfigure(),
+          resizeFromRect: (rw, rh, dpr) => r.resize(rw, rh, dpr),
+          invalidate: () => r.invalidate(),
+          // Paint SYNCHRONOUSLY (not via rAF). The whole reason this
+          // effect is now a layout effect is so the reconfigure +
+          // first paint land in the same frame as the visibility
+          // flip. Going through scheduleRender's rAF would defer
+          // the paint into the next frame, re-introducing the
+          // single-frame black flash this fix is supposed to kill.
+          paint: () => renderRequest(r),
+        },
+        rectWidth,
+        rectHeight,
+        window.devicePixelRatio || 1,
+      );
+      return action !== "defer";
+    };
+    const restored = tryRestore();
+    // Defer-retry: when the wrapper's rect was 0×0 at effect time
+    // (React fired the layout effect inside the same commit that
+    // toggled visibility, before WebKit had a chance to settle the
+    // layout), schedule one rAF retry. By then layout has run and
+    // the rect will be non-zero — `tryRestore` succeeds and the
+    // canvas reads the live frame for its first paint instead of
+    // sitting black until the next ResizeObserver tick.
+    if (deferRafRef.current !== null) {
+      cancelAnimationFrame(deferRafRef.current);
+      deferRafRef.current = null;
+    }
+    if (!restored && isVisible) {
+      deferRafRef.current = requestAnimationFrame(() => {
+        deferRafRef.current = null;
+        tryRestore();
+      });
+    }
+    return () => {
+      if (deferRafRef.current !== null) {
+        cancelAnimationFrame(deferRafRef.current);
+        deferRafRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isVisible]);
+
+  // Watchdog timer. Independent of the visibility / heartbeat /
+  // resize paths — runs every second while the canvas is visible
+  // and pre-emptively reconfigures + repaints. This is the
+  // belt-and-suspenders safety net for the class of WKWebView
+  // surface-loss bugs that don't fire any signal we can hook:
+  //
+  //   - The renderer is mid-stream and `draw()`'s heartbeat is
+  //     paused because no new frames are coming in (idle agent).
+  //   - The `isVisible` prop didn't change (the keepalive layer's
+  //     visibility flip is the dominant trigger but not the only
+  //     one — an OS-level app switch, window minimize/restore, or
+  //     full-screen toggle can release the surface too).
+  //   - The page-level `visibilitychange` event fires only for
+  //     full-document visibility, not for window-occlusion-by-
+  //     other-app cases on macOS.
+  //
+  // 1000 ms is slow enough that the configure cost is negligible
+  // (~0.1% frame time at 60 Hz) but fast enough that a stuck-dead
+  // surface recovers within one second of visible perception. The
+  // user's "switch back to the tab and it's still black" complaint
+  // is exactly the symptom this guards against — they were waiting
+  // longer than a second.
+  useEffect(() => {
+    if (!isVisible) return;
+    const id = window.setInterval(() => {
+      const renderer = rendererRef.current;
+      if (!renderer) return;
+      renderer.reconfigure();
+      renderer.invalidate();
+      renderRequest(renderer);
+    }, 1000);
+    return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isVisible]);
 

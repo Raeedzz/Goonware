@@ -810,13 +810,40 @@ function TerminalKeepaliveLayer({
         return (
           <div
             key={tab.id}
+            // CRITICAL: do not use `display: none` to hide inactive
+            // terminal slots. WKWebView releases a canvas's WebGPU
+            // swapchain under `display: none` without firing
+            // `device.lost` — the surface dies silently and the next
+            // paint after un-hiding lands on a dead context, which the
+            // user sees as a fully-black agent pane.
+            //
+            // `visibility: hidden` keeps the element in the rendering
+            // tree (layout AND paint), which keeps the WebGPU surface
+            // alive across tab/worktree switches. Combined with
+            // `pointer-events: none` so the invisible terminal can't
+            // intercept mouse events, this is a structural fix that
+            // doesn't depend on any "recover after the surface dies"
+            // recovery layer holding up under WebKit's quirks.
+            //
+            // The frame-throttling that previously justified
+            // display:none (skipping React commits while hidden) is
+            // preserved separately via the `isVisible` prop into
+            // useTerminalSession — which gates React state updates,
+            // not GPU work.
             style={{
               position: "absolute",
               inset: 0,
-              display: visible ? "flex" : "none",
+              display: "flex",
               flexDirection: "column",
               minHeight: 0,
+              visibility: visible ? "visible" : "hidden",
+              pointerEvents: visible ? "auto" : "none",
+              // Lift the active slot to its own compositor layer so
+              // sibling hidden slots can't accidentally repaint over
+              // it on a parent-driven reflow.
+              zIndex: visible ? 1 : 0,
             }}
+            aria-hidden={visible ? undefined : true}
           >
             <TerminalTabContent
               worktree={worktree}
