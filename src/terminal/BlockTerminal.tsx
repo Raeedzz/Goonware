@@ -31,6 +31,7 @@ import {
 import { detectClaude } from "@/lib/claudeUsage";
 import { termKillForeground, termResetGrid } from "@/lib/tauri/term";
 import { decideCtrlCAction } from "./ctrlCEscalation";
+import { forceIdleForCwd } from "@/state/agentActivityStore";
 import {
   agentScrollContainerStyle,
   shouldRenderBlockList,
@@ -850,13 +851,35 @@ export function BlockTerminal({
   ]);
 
 
+  // Cwd ref so the Ctrl+C interrupt path can read the live worktree
+  // path without forcing the byte-send callback to rebind on every cwd
+  // change. Mirrors the foregroundIsAgentRef pattern.
+  const cwdRef = useRef(cwd);
+  useEffect(() => {
+    cwdRef.current = cwd;
+  }, [cwd]);
+
   // Memoized `onSendBytes` adapter — `sendBytes` returns a Promise but
   // the input components want a void-returning callback. Wrapping with
   // useCallback (with `sendBytes` as the only dep) keeps the reference
   // stable across renders, so the React.memo'd PromptInput +
   // PtyPassthrough don't re-render every time a PTY frame lands.
+  //
+  // SIDE EFFECT: when the user sends a raw ⌃C (byte 0x03) and an agent
+  // is foregrounded in this pane, force-flip its hook-driven status
+  // to Idle locally. Claude/Codex don't fire their Stop hook on a
+  // mid-turn SIGINT — Stop is the end-of-turn signal, not the abort
+  // signal. Without this, the worktree spinner keeps spinning after
+  // the user interrupted the agent, because the hook event for the
+  // status flip-back never arrives. Force-idle locally; the next
+  // real hook event (e.g. UserPromptSubmit on the next prompt) will
+  // re-set Working through the normal applyRecord path.
   const onSendBytesVoid = useCallback(
     (b: Uint8Array) => {
+      if (b.length === 1 && b[0] === 0x03) {
+        const path = cwdRef.current;
+        if (path && foregroundIsAgentRef.current) forceIdleForCwd(path);
+      }
       void sendBytes(b);
     },
     [sendBytes],
@@ -867,7 +890,14 @@ export function BlockTerminal({
   // Ctrl+C and a single SIGINT didn't take. The Rust side reads the
   // foreground process group via tcgetpgrp(master_fd) and SIGKILLs
   // it, bypassing whatever signal trap the running process installed.
+  //
+  // Always force-idle here. A double-tap escalation means the user
+  // really wants the agent dead — even if it traps SIGINT, the
+  // foreground process group is about to receive SIGKILL. The
+  // spinner must reflect that intent immediately.
   const onForceKill = useCallback(() => {
+    const path = cwdRef.current;
+    if (path) forceIdleForCwd(path);
     void termKillForeground(ptyId).catch(() => {
       // Backend may have torn the session down between the read and
       // the kill (rare race on tab close). Nothing useful to do; the
@@ -1198,7 +1228,13 @@ export function BlockTerminal({
       if (decision.action === "sigkill") {
         onForceKill();
       } else {
-        void sendBytes(new Uint8Array([0x03]));
+        // Route through onSendBytesVoid (not raw sendBytes) so the
+        // shared 0x03 → forceIdleForCwd side effect fires here too.
+        // The user pressed Ctrl+C via the window-level fallback —
+        // exactly the same intent ("stop the running agent") as a
+        // textarea-focused Ctrl+C. Without this, the spinner stays
+        // on after a window-fallback interrupt.
+        onSendBytesVoid(new Uint8Array([0x03]));
       }
       if (foregroundIsAgentRef.current) {
         passthroughRef.current?.focus();
@@ -1208,7 +1244,7 @@ export function BlockTerminal({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [id, isVisible, sendBytes, onForceKill]);
+  }, [id, isVisible, onSendBytesVoid, onForceKill]);
 
   // Window-level Cmd+C copy. Closed blocks are plain divs with
   // userSelect: "text"; users can drag-select inside them. But our

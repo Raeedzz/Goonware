@@ -217,6 +217,44 @@ function getCachedRunning(worktreePath: string): boolean {
 }
 
 /**
+ * Force-flip every working/compacting agent session whose cwd is at
+ * or below `cwd` to Idle, locally. This is the Ctrl+C path: the user
+ * pressed Ctrl+C to stop a running agent, but Claude/Codex don't
+ * always fire their Stop hook on a mid-turn SIGINT — Stop is the
+ * end-of-turn signal, not the abort signal. The session stays in
+ * "working" forever and the worktree spinner keeps spinning even
+ * though the agent has actually been interrupted.
+ *
+ * Mutating the local Map is sufficient: the worktree spinner is
+ * driven by this store's snapshot, and a subsequent real hook event
+ * (e.g. the user starting a new prompt → UserPromptSubmit) will
+ * re-set the status to Working through the normal applyRecord path.
+ * Rust-side state may still report Working until the next hook
+ * fires, but no UI reads that — the snapshot below is the
+ * frontend's source of truth.
+ *
+ * Does NOT delete the session: an in-flight session that's been
+ * interrupted is still a session (next UserPromptSubmit should
+ * resume it cleanly). Eviction happens on the real Ended event.
+ */
+export function forceIdleForCwd(cwd: string): void {
+  if (!cwd) return;
+  let changed = false;
+  for (const [key, rec] of sessions) {
+    if (!cwdMatchesWorktree(rec.cwd, cwd)) continue;
+    if (rec.status !== "working" && rec.status !== "compacting") continue;
+    sessions.set(key, {
+      ...rec,
+      status: "idle",
+      last_event: "ctrl_c_local",
+      updated_at_ms: Date.now(),
+    });
+    changed = true;
+  }
+  if (changed) notifyAll();
+}
+
+/**
  * Spinner signal for a worktree. ONLY sourced from agent CLI hook
  * events — no OSC 133, no per-tab agentStatus, no transcript mtime
  * polling. Returns true iff at least one Claude/Codex/Gemini session
