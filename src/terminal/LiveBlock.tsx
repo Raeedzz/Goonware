@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CanvasGrid } from "./CanvasGrid";
 import { CellRow } from "./CellRow";
 import { formatCwd, formatDuration } from "./formatBlockMeta";
@@ -111,6 +111,18 @@ export function LiveBlock({
   noWrap = false,
   isVisible = true,
 }: Props) {
+  // DOM-fallback latch. When the embedded CanvasGrid signals that
+  // its recovery ladder has exhausted (WKWebView handed back a
+  // persistently-dead GPU surface and no rebuild ever produced a
+  // successful paint), flip this to true. From that point on the
+  // agent block renders through DOM CellRow rows for the rest of
+  // its lifetime — slower than the canvas but unbreakable. When the
+  // user kills the agent and starts a fresh one the LiveBlock
+  // unmounts; the next instance attempts the canvas path again.
+  const [canvasFailed, setCanvasFailed] = useState(false);
+  const handleCanvasUnrecoverable = useCallback(() => {
+    setCanvasFailed(true);
+  }, []);
   const visibleRows = useMemo(() => {
     if (!frame) return [];
     // Tight trim of leading + trailing blanks. For agents, keep
@@ -322,21 +334,29 @@ export function LiveBlock({
             overflowX: noWrap && !preserveGrid && !fill ? "visible" : "hidden",
           }}
         >
-          {/* Agent TUI blocks (preserveGrid) always render through the
-              WebGPU CanvasGrid — it owns its own selection + cursor
-              painting, so no browser-selection-eats-cursor issue and
-              the cursor draws on top of any selection overlay. Shell
-              command output stays on the DOM CellRow path because
-              canvas doesn't soft-wrap yet (the wrap mode is what
-              keeps long lines readable in narrow panes — promoting
-              canvas here is a follow-up that needs wrap support). */}
-          {preserveGrid && frame ? (
+          {/* Agent TUI blocks (preserveGrid) normally render through
+              the WebGPU CanvasGrid — it owns its own selection +
+              cursor painting, so no browser-selection-eats-cursor
+              issue and the cursor draws on top of any selection
+              overlay. Shell command output stays on the DOM CellRow
+              path because canvas doesn't soft-wrap yet.
+
+              When the canvas's recovery ladder gives up (WKWebView
+              handed back a persistently-dead GPU surface, no rebuild
+              recovered), `canvasFailed` flips and the agent block
+              renders DOM CellRow rows instead. Slower than canvas,
+              less polished (no shader-driven selection accent, no
+              GPU cursor compositing), but guarantees the user sees
+              text rather than the indefinite black pane this commit
+              exists to defeat. */}
+          {preserveGrid && frame && !canvasFailed ? (
             <CanvasGrid
               frame={frame}
               rows={combinedRows}
               mode="auto"
               firstRowOffset={firstRowOffset}
               isVisible={isVisible}
+              onCanvasUnrecoverable={handleCanvasUnrecoverable}
             />
           ) : (
             combinedRows.map((row) => (

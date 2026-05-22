@@ -319,6 +319,20 @@ export class GridRenderer {
    * restore + draw-retry paths are already trying to recover).
    */
   private framesSinceReconfigure = 0;
+  /**
+   * Total frames successfully submitted to the GPU since this renderer
+   * was constructed. Read by `CanvasGrid`'s escalation ladder as the
+   * "is paint actually happening?" signal — when the canvas is stuck
+   * black, this counter stops advancing even while the React layer
+   * keeps requesting renders.
+   *
+   * Same gate as `framesSinceReconfigure` (post-submit only) so a
+   * skipped frame does not falsely advance the signal and trick the
+   * ladder into thinking we are healthy. Survives `reconfigure()` (a
+   * successful configure is itself a recovery signal but the cumulative
+   * "have we ever painted" answer is what callers actually need).
+   */
+  private successfulDraws = 0;
 
   constructor(
     device: GPUDevice,
@@ -604,6 +618,17 @@ export class GridRenderer {
       widthCss: this.atlas.cellWidthCss,
       heightCss: this.atlas.cellHeightCss,
     };
+  }
+
+  /**
+   * Cumulative successful frame submissions since construction. Read
+   * by the escalation ladder in CanvasGrid to detect "the React layer
+   * keeps asking but no frames are actually landing" — the signal
+   * that distinguishes a dead WKWebView surface from a healthy idle
+   * canvas. Cheap (one number read).
+   */
+  get successfulDrawCount(): number {
+    return this.successfulDraws;
   }
 
   /**
@@ -943,6 +968,13 @@ export class GridRenderer {
     // pathological dead-surface run doesn't trip the heartbeat
     // before the draw-retry path has had a chance to recover.
     this.framesSinceReconfigure++;
+    // Cumulative paint counter — same post-submit gate so a stuck-dead
+    // surface does not advance it. Cap so a long-running session
+    // doesn't overflow Number's safe-integer range (would take ~4.7
+    // billion frames at 60Hz to risk it but pinned defensively).
+    if (this.successfulDraws < Number.MAX_SAFE_INTEGER) {
+      this.successfulDraws++;
+    }
   }
 }
 
