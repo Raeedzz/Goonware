@@ -259,6 +259,7 @@ export function CanvasGrid({
     const wrapper = wrapperRef.current;
     if (!canvas || !wrapper) return;
     let cancelled = false;
+    let bootstrapStarted = false;
     // All deferred work scheduled inside this bootstrap pass. The
     // cleanup loops through and clears each one so a rendererEpoch
     // bump (or unmount) doesn't leave timers firing against a
@@ -389,10 +390,78 @@ export function CanvasGrid({
           pendingTimers.push(id);
         });
     };
-    attemptBootstrap(0);
+
+    // ── Primary prevention: gate the FIRST context.configure() on a
+    // sized canvas ────────────────────────────────────────────────
+    //
+    // The escalation ladder + DOM fallback below are the safety net
+    // for cases we can't predict (driver hiccup, GPU process reset).
+    // The root cause of the "open agent → all black, never recovers"
+    // bug is upstream of all that: createGridRenderer calls
+    // context.configure() synchronously, and WKWebView returns a
+    // zombie swapchain if that call runs against a 0×0 canvas (no
+    // backing surface yet). All later getCurrentTexture() calls
+    // succeed from JS — no device.lost, no exception — but the
+    // textures paint into the void. No subsequent context.configure
+    // (resize-driven or otherwise) reliably rescues this state, which
+    // is why a fresh adapter+device+context rebuild was needed at all.
+    //
+    // The fix is to never enter that state. Wait for the wrapper to
+    // have nonzero CSS dimensions, pre-size the canvas to match, THEN
+    // bootstrap. The first swapchain is born on a real surface and
+    // the rebuild ladder almost never has to fire.
+    //
+    // Normal path: useEffect runs after React's layout commit, so the
+    // wrapper is already sized — startBootstrapIfSized fires
+    // synchronously here and bootstrapStarted flips to true before
+    // we ever set up the observer.
+    //
+    // Slow path: the wrapper is 0×0 (rare — initial mount under a
+    // keepalive layer that's currently `display: none`, or a
+    // first-paint reflow that hasn't settled). The ResizeObserver
+    // waits for the first nonzero rect and starts bootstrap then.
+    const startBootstrapIfSized = () => {
+      if (bootstrapStarted || cancelled || gaveUpRef.current) return;
+      const rect = wrapper.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      // Pre-size the canvas so the very first context.configure() in
+      // createGridRenderer lands on a properly-sized backing store.
+      // The renderer's own resize() will re-run configure if the
+      // wrapper later changes size, but starting at the wrapper's
+      // measured size means most agent panes never hit that path.
+      const dpr = window.devicePixelRatio || 1;
+      const physWidth = Math.max(1, Math.floor(rect.width * dpr));
+      const physHeight = Math.max(1, Math.ceil(rect.height * dpr));
+      canvas.width = physWidth;
+      canvas.height = physHeight;
+      canvas.style.width = `${physWidth / dpr}px`;
+      canvas.style.height = `${physHeight / dpr}px`;
+      bootstrapStarted = true;
+      attemptBootstrap(0);
+    };
+
+    // Try synchronously first — covers the common case where layout
+    // is already complete by the time this effect fires.
+    startBootstrapIfSized();
+
+    // Fallback observer for the 0×0-at-mount edge case. Disconnects
+    // itself the moment bootstrap actually starts so a wrapper resize
+    // doesn't trigger a second createGridRenderer call.
+    let sizeObserver: ResizeObserver | null = null;
+    if (!bootstrapStarted) {
+      sizeObserver = new ResizeObserver(() => {
+        startBootstrapIfSized();
+        if (bootstrapStarted) {
+          sizeObserver?.disconnect();
+          sizeObserver = null;
+        }
+      });
+      sizeObserver.observe(wrapper);
+    }
 
     return () => {
       cancelled = true;
+      sizeObserver?.disconnect();
       for (const id of pendingTimers) window.clearTimeout(id);
       rendererRef.current?.destroy();
       rendererRef.current = null;
