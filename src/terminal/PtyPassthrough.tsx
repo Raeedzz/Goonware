@@ -72,6 +72,14 @@ const PASTE_END = encoder.encode("\x1b[201~");
  * control byte, plain printable chars route through `onChange` so
  * OS IME composition still works. Off-screen via fixed positioning
  * so the textarea is invisible but focusable.
+ *
+ * Crucially, this component does NOT render its own slash-command
+ * picker. Warp's host-side picker is for Warp's own proprietary
+ * agent; for third-party CLI agents (Claude Code, Codex, Gemini)
+ * Warp passes `/` straight through and the agent renders its own
+ * picker inside its TUI. We do the same — Claude's `/` menu is the
+ * source of truth for slash commands, with its own keyboard nav and
+ * fuzzy filter.
  */
 export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
   function PtyPassthrough(
@@ -300,5 +308,3 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
     );
   },
 ));
-
-

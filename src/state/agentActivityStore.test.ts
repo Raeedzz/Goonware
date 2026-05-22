@@ -5,6 +5,12 @@ import {
   type SessionRecord,
 } from "./agentActivityStore";
 
+// `useAgentSessionForCwd` is exported but only consumable inside a
+// React renderer. The test below reaches into the same internal
+// resolver — `getCachedSessionForCwd` — through a thin wrapper
+// exported on `__internals`. See agentActivityStore.ts for the
+// extension.
+
 /**
  * Regression tests for the Ctrl+C spinner fix.
  *
@@ -154,5 +160,78 @@ describe("forceIdleForCwd — Ctrl+C local spinner flip", () => {
     });
     forceIdleForCwd("/Users/me/proj");
     expect(__internals.sessions.get("claude:abc")!.status).toBe("idle");
+  });
+});
+
+describe("resolveSessionForCwd — AgentChrome picks the right session", () => {
+  test("returns null for empty cwd", () => {
+    expect(__internals.resolveSessionForCwd("")).toBeNull();
+  });
+
+  test("returns null when no sessions match", () => {
+    seedSession({
+      session_id: "abc",
+      cwd: "/Users/me/other-proj",
+      status: "working",
+    });
+    expect(__internals.resolveSessionForCwd("/Users/me/proj")).toBeNull();
+  });
+
+  test("returns the matching session for exact cwd", () => {
+    seedSession({
+      session_id: "abc",
+      cwd: "/Users/me/proj",
+      status: "working",
+    });
+    const rec = __internals.resolveSessionForCwd("/Users/me/proj");
+    expect(rec).not.toBeNull();
+    expect(rec!.session_id).toBe("abc");
+  });
+
+  test("returns the matching session for a descendant cwd", () => {
+    seedSession({
+      session_id: "abc",
+      cwd: "/Users/me/proj/src/components",
+      status: "working",
+    });
+    const rec = __internals.resolveSessionForCwd("/Users/me/proj");
+    expect(rec).not.toBeNull();
+    expect(rec!.session_id).toBe("abc");
+  });
+
+  test("returns the most-recently-updated session when multiple match", () => {
+    seedSession({
+      session_id: "older",
+      cwd: "/Users/me/proj",
+      status: "working",
+      updated_at_ms: 1000,
+    });
+    seedSession({
+      provider: "codex",
+      session_id: "newer",
+      cwd: "/Users/me/proj/src",
+      status: "working",
+      updated_at_ms: 2000,
+    });
+    const rec = __internals.resolveSessionForCwd("/Users/me/proj");
+    expect(rec).not.toBeNull();
+    expect(rec!.session_id).toBe("newer");
+    expect(rec!.provider).toBe("codex");
+  });
+
+  test("skips sessions whose cwd is outside the worktree", () => {
+    seedSession({
+      session_id: "outside",
+      cwd: "/Users/me/different-proj",
+      status: "working",
+    });
+    seedSession({
+      session_id: "inside",
+      cwd: "/Users/me/proj",
+      status: "idle",
+    });
+    const rec = __internals.resolveSessionForCwd("/Users/me/proj");
+    expect(rec).not.toBeNull();
+    expect(rec!.session_id).toBe("inside");
   });
 });

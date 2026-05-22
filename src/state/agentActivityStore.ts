@@ -276,9 +276,59 @@ export function useTrackAgentActivity(_worktreeId: string, cwd: string): boolean
   );
 }
 
+/**
+ * Return the most-recently-updated SessionRecord whose cwd is at or
+ * below `cwd`, or null if none. Used by the per-pane AgentChrome to
+ * show "Claude is using Read" / "waiting for permission" / etc.
+ *
+ * "Most recent" matters when the user has multiple agents touching
+ * overlapping subtrees of a worktree (a Claude session at the root
+ * and a Codex session in `src/`, say). The freshest event is the one
+ * the user just observed, so the chrome reflects what just happened
+ * rather than randomly picking from the matching set.
+ */
+const sessionForCwdCache = new Map<string, SessionRecord | null>();
+
+function computeSessionForCwd(cwd: string): SessionRecord | null {
+  if (!cwd) return null;
+  let best: SessionRecord | null = null;
+  for (const rec of sessions.values()) {
+    if (!cwdMatchesWorktree(rec.cwd, cwd)) continue;
+    if (!best || rec.updated_at_ms > best.updated_at_ms) best = rec;
+  }
+  return best;
+}
+
+function getCachedSessionForCwd(cwd: string): SessionRecord | null {
+  if (lastSessionCacheGeneration !== snapshotGeneration) {
+    sessionForCwdCache.clear();
+    lastSessionCacheGeneration = snapshotGeneration;
+  }
+  if (sessionForCwdCache.has(cwd)) {
+    return sessionForCwdCache.get(cwd) ?? null;
+  }
+  const fresh = computeSessionForCwd(cwd);
+  sessionForCwdCache.set(cwd, fresh);
+  return fresh;
+}
+
+let lastSessionCacheGeneration = 0;
+
+export function useAgentSessionForCwd(cwd: string): SessionRecord | null {
+  return useSyncExternalStore(
+    (notify) => {
+      listeners.add(notify);
+      return () => listeners.delete(notify);
+    },
+    () => getCachedSessionForCwd(cwd),
+    () => getCachedSessionForCwd(cwd),
+  );
+}
+
 // Re-exported for tests / scripts that want to inspect store state.
 // Not part of the supported API.
 export const __internals = {
   sessions,
   applyRecord,
+  resolveSessionForCwd: getCachedSessionForCwd,
 };

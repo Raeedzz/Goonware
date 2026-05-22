@@ -204,11 +204,23 @@ export function CanvasGrid({
   // and bootstraps a fresh one. Users see a single frame of black
   // during the swap, then painting resumes from the next backend seq.
   const [rendererEpoch, setRendererEpoch] = useState(0);
+  // Tracks whether the one-shot proactive rebuild has already fired
+  // for THIS CanvasGrid instance. Without the ref the rebuild would
+  // re-arm itself every time the bumped epoch re-runs the bootstrap,
+  // pegging the user in a permanent destroy/recreate loop. Reset
+  // implicitly on remount because refs are re-created with each
+  // component instance.
+  const proactiveRebuildDoneRef = useRef(false);
   useEffect(() => {
     const canvas = canvasRef.current;
     const wrapper = wrapperRef.current;
     if (!canvas || !wrapper) return;
     let cancelled = false;
+    // All deferred work scheduled inside this bootstrap pass. The
+    // cleanup loops through and clears each one so a rendererEpoch
+    // bump (or unmount) doesn't leave timers firing against a
+    // destroyed renderer.
+    const pendingTimers: number[] = [];
     const fontFamily =
       font ??
       "JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace";
@@ -248,6 +260,58 @@ export function CanvasGrid({
           window.devicePixelRatio || 1,
         );
         renderRequest(renderer);
+
+        // ── Bulletproof black-surface recovery ─────────────────────
+        //
+        // Goonware has spent months fighting the "open agent → all
+        // black, never recovers" bug. Existing safety nets
+        // (visibility restore, 1 s watchdog reconfigure, 60-frame
+        // heartbeat, intersection observer, document.visibilitychange)
+        // all assume the swapchain is recoverable via
+        // `context.configure()`. But on WKWebView the GPU device
+        // itself can die WITHOUT `device.lost` ever resolving —
+        // `getCurrentTexture()` returns a texture that paints into
+        // the void, no error fires, and no amount of reconfigure
+        // helps. The user sees a solid-black pane indefinitely,
+        // which is the exact regression reported in the screenshot
+        // that brought us here. The only fix for a dead device is
+        // a full renderer rebuild (fresh adapter + device + context).
+        //
+        // Two-stage recovery:
+        //
+        // 1. SOFT WARMUP — 50/200/500/1200 ms post-init we
+        //    reconfigure + repaint. Cheap (sub-millisecond
+        //    configure on a healthy surface) and catches the vast
+        //    majority of "first paint into a stale swapchain"
+        //    cases without any rebuild cost.
+        //
+        // 2. HARD REBUILD — at 2500 ms, if the proactive rebuild
+        //    hasn't fired yet, bump `rendererEpoch`. This destroys
+        //    the renderer and creates a fresh adapter/device/
+        //    context. The 50-100 ms swap is visible as a brief
+        //    flicker on a healthy mount, but it's the difference
+        //    between a recoverable black canvas and the user
+        //    forcefully killing the process. The
+        //    `proactiveRebuildDoneRef` guard makes this strictly
+        //    one-shot per CanvasGrid mount so the bumped epoch
+        //    doesn't re-trigger the timer in a loop.
+        for (const delay of [50, 200, 500, 1200]) {
+          const id = window.setTimeout(() => {
+            const r = rendererRef.current;
+            if (!r) return;
+            r.reconfigure();
+            renderRequest(r);
+          }, delay);
+          pendingTimers.push(id);
+        }
+        if (!proactiveRebuildDoneRef.current) {
+          const id = window.setTimeout(() => {
+            if (cancelled) return;
+            proactiveRebuildDoneRef.current = true;
+            setRendererEpoch((n) => n + 1);
+          }, 2500);
+          pendingTimers.push(id);
+        }
       })
       .catch((err) => {
         // eslint-disable-next-line no-console
@@ -256,6 +320,7 @@ export function CanvasGrid({
 
     return () => {
       cancelled = true;
+      for (const id of pendingTimers) window.clearTimeout(id);
       rendererRef.current?.destroy();
       rendererRef.current = null;
     };

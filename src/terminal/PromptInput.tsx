@@ -73,6 +73,16 @@ interface Props {
 
 const COMPLETION_LIMIT = 8;
 
+/**
+ * Maximum pixel height the auto-growing prompt textarea can reach
+ * before it starts scrolling internally instead of pushing the rest
+ * of the layout down. Mirrors Warp's
+ * `CLI_AGENT_RICH_INPUT_EDITOR_MAX_HEIGHT` (236 px, see warpdotdev/warp
+ * → `app/src/terminal/input.rs`) so a many-line draft never eats the
+ * agent's visible canvas.
+ */
+const MAX_INPUT_HEIGHT_PX = 236;
+
 /* ------------------------------------------------------------------
    Shell tokenizer for the input overlay.
    ------------------------------------------------------------------
@@ -373,6 +383,12 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
       commandRunningRef.current = commandRunning;
     }, [commandRunning]);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
+    // Mirror of the textarea's scrollTop, attached to the syntax-
+    // highlight overlay so the colored tokens stay glued to the
+    // user's caret once the textarea reaches MAX_INPUT_HEIGHT_PX and
+    // starts scrolling internally. Without this the overlay would
+    // float in place while the textarea content scrolled underneath.
+    const highlightRef = useRef<HTMLPreElement>(null);
     const [value, setValue] = useState("");
     // Track the newline count of the last value so the height-resize
     // path only runs when the line count actually changes. Reading
@@ -983,10 +999,14 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
             </div>
           </div>
         )}
-        <PromptHighlight value={value}>
+        <PromptHighlight value={value} preRef={highlightRef}>
           <textarea
             ref={textareaRef}
             value={value}
+            onScroll={(e) => {
+              const pre = highlightRef.current;
+              if (pre) pre.scrollTop = e.currentTarget.scrollTop;
+            }}
             onChange={(e) => {
               const next = e.target.value;
               setValue(next);
@@ -1004,7 +1024,10 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
                 lastNewlineCountRef.current = newlineCount;
                 const ta = e.currentTarget;
                 ta.style.height = "auto";
-                ta.style.height = `${ta.scrollHeight}px`;
+                ta.style.height = `${Math.min(
+                  ta.scrollHeight,
+                  MAX_INPUT_HEIGHT_PX,
+                )}px`;
               }
             }}
             onPaste={(e: ClipboardEvent<HTMLTextAreaElement>) => {
@@ -1070,6 +1093,8 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
               lineHeight: 1.5,
               color: "transparent",
               caretColor: "var(--accent-bright)",
+              maxHeight: MAX_INPUT_HEIGHT_PX,
+              overflowY: "auto",
             }}
             className="goonware-prompt-input"
           />
@@ -1122,14 +1147,17 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
 function PromptHighlight({
   value,
   children,
+  preRef,
 }: {
   value: string;
   children: React.ReactNode;
+  preRef?: React.RefObject<HTMLPreElement | null>;
 }) {
   const tokens = tokenize(value);
   return (
     <div style={{ position: "relative", width: "100%" }}>
       <pre
+        ref={preRef}
         aria-hidden
         style={{
           position: "absolute",
