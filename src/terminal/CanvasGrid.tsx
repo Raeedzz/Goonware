@@ -674,6 +674,42 @@ export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGri
   useEffect(() => {
     const wrapper = wrapperRef.current;
     if (!wrapper) return;
+    // Sub-pixel reflow suppression. Some siblings of the canvas
+    // (notably AgentChrome's status pill, but also any future text
+    // strip whose content varies by status) can shift their rendered
+    // height by 1–2 px when their content changes. That tiny delta
+    // ripples through flex layout and lands here as a ResizeObserver
+    // tick with a fractional CSS-pixel rect change.
+    //
+    // `renderer.resize()` short-circuits when the resulting PHYSICAL
+    // pixel count is unchanged, so sub-pixel deltas at integer DPRs
+    // are mostly no-ops anyway. But at fractional DPRs (1.5, 2.5)
+    // and at certain ResizeObserver-rounded values, a sub-CSS-pixel
+    // shift can still cross an integer physical-pixel boundary,
+    // trigger the slow path (canvas.width = ...; context.configure;
+    // lastSeq = -1), and on WKWebView produce one frame of blank
+    // swapchain before the synchronous `renderRequest` lands the
+    // next paint. The user-reported symptom was "screen instantly
+    // blank when Claude asks for permission" — the permission pill
+    // in AgentChrome was changing the strip's rendered height by a
+    // couple of CSS px even though BlockTerminal had reserved a
+    // fixed 32px row for it.
+    //
+    // Defense: track the last rect we forwarded and ignore ticks
+    // whose CSS-pixel delta is below SUBPIXEL_REFLOW_THRESHOLD_PX in
+    // both dimensions. Real resizes (sidebar collapse, window
+    // resize, tab switch landing a different layout) are always
+    // many pixels and pass through immediately. Status-pill churn
+    // is sub-pixel and gets dropped — the swapchain stays alive and
+    // the renderer's per-second watchdog keeps painting.
+    //
+    // The 2 px threshold is chosen against JetBrains Mono at 13 px /
+    // 1.35 lh — one row of canvas is 17.5–18 CSS px, so a 2 px shift
+    // is still far below "one row gained/lost" territory. Anything
+    // larger than that legitimately needs a backbuffer realloc.
+    const SUBPIXEL_REFLOW_THRESHOLD_PX = 2;
+    let lastForwardedWidth = -1;
+    let lastForwardedHeight = -1;
     const observer = new ResizeObserver((entries) => {
       const renderer = rendererRef.current;
       if (!renderer) return;
@@ -689,11 +725,31 @@ export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGri
       // its pre-hide backbuffer means the next visibility tick can
       // paint the cached frame without a re-fit round-trip.
       if (rect.width === 0 || rect.height === 0) return;
+      // Sub-pixel reflow suppression — see comment above the
+      // observer. Only applies AFTER the first forwarded resize so
+      // the initial mount measurement always goes through.
+      if (lastForwardedWidth > 0 && lastForwardedHeight > 0) {
+        const dw = Math.abs(rect.width - lastForwardedWidth);
+        const dh = Math.abs(rect.height - lastForwardedHeight);
+        if (
+          dw < SUBPIXEL_REFLOW_THRESHOLD_PX &&
+          dh < SUBPIXEL_REFLOW_THRESHOLD_PX
+        ) {
+          return;
+        }
+      }
+      lastForwardedWidth = rect.width;
+      lastForwardedHeight = rect.height;
       renderer.resize(
         rect.width,
         rect.height,
         window.devicePixelRatio || 1,
       );
+      // Defense in depth: even if `resize()` took its dimensions-
+      // unchanged fast path (no reconfigure, no canvas clear), force
+      // a fresh paint. The cost is one renderer.render() call which
+      // dedupes by seq when nothing actually changed.
+      renderer.invalidate();
       renderRequest(renderer);
     });
     observer.observe(wrapper);

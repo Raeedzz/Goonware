@@ -11,6 +11,25 @@ interface Props {
 }
 
 /**
+ * Pinned strip height in CSS pixels. MUST stay in sync with the
+ * `agentChromeHeight` constant in BlockTerminal.tsx — that file's
+ * PTY-dimension calc reserves this exact number, and any drift between
+ * the two reserves either an empty stripe under the canvas or sends
+ * the canvas under the chrome.
+ *
+ * The strip is rendered as a fixed-height box (height + boxSizing:
+ * border-box) so its rendered height is INVARIANT across status
+ * transitions. Earlier versions sized to content — the "permission
+ * requested" pill (12px SVG + semibold text) made the strip a few
+ * pixels taller than the working/idle states, which fired
+ * CanvasGrid's inner ResizeObserver, reconfigured the WebGPU
+ * swapchain mid-frame, and produced the "agent pane goes blank when
+ * Claude asks for permission" symptom. Pinning the height prevents
+ * the layout shift at its source.
+ */
+export const AGENT_CHROME_HEIGHT_PX = 32;
+
+/**
  * Warp-style status strip rendered above the agent's TUI / live block.
  * Reads the hook-driven SessionRecord for this pane's cwd and surfaces:
  *
@@ -40,10 +59,16 @@ export function AgentChrome({ cwd }: Props) {
       role="status"
       aria-live="polite"
       style={{
+        // Pinned height — see AGENT_CHROME_HEIGHT_PX above for why
+        // this MUST NOT be content-sized. boxSizing:border-box so the
+        // 1px borderBottom is counted inside the 32px box (otherwise
+        // the box becomes 33px and BlockTerminal's reserve drifts).
+        height: AGENT_CHROME_HEIGHT_PX,
+        boxSizing: "border-box",
         display: "flex",
         alignItems: "center",
         gap: "var(--space-2)",
-        padding: "6px var(--space-3)",
+        padding: "0 var(--space-3)",
         borderBottom: "var(--border-1)",
         backgroundColor: "var(--surface-1)",
         fontFamily: "var(--font-sans)",
@@ -52,6 +77,13 @@ export function AgentChrome({ cwd }: Props) {
         letterSpacing: "var(--tracking-tight)",
         userSelect: "none",
         flexShrink: 0,
+        // Hide any sub-pixel overshoot from a heavier child (e.g. the
+        // semibold "permission requested" pill at certain font hinting
+        // / DPR combos). Without this the inner row can push the
+        // visible box past 32px even with a fixed height set on the
+        // outer — the overflow itself doesn't change the box's height
+        // but layout calc inside flex parents can still observe it.
+        overflow: "hidden",
       }}
     >
       <ProviderBadge provider={session.provider} />

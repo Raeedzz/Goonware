@@ -11,7 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { joinShellPaths } from "@/lib/shellQuote";
 import { BlockList } from "./BlockList";
-import { AgentChrome } from "./AgentChrome";
+import { AgentChrome, AGENT_CHROME_HEIGHT_PX } from "./AgentChrome";
 import { CanvasGrid, type CanvasGridHandle } from "./CanvasGrid";
 import { CellRow } from "./CellRow";
 import { LiveBlock } from "./LiveBlock";
@@ -491,6 +491,55 @@ export function BlockTerminal({
     el.scrollTop = el.scrollHeight;
   }, [liveFrame?.seq, blocks.length, altScreen, foregroundIsAgent]);
 
+  // Sustained anchor while stick-to-bottom is true: ANY growth of the
+  // scroll container's content (BlockList row added, LiveBlock body
+  // tall canvas mid-bootstrap, AgentChrome rendering for the first
+  // time, etc.) re-snaps scrollTop to the new scrollHeight. Without
+  // this, the user-reported "open a new claude and it glitches
+  // halfway up the pane" bug fires whenever the LiveBlock fill mode
+  // settles AFTER the layout-effect snap above has already run — the
+  // first snap commits when the inner body is still empty / short,
+  // then the canvas grows downward via `flex-end` justification and
+  // the scroll position is left somewhere in the middle of the
+  // scrollHeight. The intermittent nature ("doesn't happen every
+  // time") matches the race: only when the LiveBlock layout settles
+  // across more rAFs than the post-flip rAF-snap chain covers.
+  //
+  // Observe the scroll container itself (its scrollHeight grows as
+  // children grow). Snap synchronously inside the observer so the
+  // viewport never paints with a stale scrollTop.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver(() => {
+      if (!stickToBottomRef.current) return;
+      // Read in the same tick we write — the observer fires between
+      // layout and paint, so scrollHeight is current.
+      el.scrollTop = el.scrollHeight;
+    });
+    observer.observe(el);
+    // Also observe direct children so a growth INSIDE the container
+    // (LiveBlock body inflating to 100cqh, CanvasGrid auto height
+    // settling to rows × cellHeight) fires the snap even when the
+    // container's own outer height is stable. Children mount /
+    // unmount with React's reconciliation, so re-observe whenever
+    // the child list changes — use a MutationObserver for that.
+    const childObserver = new MutationObserver(() => {
+      for (const child of Array.from(el.children)) {
+        if (child instanceof HTMLElement) observer.observe(child);
+      }
+    });
+    childObserver.observe(el, { childList: true });
+    // Prime: observe the current children once at mount.
+    for (const child of Array.from(el.children)) {
+      if (child instanceof HTMLElement) observer.observe(child);
+    }
+    return () => {
+      observer.disconnect();
+      childObserver.disconnect();
+    };
+  }, []);
+
   // Force-stick when the terminal transitions from hidden to visible.
   // The keepalive layer in MainColumn flips `display: none` ↔
   // `display: flex` for tab switches; WKWebView resets the inner
@@ -676,10 +725,15 @@ export function BlockTerminal({
       const inputChrome = agentMode ? 44 : 80;
       const liveBlockChrome = 50;
       // Warp-style status strip rendered above the agent canvas (see
-      // AgentChrome.tsx). 6px top + ~16px content + 6px bottom + 1px
-      // border ≈ 29; round to 32 so a row of the canvas never tucks
-      // behind the chrome at sub-pixel boundaries.
-      const agentChromeHeight = agentMode ? 32 : 0;
+      // AgentChrome.tsx). Pinned via AGENT_CHROME_HEIGHT_PX — the
+      // chrome itself uses height + boxSizing:border-box with the
+      // same constant, so the PTY reserve here can never drift from
+      // the chrome's measured height. Drift was the root cause of
+      // "agent pane goes blank when Claude asks for permission":
+      // each status flip changed the chrome's content height by a
+      // few px, which fired CanvasGrid's inner ResizeObserver and
+      // reconfigured the WebGPU swapchain mid-frame.
+      const agentChromeHeight = agentMode ? AGENT_CHROME_HEIGHT_PX : 0;
       const reserved = inputChrome + liveBlockChrome + agentChromeHeight;
       const usableHeight = Math.max(120, rect.height - reserved);
       const cellHeight = 13 * 1.35;
