@@ -22,6 +22,7 @@ import {
 import { fs } from "@/lib/fs";
 import { git, type StatusEntry } from "@/lib/git";
 import { FileTree } from "@/files/FileTree";
+import { paneSlotStyle } from "./paneSlotLayout";
 import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { useToast } from "@/primitives/Toast";
 import { Loader } from "@/primitives/Loader";
@@ -203,19 +204,7 @@ function PaneSlot({
   active: boolean;
   children: React.ReactNode;
 }) {
-  return (
-    <div
-      style={{
-        position: "absolute",
-        inset: 0,
-        display: active ? "flex" : "none",
-        flexDirection: "column",
-        minHeight: 0,
-      }}
-    >
-      {children}
-    </div>
-  );
+  return <div style={paneSlotStyle(active)}>{children}</div>;
 }
 
 function PanelTab({
@@ -365,7 +354,7 @@ function hoverableIcon(active: boolean): CSSProperties {
    tab; everything else as an editor tab in the main column.
    ------------------------------------------------------------------ */
 
-function FilesView({ worktree }: { worktree: Worktree }) {
+export function FilesView({ worktree }: { worktree: Worktree }) {
   const dispatch = useAppDispatch();
 
   const onOpen = (path: string) => {
@@ -387,11 +376,15 @@ function FilesView({ worktree }: { worktree: Worktree }) {
     });
   };
 
-  return (
-    <div style={{ padding: "var(--space-1) 0", minHeight: 0 }}>
-      <FileTree root={worktree.path} onOpenFile={onOpen} />
-    </div>
-  );
+  // FileTree is the direct child of the PaneSlot flex column — its
+  // outer element carries the `flex:1 + minHeight:0 + overflowY:auto`
+  // contract that makes the right-panel file list scrollable. An
+  // intermediate wrapper here used to break that contract (default
+  // `flex:0 1 auto` sized the wrapper to content, so FileTree's `flex:1`
+  // had no flex parent to claim and the list overflowed silently into
+  // the PaneSlot's `overflow:hidden`). Pinned by `paneSlotLayout.test.ts`
+  // and `filesViewScroll.test.tsx`.
+  return <FileTree root={worktree.path} onOpenFile={onOpen} />;
 }
 
 function relPath(abs: string, root: string): string {

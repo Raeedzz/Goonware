@@ -591,6 +591,110 @@ export function BlockTerminal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Warp-style drag-to-scroll. Pointer-down anywhere on the scroll
+  // container starts tracking; once the pointer moves past a small
+  // threshold we engage drag mode (cancel any nascent selection, take
+  // pointer capture, and slide scrollTop with the cursor). Below the
+  // threshold the event flows through normally, so taps still focus
+  // and short drags can still start a text selection.
+  //
+  // We skip drag on canvas / input / button targets so the agent's
+  // CanvasGrid keeps its own click semantics and the PromptInput
+  // textarea isn't hijacked when the user reaches for it.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const DRAG_THRESHOLD_PX = 6;
+    let activePointerId = -1;
+    let startY = 0;
+    let startScroll = 0;
+    let engaged = false;
+    let restoreUserSelect: string | null = null;
+
+    const isInteractiveTarget = (target: EventTarget | null): boolean => {
+      if (!(target instanceof Element)) return false;
+      return Boolean(
+        target.closest(
+          "canvas, input, textarea, button, select, [contenteditable=true], [role='button']",
+        ),
+      );
+    };
+
+    const teardown = () => {
+      if (activePointerId !== -1) {
+        try {
+          el.releasePointerCapture?.(activePointerId);
+        } catch {
+          // Pointer capture wasn't granted — ignore.
+        }
+      }
+      activePointerId = -1;
+      engaged = false;
+      if (restoreUserSelect !== null) {
+        document.body.style.userSelect = restoreUserSelect;
+        restoreUserSelect = null;
+      }
+      document.body.style.cursor = "";
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (e.pointerId !== activePointerId) return;
+      const dy = e.clientY - startY;
+      if (!engaged) {
+        if (Math.abs(dy) < DRAG_THRESHOLD_PX) return;
+        engaged = true;
+        // Drop any selection that the down-event started; once we're
+        // committing to a scroll-drag the highlighted text would just
+        // streak across the page as the cursor moves.
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed) sel.removeAllRanges();
+        restoreUserSelect = document.body.style.userSelect;
+        document.body.style.userSelect = "none";
+        document.body.style.cursor = "grabbing";
+        try {
+          el.setPointerCapture?.(activePointerId);
+        } catch {
+          // Some targets refuse capture (e.g. detached nodes); the
+          // window-level listeners still drive the drag, so this is
+          // a soft failure.
+        }
+      }
+      // Natural-drag direction: pull the content up to reveal what's
+      // below (scrollTop increases as the cursor moves up). This
+      // matches the touch convention every user already knows.
+      el.scrollTop = startScroll - dy;
+      e.preventDefault();
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
+      if (e.pointerId !== activePointerId) return;
+      teardown();
+    };
+
+    const onPointerDown = (e: PointerEvent) => {
+      // Left button (0) or middle button (1). Right-click should keep
+      // its native context menu.
+      if (e.button !== 0 && e.button !== 1) return;
+      if (isInteractiveTarget(e.target)) return;
+      activePointerId = e.pointerId;
+      startY = e.clientY;
+      startScroll = el.scrollTop;
+      engaged = false;
+      window.addEventListener("pointermove", onPointerMove, { passive: false });
+      window.addEventListener("pointerup", onPointerUp, { passive: true });
+      window.addEventListener("pointercancel", onPointerUp, { passive: true });
+    };
+
+    el.addEventListener("pointerdown", onPointerDown, { passive: true });
+    return () => {
+      el.removeEventListener("pointerdown", onPointerDown);
+      teardown();
+    };
+  }, []);
+
   // PTY died (process crashed, backend restarted on a Rust hot-reload,
   // user `exit`-ed the shell, etc.). Drop out of agent mode so the
   // user isn't staring at a blank pane that used to be claude. The
@@ -998,6 +1102,22 @@ export function BlockTerminal({
       // the kill (rare race on tab close). Nothing useful to do; the
       // next Ctrl+C will start a fresh single-tap cycle anyway.
     });
+    // We just killed the foreground process group — there is no
+    // longer a running agent to wait for. Eagerly drop out of
+    // agent mode instead of waiting for the OSC 133 D path to fire.
+    // The D marker can be slow (debounced flush) or never come at
+    // all (e.g. the shell's preexec/precmd hook didn't fire on a
+    // SIGKILLed child), and without this the pane would sit in
+    // agent mode showing the dying TUI with no PromptInput. If the
+    // kill missed for any reason and the agent is still alive, the
+    // banner-detect / activeCommand effects below will flip
+    // agent-mode back on within a frame.
+    if (exitDebounceRef.current !== null) {
+      window.clearTimeout(exitDebounceRef.current);
+      exitDebounceRef.current = null;
+    }
+    setForegroundIsAgent(false);
+    setTimeout(() => promptRef.current?.focus(), 0);
   }, [ptyId]);
 
   // Window-level Ctrl+C path (fallback for focus-drifted-to-body) has
@@ -1329,7 +1449,14 @@ export function BlockTerminal({
   //     pane B since both panes' listeners fire on every keydown.
   const liveCommandRunning = liveFrame?.command_running ?? false;
   const liveCommandRunningRef = useRef(liveCommandRunning);
-  useEffect(() => {
+  // Synchronous with commit (vs `useEffect`, which lags one tick).
+  // The window-level Ctrl+C listener below reads through this ref —
+  // if it ran on a stale `true` while the live frame had already
+  // flipped to `false`, the second tap would escalate to SIGKILL on
+  // a foreground pgrp that has already passed back to the shell.
+  // `term_kill_foreground` has a matching server-side guard, but
+  // closing the window on the client side keeps the policy honest.
+  useLayoutEffect(() => {
     liveCommandRunningRef.current = liveCommandRunning;
   }, [liveCommandRunning]);
 
@@ -1584,11 +1711,13 @@ export function BlockTerminal({
           stays accurate without polling the PTY. */}
       {agentMode && <AgentChrome cwd={liveCwd ?? cwd} />}
       {!exited && altScreen && (
-        // Alt-screen TUI (vim, htop, claude-in-alt-screen) normally
-        // renders through the WebGPU CanvasGrid — handles selection,
-        // cursor, and the full feature set without two-path drift.
-        // The `autoFocus` prop isn't forwarded because CanvasGrid
-        // manages its own focus through the hidden textarea overlay.
+        // Alt-screen TUI (vim, htop, claude-in-alt-screen) renders
+        // exclusively through the WebGPU CanvasGrid. The previous
+        // DOM-backed FullGrid is retired — CanvasGrid handles
+        // selection, cursor, and the full feature set, and keeping
+        // two paths invited drift bugs. The `autoFocus` prop isn't
+        // forwarded because CanvasGrid manages its own focus through
+        // the hidden textarea overlay.
         //
         // `isVisible` IS forwarded — when this terminal is hidden by
         // the keepalive layer (display: none), the canvas needs to
