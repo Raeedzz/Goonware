@@ -424,6 +424,7 @@ export function BlockTerminal({
     sendLine,
     sendBytes,
     resize,
+    forceResync,
   } = useTerminalSession({
     id: ptyId,
     command,
@@ -1317,7 +1318,13 @@ export function BlockTerminal({
     if (path) forceIdleForCwd(path);
     setTimeout(() => promptRef.current?.focus(), 0);
     canvasGridRef.current?.invalidate();
-  }, [onForceKill]);
+    // Also force the React-side frame pipeline to flush any pending
+    // ref state into committed liveFrame. The canvas invalidate above
+    // re-paints the renderer's current input; forceResync makes sure
+    // that input is the latest cached frame, not whatever React last
+    // committed before the pipeline got stuck.
+    forceResync();
+  }, [onForceKill, forceResync]);
 
   useEffect(() => {
     if (!isVisible) return;

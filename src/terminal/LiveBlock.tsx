@@ -3,7 +3,8 @@ import { CanvasGrid } from "./CanvasGrid";
 import { CellRow } from "./CellRow";
 import { formatCwd, formatDuration } from "./formatBlockMeta";
 import { liveBlockOuterStyle } from "./agentScrollLayout";
-import type { DirtyRow, RenderFrame } from "./types";
+import { fallbackTail, trimEchoAndBlanks } from "./liveRowTrim";
+import type { RenderFrame } from "./types";
 
 interface Props {
   /** What the user typed to start the running command. */
@@ -49,51 +50,6 @@ interface Props {
  * surface.
  */
 
-function rowIsBlank(row: DirtyRow): boolean {
-  for (const s of row.spans) {
-    if (s.text.trim().length > 0) return false;
-  }
-  return true;
-}
-
-function rowText(row: DirtyRow): string {
-  return row.spans.map((s) => s.text).join("").trim();
-}
-
-/**
- * Strip leading blanks + zsh's echo of the typed command, plus
- * trailing blanks. Same shape as the closed-block transcript trim
- * (`Block.tsx` skips line 0 when input matches), kept consistent so
- * a running block and its eventual closed block look visually
- * continuous when the command finishes.
- *
- * `footerKeepThroughRow` (optional) — minimum original-grid row
- * index that must remain in the trimmed slice even when its tail is
- * blank. Used by agent TUIs (claude/codex/gemini) where the input
- * cursor sits above the meta + auto-mode hint and those rows are
- * momentarily blank mid-redraw. Pass `frame.cursor_row + 5` for
- * agents and `undefined` for shell commands.
- */
-function trimEchoAndBlanks(
-  rows: DirtyRow[],
-  command: string,
-  footerKeepThroughRow?: number,
-): DirtyRow[] {
-  const target = command.trim();
-  let i = 0;
-  while (i < rows.length && rowIsBlank(rows[i])) i++;
-  if (i < rows.length && target.length > 0 && rowText(rows[i]) === target) {
-    i++;
-  }
-  let j = rows.length - 1;
-  while (j >= i && rowIsBlank(rows[j])) j--;
-  if (typeof footerKeepThroughRow === "number") {
-    const minJ = Math.min(rows.length - 1, footerKeepThroughRow);
-    if (minJ > j) j = minJ;
-  }
-  if (i > j) return [];
-  return rows.slice(i, j + 1);
-}
 
 /**
  * The "in-progress block" — what's running right now. Visually
@@ -133,7 +89,21 @@ export function LiveBlock({
     // much vertical space as claude's actual UI needs, no more, no
     // less, always visible.
     const footerKeep = preserveGrid ? frame.cursor_row + 5 : undefined;
-    return trimEchoAndBlanks(frame.dirty, command, footerKeep);
+    const trimmed = trimEchoAndBlanks(frame.dirty, command, footerKeep);
+    // Agent-mode safety net. trimEchoAndBlanks anchors to cursor_row
+    // for the keep-through floor; mid-redraw frames where the agent
+    // emitted clear-screen + cursor-home (alt-screen apps do this on
+    // every full repaint) land with cursor_row near 0. The keep-floor
+    // collapses to ~5, the actual content above it gets dropped, and
+    // the trim returns []. The canvas then paints nothing while the
+    // pane chrome stays — user-visible symptom is "agent went blank,
+    // doesn't recover". Floor: when the grid has content but the
+    // heuristic dropped all of it, fall back to the populated tail of
+    // the grid (cap at frame.rows so we never overshoot the visible
+    // area's height). Only applies in agent (preserveGrid) mode; shell
+    // commands don't run through the keep-floor path.
+    if (trimmed.length > 0 || !preserveGrid) return trimmed;
+    return fallbackTail(frame.dirty, frame.rows);
   }, [frame, command, preserveGrid]);
 
   // Concatenate scrollback above visibleRows. Each entry in
@@ -174,18 +144,70 @@ export function LiveBlock({
     return out;
   }, [frame, visibleRows]);
 
-  // Original-grid row index of `combinedRows[0]`. Used by the canvas
+  // Sticky last-non-empty rows. When combinedRows becomes empty mid-
+  // stream (agent emitted clear-screen, frame arrived before redraw,
+  // trim collapsed to []), we keep painting the last good frame
+  // instead of unmounting the canvas. The unmount was the
+  // user-reported "content gone, chrome visible, does not recover"
+  // bug — once CanvasGrid is removed from the tree, ALL its recovery
+  // mechanisms (1s watchdog, visibility restore, escalation ladder,
+  // device-lost handler) vanish with it. A subsequent populated
+  // frame remounts a fresh canvas whose bootstrap can transiently
+  // fail and stick, leaving the user wedged with no in-pane recovery
+  // path. Holding the last good rows over the empty interval keeps
+  // the canvas mounted continuously through the agent's redraw cycle.
+  const lastGoodRowsRef = useRef<typeof combinedRows>([]);
+  const lastGoodOffsetRef = useRef(0);
+  if (combinedRows.length > 0) {
+    lastGoodRowsRef.current = combinedRows;
+    lastGoodOffsetRef.current = combinedRows[0].row;
+  }
+  const displayedRows =
+    combinedRows.length > 0 ? combinedRows : lastGoodRowsRef.current;
+
+  // Original-grid row index of `displayedRows[0]`. Used by the canvas
   // path to translate `frame.cursor_row` (in visible-grid coords) into
   // a window-relative row. When scrollback is non-empty this is
   // negative (extends the visible-grid coord space upward into
   // scrollback); without it the cursor would paint several rows above
   // where it should be the moment scrollback grew beyond zero rows.
   const firstRowOffset = useMemo(() => {
-    if (!frame || combinedRows.length === 0) return 0;
-    return combinedRows[0].row;
-  }, [frame, combinedRows]);
+    if (!frame || displayedRows.length === 0) return 0;
+    return displayedRows[0].row;
+  }, [frame, displayedRows]);
 
-  const hasBody = combinedRows.length > 0;
+  // Dev-only blanking detector. Logs whenever the agent pane ends up
+  // with nothing to paint despite a live frame + running command —
+  // exactly the user-reported "content gone, chrome visible" symptom.
+  // Provides the data points needed to verify whether the fallbackTail
+  // floor + sticky-last-good held the canvas through the gap, or
+  // whether some other state path produced the empty render.
+  // Gated on DEV so the prod bundle pays no cost.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    if (!frame) return;
+    if (combinedRows.length > 0) return;
+    if (!frame.command_running) return;
+    // eslint-disable-next-line no-console
+    console.warn("[LiveBlock] empty combinedRows with live frame + running", {
+      command,
+      cursor_row: frame.cursor_row,
+      cursor_col: frame.cursor_col,
+      frame_rows: frame.rows,
+      dirty_len: frame.dirty.length,
+      scrollback_len: frame.scrollback_appended?.length ?? 0,
+      visible_len: visibleRows.length,
+      preserveGrid,
+      last_good_len: lastGoodRowsRef.current.length,
+    });
+  }, [frame, combinedRows, visibleRows, command, preserveGrid]);
+
+  // Keep the body (and the canvas inside it) mounted whenever we have
+  // ANY rows we can paint — including the sticky last-good fallback.
+  // In agent mode with a live frame, this is effectively always true
+  // after the first populated frame, which is exactly the contract
+  // that keeps the canvas's in-pane recovery alive.
+  const hasBody = displayedRows.length > 0;
   const cwdLabel = formatCwd(cwd);
 
   // Live duration counter — same look as closed blocks but updated
@@ -352,14 +374,14 @@ export function LiveBlock({
           {preserveGrid && frame && !canvasFailed ? (
             <CanvasGrid
               frame={frame}
-              rows={combinedRows}
+              rows={displayedRows}
               mode="auto"
               firstRowOffset={firstRowOffset}
               isVisible={isVisible}
               onCanvasUnrecoverable={handleCanvasUnrecoverable}
             />
           ) : (
-            combinedRows.map((row) => (
+            displayedRows.map((row) => (
               <CellRow
                 key={row.row}
                 spans={row.spans}

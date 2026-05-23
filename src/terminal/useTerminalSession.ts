@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { termResize, termStart } from "@/lib/tauri/term";
@@ -91,6 +91,16 @@ interface SessionApi {
   sendBytes: (bytes: Uint8Array) => Promise<void>;
   /** Tell Rust the cell-grid size changed. */
   resize: (rows: number, cols: number) => Promise<void>;
+  /**
+   * Force the rAF-coalesced frame pipeline to commit any pending
+   * frame data synchronously, then drop the cached pending frame so
+   * subsequent backend events re-arm the rAF cleanly. Used by the
+   * BlockTerminal soft-reset path (3-tap Ctrl+C) to unstick a React-
+   * side stale-state pane in the same gesture that already kicks
+   * the canvas renderer. Safe to call when nothing is pending — it
+   * no-ops if `pendingFrameRef` is null AND `lastFrameRef` is null.
+   */
+  forceResync: () => void;
 }
 
 const encoder = new TextEncoder();
@@ -171,6 +181,17 @@ export function useTerminalSession(opts: Args): SessionApi {
   const requestFlushRef = useRef<() => void>(() => {});
   const flushNowRef = useRef<() => void>(() => {});
 
+  // Last wall-clock time at which flushFrame committed a frame into
+  // React state. Read by the stuck-frame watchdog below to detect
+  // "frames keep arriving from the backend but React state stopped
+  // updating" — the dominant remaining mechanism for the user-reported
+  // "agent pane goes blank and doesn't recover" symptom once the
+  // canvas-level recovery layers (visibility restore, escalation
+  // ladder, watchdog reconfigure) are all wired. Always initialised
+  // to mount time so the watchdog has a sane reference even before
+  // the first frame lands.
+  const lastCommitAtRef = useRef<number>(Date.now());
+
   // Visibility-flip flush. Implemented as a LAYOUT effect (not
   // useEffect) so it fires synchronously during the commit phase,
   // BEFORE the browser paints AND BEFORE child useEffects run.
@@ -219,6 +240,35 @@ export function useTerminalSession(opts: Args): SessionApi {
     if (isVisible && !wasVisible) {
       flushNowRef.current();
     }
+  }, [isVisible]);
+
+  // Stuck-frame watchdog. Every 2 s while visible, check whether the
+  // rAF flush pipeline has stopped committing despite the backend
+  // still pushing frame data into `pendingFrameRef` / `rowsRef`. The
+  // failure mode this catches: `isVisibleRef` accidentally desyncs
+  // from the prop, or a rAF callback got swallowed during a stress
+  // burst, so onFrame keeps updating refs but never lands a React
+  // commit. The user sees the agent pane stuck on its last good
+  // frame indefinitely. A force-flush via `flushNowRef` re-syncs
+  // React state from the latest cached refs without remounting.
+  //
+  // 2 s threshold is comfortable above the backend's nominal 16–60 ms
+  // cadence and well above the per-frame coalesce window; only a
+  // genuinely wedged pipeline should hit it.
+  useEffect(() => {
+    if (!isVisible) return;
+    const id = window.setInterval(() => {
+      if (!isVisibleRef.current) return;
+      if (pendingFrameRef.current === null) return;
+      const since = Date.now() - lastCommitAtRef.current;
+      if (since < 2000) return;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[useTerminalSession] stuck-frame watchdog: forcing flush after ${since}ms`,
+      );
+      flushNowRef.current();
+    }, 2000);
+    return () => window.clearInterval(id);
   }, [isVisible]);
 
   useEffect(() => {
@@ -321,6 +371,10 @@ export function useTerminalSession(opts: Args): SessionApi {
       memSetLiveFrame(opts.id, merged);
       memSetRows(opts.id, rows);
       memSetScrollback(opts.id, scrollbackRows);
+      // Record commit wall-time so the stuck-frame watchdog can
+      // detect a state pipeline that's quietly silent (no commits)
+      // while the backend keeps pushing frames.
+      lastCommitAtRef.current = Date.now();
     };
 
     // Expose the flush triggers to the outer visibility-flip layout
@@ -550,6 +604,12 @@ export function useTerminalSession(opts: Args): SessionApi {
     await termResize(opts.id, rows, cols);
   };
 
+  const forceResync = useCallback(() => {
+    // Synchronous flush — same path the visibility-flip layout effect
+    // uses to push cached refs into React state in one commit.
+    flushNowRef.current();
+  }, []);
+
   return {
     blocks,
     liveFrame,
@@ -560,5 +620,6 @@ export function useTerminalSession(opts: Args): SessionApi {
     sendLine,
     sendBytes,
     resize,
+    forceResync,
   };
 }

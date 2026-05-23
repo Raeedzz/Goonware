@@ -48,12 +48,53 @@ export interface CanvasGridHandle {
  * Half-open cell-coord range. `start` is the anchor (mouse-down
  * cell); `end` is the live mouse position. Either end can be
  * lexicographically less than the other — the renderer canonicalises.
+ *
+ * **Coordinate space**: `startRow` and `endRow` are ORIGINAL-GRID
+ * row indices (the same coordinate space `firstRowOffset` lives in),
+ * NOT window-relative indices. Mouse events arrive in window coords
+ * and are translated to grid coords on the way in (`eventToCell`);
+ * the renderer expects window coords and gets them via translation
+ * on the way out (`renderRequest`). Anchoring to the grid makes the
+ * selection survive row shifts caused by scrollback growth from
+ * large agent output — without it, the user-visible selection drifts
+ * to a different cell every time `firstRowOffset` changes.
  */
 interface Selection {
   startRow: number;
   startCol: number;
   endRow: number;
   endCol: number;
+}
+
+/**
+ * Translate a grid-coords selection to window-relative coords for the
+ * renderer. Returns null when the entire selection lies outside the
+ * visible window — the renderer's `selection: null` path short-
+ * circuits selection painting entirely, which is what we want when
+ * the user's selection has scrolled out of view above the window.
+ *
+ * Exported for unit testing; consumed locally by `renderRequest`
+ * and (via the inverse) by `extractSelectionText`.
+ */
+export function gridSelectionToWindow(
+  sel: Selection | null,
+  offset: number,
+  windowSize: number,
+): Selection | null {
+  if (!sel) return null;
+  const startWin = sel.startRow - offset;
+  const endWin = sel.endRow - offset;
+  // Canonicalise to test against the window range without caring
+  // which end is the anchor vs. the live drag head.
+  const lo = Math.min(startWin, endWin);
+  const hi = Math.max(startWin, endWin);
+  if (hi < 0 || lo >= windowSize) return null;
+  return {
+    startRow: startWin,
+    startCol: sel.startCol,
+    endRow: endWin,
+    endCol: sel.endCol,
+  };
 }
 
 interface Props {
@@ -213,8 +254,19 @@ export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGri
   }));
   const frameRef = useRef<RenderFrame | null>(frame);
   const rowsRef = useRef<DirtyRow[] | undefined>(rows);
+  // Synchronously-updated `firstRowOffset` mirror so the selection
+  // translation in eventToCell + renderRequest reads the latest
+  // window→grid offset without the callback closures rebinding
+  // every render. The renderer's selection input is window-relative;
+  // our stored Selection is grid-relative. This ref bridges the two
+  // at runtime, not at closure-capture time, so a row-window shift
+  // mid-drag (large agent output arrives while user is selecting)
+  // keeps the selection anchored to the cells the user actually
+  // clicked.
+  const firstRowOffsetRef = useRef<number | undefined>(firstRowOffset);
   frameRef.current = frame;
   rowsRef.current = rows;
+  firstRowOffsetRef.current = firstRowOffset;
 
   // rAF-coalesced render scheduling. React can land several state
   // updates (a fresh frame, a rows window change, a selection drag
@@ -919,10 +971,11 @@ export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGri
       // original grid. Without it we'd guess "the slice is the tail
       // of the grid" — fine for many shell commands, wrong for any
       // agent TUI where the trim moved the slice's start.
+      const windowSize = explicitRows.length;
+      const offset =
+        firstRowOffset ?? (f ? Math.max(0, f.rows - windowSize) : 0);
       let cursor: { row: number; col: number; visible: boolean } | null = null;
       if (f) {
-        const windowSize = explicitRows.length;
-        const offset = firstRowOffset ?? Math.max(0, f.rows - windowSize);
         const cursorRowInWindow = f.cursor_row - offset;
         if (cursorRowInWindow >= 0 && cursorRowInWindow < windowSize) {
           cursor = {
@@ -942,11 +995,18 @@ export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGri
         cols: f?.cols ?? 80,
         seq: f?.seq ?? 0,
         cursor,
-        selection: sel,
+        // Selection is stored in grid coords; renderer wants window
+        // coords. Translate here so a firstRowOffset shift mid-drag
+        // (large output arrives while the user is selecting) keeps
+        // the highlight on the same cells the user clicked.
+        selection: gridSelectionToWindow(sel, offset, windowSize),
       });
     } else if (f) {
       // For the full-frame path we can't use renderFrame() because
       // it doesn't forward selection. Reconstruct the input shape.
+      // Full-frame path has no explicit window — original-grid and
+      // window-relative coords coincide (offset = 0), so the
+      // translation is a no-op pass-through.
       r.render({
         rows: f.dirty,
         cols: f.cols,
@@ -956,7 +1016,7 @@ export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGri
           col: f.cursor_col,
           visible: f.cursor_visible !== false,
         },
-        selection: sel,
+        selection: gridSelectionToWindow(sel, 0, f.rows),
       });
     } else {
       r.renderFrame(null);
@@ -997,9 +1057,12 @@ export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGri
   // highlight aligns with the cells the copy step extracts from.
 
   /**
-   * Convert a mouse event to (row, col) cell coordinates relative to
-   * the rendered grid. Returns null when the renderer hasn't booted
-   * yet (early frames before WebGPU init resolves).
+   * Convert a mouse event to (gridRow, col) cell coordinates. The
+   * returned `row` is in ORIGINAL-GRID coordinates (windowRow +
+   * firstRowOffset), so the selection state survives a row-window
+   * shift mid-drag (e.g. large agent output prepends scrollback while
+   * the user is selecting). Returns null when the renderer hasn't
+   * booted yet (early frames before WebGPU init resolves).
    */
   const eventToCell = useCallback(
     (e: ReactMouseEvent | MouseEvent): { row: number; col: number } | null => {
@@ -1012,7 +1075,10 @@ export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGri
       const { widthCss, heightCss } = renderer.cellSize;
       if (widthCss <= 0 || heightCss <= 0) return null;
       const col = Math.max(0, Math.floor(x / widthCss));
-      const row = Math.max(0, Math.floor(y / heightCss));
+      const windowRow = Math.max(0, Math.floor(y / heightCss));
+      // Translate window-relative → original-grid coordinates so the
+      // stored Selection is stable across firstRowOffset shifts.
+      const row = windowRow + (firstRowOffsetRef.current ?? 0);
       return { row, col };
     },
     [],
@@ -1141,13 +1207,22 @@ export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGri
     const aBefore =
       sel.startRow < sel.endRow ||
       (sel.startRow === sel.endRow && sel.startCol <= sel.endCol);
-    const sr = aBefore ? sel.startRow : sel.endRow;
+    const srGrid = aBefore ? sel.startRow : sel.endRow;
     const sc = aBefore ? sel.startCol : sel.endCol;
-    const er = aBefore ? sel.endRow : sel.startRow;
+    const erGrid = aBefore ? sel.endRow : sel.startRow;
     const ec = aBefore ? sel.endCol : sel.startCol;
     const sourceRows: DirtyRow[] | undefined =
       rowsRef.current ?? frameRef.current?.dirty;
     if (!sourceRows || sourceRows.length === 0) return "";
+    // Translate grid → window. Selection is stored in original-grid
+    // coords; sourceRows is window-relative (indices 0..length-1
+    // correspond to the current windowed slice). Without this
+    // translation, large scrollback (firstRowOffset deeply negative)
+    // would have us slicing at negative or far-future indices and
+    // returning empty / mangled text.
+    const offset = firstRowOffsetRef.current ?? 0;
+    const sr = srGrid - offset;
+    const er = erGrid - offset;
     const lines: string[] = [];
     for (let r = sr; r <= er; r++) {
       if (r < 0 || r >= sourceRows.length) continue;
