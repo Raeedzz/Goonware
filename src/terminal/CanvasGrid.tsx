@@ -1,6 +1,8 @@
 import {
+  forwardRef,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -23,6 +25,24 @@ import {
 } from "./canvasGridEscalation";
 import { isGlobalChord, keyToBytes } from "./keyEncoding";
 import type { DirtyRow, RenderFrame } from "./types";
+
+/**
+ * Imperative handle for parents that need to poke the renderer
+ * directly. Today the soft-reset path in BlockTerminal calls
+ * `invalidate()` so a stuck-but-alive canvas (typical post-sleep
+ * symptom: surface configured, last frame still on screen, no new
+ * frames arriving) gets a synchronous re-render before the existing
+ * watchdog ticks. Heavier escalation (rendererEpoch bump) stays
+ * internal to CanvasGrid.
+ */
+export interface CanvasGridHandle {
+  /**
+   * Force the renderer to redraw the current frame on the next rAF,
+   * even if the seq hasn't changed. No-op if the renderer is null
+   * (pre-mount or post-tear-down).
+   */
+  invalidate: () => void;
+}
 
 /**
  * Half-open cell-coord range. `start` is the anchor (mouse-down
@@ -137,7 +157,7 @@ interface Props {
  * (same pattern as FullGrid + PtyPassthrough). All three paths
  * encode keys via the shared keyEncoding module.
  */
-export function CanvasGrid({
+export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGrid({
   frame,
   rows,
   mode = "fill",
@@ -148,7 +168,7 @@ export function CanvasGrid({
   firstRowOffset,
   isVisible = true,
   onCanvasUnrecoverable,
-}: Props) {
+}, ref) {
   // Cache the latest unrecoverable callback so the bootstrap effect's
   // setTimeout closures always fire the current parent's handler even
   // if React swaps the callback identity between renders.
@@ -175,6 +195,22 @@ export function CanvasGrid({
   const wrapperRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const rendererRef = useRef<GridRenderer | null>(null);
+  // Imperative escape hatch for parents (currently BlockTerminal's
+  // soft-reset path). `invalidate` is the lightest poke possible: it
+  // tells the existing rAF-coalesced render loop "redraw the current
+  // frame even if seq hasn't changed." Heavier escalation (renderer
+  // rebuild via rendererEpoch) is intentionally NOT exposed — the
+  // existing 1 s watchdog and the canvasGridEscalation ladder already
+  // own the rebuild path, and exposing both would create two callers
+  // racing the same recovery.
+  useImperativeHandle(ref, () => ({
+    invalidate: () => {
+      const renderer = rendererRef.current;
+      if (!renderer) return;
+      renderer.invalidate();
+      renderRequest(renderer);
+    },
+  }));
   const frameRef = useRef<RenderFrame | null>(frame);
   const rowsRef = useRef<DirtyRow[] | undefined>(rows);
   frameRef.current = frame;
@@ -1325,5 +1361,5 @@ export function CanvasGrid({
       )}
     </div>
   );
-}
+});
 

@@ -16,6 +16,14 @@ import { decideCtrlCAction } from "./ctrlCEscalation";
 
 export interface PtyPassthroughHandle {
   focus: () => void;
+  /**
+   * Drop the double-tap Ctrl+C escalation timestamp so the next press
+   * is a fresh single-tap cycle. See PromptInputHandle.clearEscalation —
+   * BlockTerminal's soft-reset calls all three paths' clearEscalation
+   * so a stale timestamp in any one of them can't misfire SIGKILL on
+   * the very next keystroke.
+   */
+  clearEscalation: () => void;
 }
 
 interface Props {
@@ -111,6 +119,9 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
 
     useImperativeHandle(ref, () => ({
       focus: () => inputRef.current?.focus(),
+      clearEscalation: () => {
+        lastCtrlCAtRef.current = null;
+      },
     }));
 
     /**

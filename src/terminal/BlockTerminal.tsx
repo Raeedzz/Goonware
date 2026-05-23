@@ -12,7 +12,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { joinShellPaths } from "@/lib/shellQuote";
 import { BlockList } from "./BlockList";
 import { AgentChrome } from "./AgentChrome";
-import { CanvasGrid } from "./CanvasGrid";
+import { CanvasGrid, type CanvasGridHandle } from "./CanvasGrid";
 import { CellRow } from "./CellRow";
 import { LiveBlock } from "./LiveBlock";
 import { PromptInput, type PromptInputHandle } from "./PromptInput";
@@ -33,7 +33,7 @@ import {
 import { detectClaude } from "@/lib/claudeUsage";
 import { termKillForeground, termResetGrid } from "@/lib/tauri/term";
 import { writeClipboardTextWithFallback } from "./clipboardWrite";
-import { decideCtrlCAction } from "./ctrlCEscalation";
+import { decideSoftResetAction } from "./softReset";
 import { forceIdleForCwd } from "@/state/agentActivityStore";
 import {
   agentScrollContainerStyle,
@@ -217,6 +217,12 @@ export function BlockTerminal({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const promptRef = useRef<PromptInputHandle>(null);
   const passthroughRef = useRef<PtyPassthroughHandle>(null);
+  // Alt-screen CanvasGrid handle. Used by the soft-reset path to
+  // poke the renderer when a sleep/wake leaves the canvas stuck on
+  // its last frame (alive surface, no new frames arriving). Only
+  // the alt-screen grid gets a ref because the inline agent grid
+  // unmounts as soon as resetPane() flips foregroundIsAgent off.
+  const canvasGridRef = useRef<CanvasGridHandle>(null);
   // Generation counter — bumped when the user clicks "restart" on the
   // session-ended banner. Suffixed onto the session id so the underlying
   // useTerminalSession effect tears down the dead PTY and spawns a fresh
@@ -942,8 +948,12 @@ export function BlockTerminal({
   // Window-level Ctrl+C path (fallback for focus-drifted-to-body) has
   // its own escalation state because the window listener never runs
   // PromptInput's keydown. Keep them independent so a mash that
-  // ricochets through both paths still escalates cleanly.
+  // ricochets through both paths still escalates cleanly. Two
+  // timestamps here (vs. one in PromptInput/PtyPassthrough) because
+  // this path runs `decideSoftResetAction`, which adds a third tier
+  // — three taps within RESET_WINDOW_MS → soft pane reset.
   const fallbackLastCtrlCAtRef = useRef<number | null>(null);
+  const secondLastFallbackCtrlCAtRef = useRef<number | null>(null);
 
   const onSubmit = useCallback(
     (text: string) => {
@@ -1243,20 +1253,72 @@ export function BlockTerminal({
 
   // Window-level Ctrl+C fallback — handles the "focus drifted to
   // document.body after a drag-selection" case. Encoding is pinned
-  // by keyEncoding.test.ts; this pins the delivery path. Same
-  // double-tap escalation as the textarea-focused path: second press
-  // within ESCALATION_WINDOW_MS escalates SIGINT → SIGKILL on the
-  // foreground process group.
+  // by keyEncoding.test.ts; this pins the delivery path.
+  //
+  // Three-tier escalation, decided by `decideSoftResetAction`:
+  //   1. SIGINT (write 0x03) — matches a real terminal.
+  //   2. SIGKILL on the foreground process group (Rust IPC) — second
+  //      press within ESCALATION_WINDOW_MS while a command is still
+  //      running, for trapped-SIGINT processes (bun, dev watchers).
+  //   3. Soft pane reset — third press within RESET_WINDOW_MS. Fires
+  //      when the pane is wedged in a way the SIGINT/SIGKILL bytes
+  //      can't fix (stale `command_running` after sleep, agent-mode
+  //      stuck in the EXIT_DEBOUNCE_MS window, half-drawn frame). See
+  //      {@link resetPane} for what gets cleared.
   //
   // Gates:
   //   - No text currently selected (don't compete with copy paths).
   //   - Focus is on body or non-editable (not stealing from real inputs).
   //   - This terminal was most-recently interacted with (multi-pane).
+  //     Without this gate, a Ctrl+C mash in pane A would also reset
+  //     pane B since both panes' listeners fire on every keydown.
   const liveCommandRunning = liveFrame?.command_running ?? false;
   const liveCommandRunningRef = useRef(liveCommandRunning);
   useEffect(() => {
     liveCommandRunningRef.current = liveCommandRunning;
   }, [liveCommandRunning]);
+
+  // Soft pane reset — unstick a pane that the SIGINT/SIGKILL bytes
+  // can't reach. Scoped to THIS pane only: peer panes' state, peer
+  // PTYs, and the persistent scrollback (sessionMemory keyed by id)
+  // are untouched. Order matters:
+  //   1. SIGKILL the foreground pgrp. By the third tap the user
+  //      wants the process gone; earlier taps may have been gated.
+  //   2. Cancel the agent-mode exit-debounce BEFORE flipping
+  //      foregroundIsAgent, so the timer can't fire stale-true back
+  //      on top of our flip-to-false.
+  //   3. Flip out of agent mode and clear the claude-detect sniff
+  //      buffer so the next frame doesn't immediately flip back.
+  //   4. Snap-to-bottom so the new prompt is visible.
+  //   5. Clear all three Ctrl+C escalation refs (PromptInput,
+  //      PtyPassthrough, window-fallback) so the very next keystroke
+  //      is a fresh single-tap cycle, not a phantom mid-escalation.
+  //   6. Force the per-cwd spinner idle so chrome reflects reality.
+  //   7. Focus the prompt input — always shell mode after a reset,
+  //      regardless of the prior state.
+  //   8. Poke the alt-screen canvas in case its surface is alive but
+  //      not painting (typical post-sleep symptom). Inline agent
+  //      canvas unmounts as soon as foregroundIsAgent flips, so no
+  //      ref is needed there.
+  const resetPane = useCallback(() => {
+    onForceKill();
+    if (exitDebounceRef.current !== null) {
+      window.clearTimeout(exitDebounceRef.current);
+      exitDebounceRef.current = null;
+    }
+    setForegroundIsAgent(false);
+    sniffBufferRef.current = "";
+    stickToBottomRef.current = true;
+    fallbackLastCtrlCAtRef.current = null;
+    secondLastFallbackCtrlCAtRef.current = null;
+    promptRef.current?.clearEscalation();
+    passthroughRef.current?.clearEscalation();
+    const path = cwdRef.current;
+    if (path) forceIdleForCwd(path);
+    setTimeout(() => promptRef.current?.focus(), 0);
+    canvasGridRef.current?.invalidate();
+  }, [onForceKill]);
+
   useEffect(() => {
     if (!isVisible) return;
     const onKey = (e: KeyboardEvent) => {
@@ -1277,13 +1339,21 @@ export function BlockTerminal({
       }
       if (getLastInteractedTerminal() !== id) return;
       e.preventDefault();
-      const decision = decideCtrlCAction({
+      const decision = decideSoftResetAction({
         now: Date.now(),
         lastCtrlCAt: fallbackLastCtrlCAtRef.current,
+        secondLastCtrlCAt: secondLastFallbackCtrlCAtRef.current,
         commandRunning: liveCommandRunningRef.current,
       });
-      fallbackLastCtrlCAtRef.current =
-        decision.newLastCtrlCAt === 0 ? null : decision.newLastCtrlCAt;
+      fallbackLastCtrlCAtRef.current = decision.newLastCtrlCAt;
+      secondLastFallbackCtrlCAtRef.current = decision.newSecondLastCtrlCAt;
+      if (decision.action === "reset") {
+        // resetPane handles its own focus restore — don't run the
+        // foregroundIsAgent-based refocus below, the state it reads
+        // is exactly what the reset just cleared.
+        resetPane();
+        return;
+      }
       if (decision.action === "sigkill") {
         onForceKill();
       } else {
@@ -1303,7 +1373,7 @@ export function BlockTerminal({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [id, isVisible, onSendBytesVoid, onForceKill]);
+  }, [id, isVisible, onSendBytesVoid, onForceKill, resetPane]);
 
   // Window-level Cmd+C copy. Closed blocks are plain divs with
   // userSelect: "text"; users can drag-select inside them. But our
@@ -1501,6 +1571,7 @@ export function BlockTerminal({
             </div>
           ) : (
             <CanvasGrid
+              ref={canvasGridRef}
               frame={liveFrame}
               onSendBytes={sendBytes}
               isVisible={isVisible}
