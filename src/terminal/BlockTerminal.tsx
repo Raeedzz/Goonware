@@ -855,14 +855,16 @@ export function BlockTerminal({
       const cellWidth = 13 * 0.66;
       const visibleRows = Math.max(8, Math.floor(usableHeight / cellHeight));
       // Warp behavior: Claude's PTY is constrained so its slash menu
-      // paints ~9 visible items (12 PTY rows minus ~3 rows of chrome
-      // for input box + status). Arrow keys then scroll *within*
-      // Claude's picker for the rest of the list. Trade-off: Claude's
-      // normal conversation view is also bounded — this matches
-      // Warp's "agent lives in a small block" aesthetic. Tune
-      // AGENT_PTY_MAX_ROWS to taste; 12 is the minimum that still
-      // shows 9 picker items.
-      const AGENT_PTY_MAX_ROWS = 12;
+      // paints ~9 visible items. Empirically Claude's TUI now reserves
+      // ~8 rows for chrome (input box, status footer, hint line, the
+      // picker's own header/footer), so 17 PTY rows leaves room for
+      // 9 picker entries. Arrow keys scroll *within* Claude's picker
+      // for the rest of the list. Trade-off: Claude's normal
+      // conversation view is also bounded — this matches Warp's
+      // "agent lives in a small block" aesthetic. Tune
+      // AGENT_PTY_MAX_ROWS to taste; 17 is the minimum that still
+      // shows 9 picker items with current Claude chrome.
+      const AGENT_PTY_MAX_ROWS = 17;
       // For panes smaller than the cap we follow the visible viewport
       // — never tell Claude its PTY is taller than the canvas can
       // render or its TUI footer slides off-screen.
