@@ -366,14 +366,14 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
     // ever read inside the keydown handler; a re-render would just
     // waste work and re-create the textarea's closure.
     const lastCtrlCAtRef = useRef<number | null>(null);
-    // `commandRunning` is captured by the keydown closure once per
-    // render; the ref keeps the decision against the freshest
-    // running-state without forcing the textarea to rebind
-    // onKeyDown on every OSC 133 transition.
-    const commandRunningRef = useRef(commandRunning);
-    useEffect(() => {
-      commandRunningRef.current = commandRunning;
-    }, [commandRunning]);
+    // `commandRunning` is the prop directly. We used to mirror it
+    // into a ref via `useEffect`, but effects run after commit — a
+    // keydown firing between commit and effect would read the stale
+    // previous value. The escalation path then escalates SIGINT →
+    // SIGKILL on a process group whose foreground has already
+    // passed back to the shell, killing zsh and freezing the pane.
+    // `onKeyDown` is an inline function rebuilt every render, so
+    // closing over the prop is fresh-by-construction.
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     // Mirror of the textarea's scrollTop, attached to the syntax-
     // highlight overlay so the colored tokens stay glued to the
@@ -589,7 +589,7 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
         const decision = decideCtrlCAction({
           now: Date.now(),
           lastCtrlCAt: lastCtrlCAtRef.current,
-          commandRunning: commandRunningRef.current,
+          commandRunning,
         });
         lastCtrlCAtRef.current =
           decision.newLastCtrlCAt === 0 ? null : decision.newLastCtrlCAt;
