@@ -5,6 +5,7 @@ import {
   useGitStatus,
   type GitStatusMap,
 } from "@/hooks/useGitStatus";
+import { paneSlotScrollChildStyle } from "@/shell/paneSlotLayout";
 import { FileTypeIcon } from "./FileTypeIcon";
 
 interface Props {
@@ -101,57 +102,49 @@ export function FileTree({
     setTree((prev) => (prev ? { ...prev } : prev));
   }, []);
 
-  if (error) {
-    return (
-      <div
-        style={{
-          padding: "var(--space-4)",
-          color: "var(--state-error)",
-          fontSize: "var(--text-xs)",
-          fontFamily: "var(--font-mono)",
-        }}
-      >
-        {error}
-      </div>
-    );
-  }
-
-  if (!tree) {
-    return (
-      <div
-        style={{
-          padding: "var(--space-4)",
-          color: "var(--text-tertiary)",
-          fontSize: "var(--text-xs)",
-        }}
-      >
-        loading…
-      </div>
-    );
-  }
-
+  // Outer element is ALWAYS the scroll container — error / loading /
+  // empty / loaded states render inside it. This keeps the layout
+  // invariant constant (FileTree's root satisfies
+  // `paneSlotScrollChildStyle`) across every render, so a long error
+  // message scrolls, and the right-panel test that asserts FilesView's
+  // top-level DOM has `overflow-y: auto` holds in every state.
   return (
-    <div
-      style={{
-        flex: 1,
-        minHeight: 0,
-        overflowY: "auto",
-        overflowX: "hidden",
-        padding: "var(--space-1) 0",
-      }}
-    >
-      {tree.children?.map((child) => (
-        <RowSubtree
-          key={child.path}
-          node={child}
-          depth={0}
-          onToggle={toggle}
-          onOpenFile={onOpenFile}
-          onContextMenu={onContextMenu}
-          activeFile={activeFile ?? null}
-          gitStatus={gitStatus}
-        />
-      ))}
+    <div style={paneSlotScrollChildStyle({ padding: "var(--space-1) 0" })}>
+      {error ? (
+        <div
+          style={{
+            padding: "var(--space-3)",
+            color: "var(--state-error)",
+            fontSize: "var(--text-xs)",
+            fontFamily: "var(--font-mono)",
+          }}
+        >
+          {error}
+        </div>
+      ) : !tree ? (
+        <div
+          style={{
+            padding: "var(--space-3)",
+            color: "var(--text-tertiary)",
+            fontSize: "var(--text-xs)",
+          }}
+        >
+          loading…
+        </div>
+      ) : (
+        tree.children?.map((child) => (
+          <RowSubtree
+            key={child.path}
+            node={child}
+            depth={0}
+            onToggle={toggle}
+            onOpenFile={onOpenFile}
+            onContextMenu={onContextMenu}
+            activeFile={activeFile ?? null}
+            gitStatus={gitStatus}
+          />
+        ))
+      )}
     </div>
   );
 }
