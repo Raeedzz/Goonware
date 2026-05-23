@@ -207,54 +207,69 @@ describe("source pin — GridRenderer exposes successfulDrawCount", () => {
 });
 
 /**
- * Source pin: CanvasGrid must defer createGridRenderer until after
- * WKWebView's compositor has had a chance to allocate the canvas's
- * IOSurface. React useEffect fires before the next paint cycle, so
- * if context.configure() runs synchronously on mount, the swapchain
- * binds to a not-yet-existing surface handle and the user sees a
- * permanently black canvas. The fix is to wait two requestAnimation-
- * Frame callbacks (each fires after a completed paint), with a
- * setTimeout fallback for when the window is occluded and rAFs
- * stop firing.
+ * Source pin: CanvasGrid's bootstrap path MUST defer createGridRenderer
+ * until the wrapper has nonzero CSS dimensions. This is the load-bearing
+ * prevention for the "open agent → all black, never recovers" bug:
+ * context.configure() against a 0×0 canvas makes WKWebView hand back a
+ * zombie swapchain that paints into the void forever, no errors fired.
  *
- * If a future refactor removes the deferral and bootstraps
- * synchronously on mount, these tests trip — instead of regressing
- * back to "second agent opens with a black canvas."
+ * The escalation ladder is the safety net for unknown unknowns; this
+ * gate is what makes the ladder almost never need to fire.
+ *
+ * If a future refactor inlines the configure call without the gate,
+ * the ladder still works but users see 2.5+ seconds of black before
+ * the first rebuild. These pins flag that regression at the source.
  */
-describe("source pin — CanvasGrid defers bootstrap past the compositor race", () => {
+describe("source pin — CanvasGrid bootstrap is size-gated", () => {
   const canvasGridSrc = readFileSync(
     join(import.meta.dir, "CanvasGrid.tsx"),
     "utf8",
   );
 
-  test("bootstrap is scheduled via requestAnimationFrame, not called synchronously", () => {
-    // The kick path goes through requestAnimationFrame in the
-    // bootstrap useEffect. Without these calls the bootstrap would
-    // fire synchronously and hit the zombie-swapchain race.
-    expect(canvasGridSrc).toMatch(/requestAnimationFrame\s*\(/);
-  });
-
-  test("two rAFs are chained (compositor needs a full frame to settle)", () => {
-    // The inner rAF nested inside the outer rAF's callback is what
-    // gives WKWebView a full paint cycle (not just a layout) before
-    // configure() binds the swapchain.
-    const matches = canvasGridSrc.match(/requestAnimationFrame\s*\(/g) ?? [];
-    expect(matches.length).toBeGreaterThanOrEqual(2);
-  });
-
-  test("setTimeout fallback exists for occluded windows where rAFs stall", () => {
-    // rAFs don't fire while the page isn't rendering. Without a
-    // wall-clock fallback, opening a worktree behind another macOS
-    // window would deadlock bootstrap until the window returned.
+  test("guard reads the wrapper's bounding rect before bootstrap", () => {
+    // The gate must measure the wrapper, not the canvas — the canvas
+    // starts at its default 300×150 even when its parent is 0×0, so
+    // checking the canvas alone would falsely report "ready" and
+    // configure() would still run against a non-laid-out parent tree.
     expect(canvasGridSrc).toMatch(
-      /window\.setTimeout\s*\(\s*kickBootstrap\s*,\s*100\s*\)/,
+      /wrapper\.getBoundingClientRect\(\)[\s\S]*?startBootstrapIfSized/,
     );
   });
 
-  test("rAF + timeout cleanup happens on unmount", () => {
-    // Without cancelAnimationFrame the deferred bootstrap would
-    // race a rendererEpoch bump or component unmount and fire
-    // attemptBootstrap against a destroyed canvas.
-    expect(canvasGridSrc).toMatch(/cancelAnimationFrame\s*\(/);
+  test("bootstrap short-circuits when either dimension is 0", () => {
+    // Both width AND height must be nonzero. A canvas that's wide but
+    // 0-tall (or vice versa) still has no backing surface as far as
+    // WKWebView's swapchain is concerned.
+    expect(canvasGridSrc).toMatch(
+      /rect\.width\s*===\s*0\s*\|\|\s*rect\.height\s*===\s*0/,
+    );
+  });
+
+  test("canvas is pre-sized before createGridRenderer runs", () => {
+    // The whole point: configure() lands on a canvas with real
+    // physical-pixel dimensions, not the default 300×150 or 0×0.
+    // The pre-sizing must live in startBootstrapIfSized — pin both
+    // the canvas.width assignment AND the canvas.style.width assignment
+    // (the second is what makes the CSS box honest about its size).
+    expect(canvasGridSrc).toMatch(/canvas\.width\s*=\s*physWidth/);
+    expect(canvasGridSrc).toMatch(/canvas\.style\.width\s*=/);
+  });
+
+  test("ResizeObserver fallback covers 0×0-at-mount edge case", () => {
+    // useEffect runs after layout, so most mounts hit the synchronous
+    // path. The observer is the safety net for the keepalive-layer
+    // initially-hidden case where the wrapper has no rect yet.
+    expect(canvasGridSrc).toMatch(/new ResizeObserver/);
+    expect(canvasGridSrc).toMatch(/bootstrapStarted/);
+  });
+
+  test("observer disconnects once bootstrap actually starts", () => {
+    // Without disconnect, a runtime wrapper resize would re-trigger
+    // startBootstrapIfSized, which would no-op (bootstrapStarted is
+    // true) but the observer would keep firing for the lifetime of
+    // the mount. Cheap, but the disconnect makes the lifecycle obvious.
+    expect(canvasGridSrc).toMatch(
+      /sizeObserver\??\.disconnect\(\)/,
+    );
   });
 });

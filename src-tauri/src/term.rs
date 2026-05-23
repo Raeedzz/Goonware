@@ -361,6 +361,18 @@ struct Session {
     pty_master: Box<dyn MasterPty + Send>,
     pty_writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// PID of the shell process spawned by `term_start`. Captured so
+    /// `term_kill_foreground` can refuse to SIGKILL the shell itself
+    /// — without this guard, a Ctrl+C-escalation that fires inside the
+    /// few-ms race window between `fork()` and the child's
+    /// `setpgid()` + `tcsetpgrp()` would read the shell's own pgrp via
+    /// `tcgetpgrp(master_fd)` and `kill(-shell_pgrp, SIGKILL)` would
+    /// take the shell down with the child. The user-reported symptom
+    /// is "after a run is done and I open a new claude, ctrl+c kills
+    /// zsh." Storing the shell pid lets us bail before sending the
+    /// fatal signal. None when the host platform doesn't expose
+    /// `process_id()` from portable_pty (e.g. future Windows path).
+    shell_pid: Option<u32>,
     cols: u16,
     rows: u16,
     /// Last full snapshot we sent to the frontend. We diff against this so
@@ -415,16 +427,6 @@ struct Session {
     /// stopping — even when no further PTY bytes arrive to drive
     /// another wakeup.
     trailing_flusher: Arc<TrailingFlusher>,
-    /// PID of the shell we spawned. The shell is the session leader,
-    /// so this is also its process-group ID. `term_kill_foreground`
-    /// uses it as a safety guard: if `tcgetpgrp(master_fd)` ever
-    /// returns this PID, the shell has reclaimed the foreground (the
-    /// previously-running child already exited), and sending SIGKILL
-    /// to `-shell_pgrp` would kill the shell itself — freezing the
-    /// pane. `None` only if portable-pty couldn't surface the PID;
-    /// we still allow the kill in that case (matches pre-guard
-    /// behaviour, no worse than today).
-    shell_pid: Option<u32>,
 }
 
 /* ------------------------------------------------------------------
@@ -2179,8 +2181,15 @@ pub fn term_start(
         .map_err(|e| classify_spawn_error(&args.command, &e.to_string()))?;
     drop(pair.slave);
 
-    let shell_pid = child.process_id();
     let killer = child.clone_killer();
+    // Snapshot the shell's pid BEFORE we move `child` into the reader
+    // thread below. `term_kill_foreground` uses this to refuse a kill
+    // when the foreground pgrp is still the shell's own — the race
+    // window after `fork()` but before the child has `setpgid()` +
+    // `tcsetpgrp()`'d into its own pgrp. Without this guard a
+    // double-tap Ctrl+C right as a new agent launches takes the
+    // shell down with the child.
+    let shell_pid = child.process_id();
     let mut reader = pair
         .master
         .try_clone_reader()
@@ -2206,6 +2215,7 @@ pub fn term_start(
         pty_master: pair.master,
         pty_writer: writer,
         killer,
+        shell_pid,
         cols: args.cols,
         rows: args.rows,
         last_snapshot: initial_snapshot,
@@ -2217,7 +2227,6 @@ pub fn term_start(
         next_frame_seq: 0,
         frame_channel,
         trailing_flusher: trailing_flusher.clone(),
-        shell_pid,
     }));
 
     {
@@ -2523,6 +2532,55 @@ pub fn term_history_forget<R: tauri::Runtime>(
     state.writer.forget_pty(id)
 }
 
+/// Pure decision: given the foreground pgrp the kernel reports for
+/// the PTY and the shell's own pid (which equals the shell's pgrp,
+/// since the shell is the session leader of its own pgrp), decide
+/// whether `term_kill_foreground` should send SIGKILL.
+///
+/// The default is yes — single SIGKILL on the foreground pgrp is
+/// exactly the escape hatch users want for `bun run` / trapped-SIGINT
+/// processes. The guards encode the cases where SIGKILL would
+/// over-reach:
+///
+///   - pgrp <= 1 — broadcast (`kill(0, ...)` semantic) or init. The
+///     tcgetpgrp returned a suspicious value; refuse rather than punch
+///     outside the PTY.
+///   - pgrp == shell_pid — the foreground pgrp IS still the shell's.
+///     This happens in the few-hundred-microsecond race window
+///     between the shell's `fork()` and the child's `setpgid()` +
+///     `tcsetpgrp()` — typical when launching a new agent right
+///     after a previous one has exited. The user reports it as
+///     "after a run is done, I open a new claude, ctrl+c kills zsh."
+///     Refuse here; by the time the child has its own pgrp, this
+///     check passes and the kill goes through normally.
+///
+/// `shell_pid` is `Option` because portable_pty's `process_id()`
+/// returns `Option<u32>` — on hosts where it can't be read we lose the
+/// guard but still preserve the pgrp<=1 floor.
+pub(crate) fn should_skip_kill(pgrp: i32, shell_pid: Option<u32>) -> KillDecision {
+    if pgrp <= 1 {
+        return KillDecision::RefuseSuspiciousPgrp;
+    }
+    if let Some(spid) = shell_pid {
+        if pgrp == spid as i32 {
+            return KillDecision::SkipShellRace;
+        }
+    }
+    KillDecision::Proceed
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillDecision {
+    /// Send SIGKILL to -pgrp.
+    Proceed,
+    /// pgrp matched the shell's pid; the child hasn't pgrp'd into its
+    /// own group yet. Quietly skip the kill.
+    SkipShellRace,
+    /// pgrp <= 1 — refuse with an error rather than silently
+    /// broadcasting to the whole session or signalling init.
+    RefuseSuspiciousPgrp,
+}
+
 /// SIGKILL the PTY's foreground process group. The escape hatch when
 /// a single Ctrl+C didn't take — bun's run wrapper, some node/python
 /// dev servers, and certain build watchers trap SIGINT and refuse to
@@ -2536,43 +2594,6 @@ pub fn term_history_forget<R: tauri::Runtime>(
 /// On non-unix targets (we don't build for any today, but the cfg
 /// makes future cross-compile attempts honest) this is a no-op that
 /// returns an explanatory error.
-///
-/// Whether a given (`pgrp`, `shell_pid`) pair should actually receive
-/// `kill(-pgrp, SIGKILL)`. Pulled into a free function so the policy
-/// is unit-testable without spinning up a PTY.
-#[cfg(unix)]
-#[derive(Debug, PartialEq, Eq)]
-enum ForegroundKillDecision {
-    /// Sane foreground pgrp belonging to a child — proceed.
-    Allow,
-    /// `pgrp` is the shell's own pgrp (== its pid, since the shell is
-    /// the session leader). Refuse silently: the previously-running
-    /// child has already exited and the shell has reclaimed foreground
-    /// via `tcsetpgrp(2)`. Signaling `-shell_pgrp` would kill zsh and
-    /// freeze the pane (PTY alive, no shell to drive it). This is the
-    /// exact race the user hit: first Ctrl+C killed the agent, second
-    /// Ctrl+C lands while the frontend's `command_running` flag is
-    /// still stale, escalation fires, foreground pgrp is now zsh.
-    RefuseShellPgrp,
-    /// `pgrp` is 0 (broadcast to the whole session) or 1 (init).
-    /// `tcgetpgrp(master_fd)` shouldn't ever return these for a real
-    /// foreground job — refuse loudly, surface as an error.
-    RefuseSuspicious,
-}
-
-#[cfg(unix)]
-fn fg_kill_decision(pgrp: i32, shell_pid: Option<u32>) -> ForegroundKillDecision {
-    if pgrp <= 1 {
-        return ForegroundKillDecision::RefuseSuspicious;
-    }
-    if let Some(spid) = shell_pid {
-        if (pgrp as u32) == spid {
-            return ForegroundKillDecision::RefuseShellPgrp;
-        }
-    }
-    ForegroundKillDecision::Allow
-}
-
 #[tauri::command]
 pub fn term_kill_foreground(
     state: State<TerminalState>,
@@ -2593,14 +2614,16 @@ pub fn term_kill_foreground(
         let Some(pgrp) = s.pty_master.process_group_leader() else {
             return Ok(());
         };
-        match fg_kill_decision(pgrp, s.shell_pid) {
-            ForegroundKillDecision::RefuseSuspicious => {
+        // All "should we even send the signal?" logic lives in the
+        // pure `should_skip_kill` helper so it can be unit-tested
+        // without spinning up a real PTY. See its doc comment for
+        // the rationale on each branch.
+        match should_skip_kill(pgrp, s.shell_pid) {
+            KillDecision::SkipShellRace => return Ok(()),
+            KillDecision::RefuseSuspiciousPgrp => {
                 return Err(format!("refusing to signal pgrp {pgrp}"));
             }
-            ForegroundKillDecision::RefuseShellPgrp => {
-                return Ok(());
-            }
-            ForegroundKillDecision::Allow => {}
+            KillDecision::Proceed => {}
         }
         // Negate the pid to address the whole process group — that's
         // POSIX `kill(2)`'s contract for `pid < -1`. SIGKILL cannot be
@@ -2946,55 +2969,75 @@ mod tests {
             term_kill_foreground;
     }
 
-    /* ---------- fg_kill_decision (Ctrl+C escalation safety) ----------
-       The double-tap escape hatch reads tcgetpgrp(master_fd) and SIGKILLs
-       the result. If the previously-running child already exited and the
-       shell reclaimed foreground via tcsetpgrp(2), that read returns the
-       shell's own pgrp — signaling it would kill zsh and freeze the
-       pane. These pins lock the policy that catches that race.
-       ----------------------------------------------------------- */
+    /* ---------- should_skip_kill (shell-pgrp race guard) ---------- */
 
-    #[cfg(unix)]
+    /// Normal path: foreground pgrp is some real child process,
+    /// distinct from the shell. Kill proceeds.
     #[test]
-    fn fg_kill_decision_refuses_pgrp_equal_to_shell_pid() {
-        // The bug: foreground pgrp == shell pid means the shell has
-        // reclaimed foreground (no child running). Killing it would
-        // take out zsh and freeze the pane.
-        let d = fg_kill_decision(1234, Some(1234));
-        assert_eq!(d, ForegroundKillDecision::RefuseShellPgrp);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fg_kill_decision_allows_child_pgrp() {
-        // Real foreground child running under the shell — proceed.
-        let d = fg_kill_decision(2222, Some(1234));
-        assert_eq!(d, ForegroundKillDecision::Allow);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fg_kill_decision_refuses_pgrp_zero_or_one() {
-        // tcgetpgrp returning 0 (broadcast) or 1 (init) is never
-        // sane for our PTY — surface as an error.
+    fn skip_kill_proceeds_for_real_child_pgrp() {
         assert_eq!(
-            fg_kill_decision(0, Some(1234)),
-            ForegroundKillDecision::RefuseSuspicious
-        );
-        assert_eq!(
-            fg_kill_decision(1, Some(1234)),
-            ForegroundKillDecision::RefuseSuspicious
+            should_skip_kill(54321, Some(12345)),
+            KillDecision::Proceed,
         );
     }
 
-    #[cfg(unix)]
+    /// Suspicious pgrp 0 (broadcast) is refused with an explicit
+    /// error so the caller doesn't silently signal every process in
+    /// the session.
     #[test]
-    fn fg_kill_decision_allows_when_shell_pid_unknown() {
-        // If portable-pty couldn't surface the shell's pid we still
-        // honor the kill — no worse than pre-guard behaviour, and
-        // refusing every kill would defeat the whole escape hatch.
-        let d = fg_kill_decision(2222, None);
-        assert_eq!(d, ForegroundKillDecision::Allow);
+    fn skip_kill_refuses_pgrp_zero() {
+        assert_eq!(
+            should_skip_kill(0, Some(12345)),
+            KillDecision::RefuseSuspiciousPgrp,
+        );
+    }
+
+    /// init (pid 1) is also refused — `kill(-1, ...)` would broadcast
+    /// per POSIX, and the only legitimate fg pgrp for a user terminal
+    /// is >1.
+    #[test]
+    fn skip_kill_refuses_pgrp_one() {
+        assert_eq!(
+            should_skip_kill(1, Some(12345)),
+            KillDecision::RefuseSuspiciousPgrp,
+        );
+    }
+
+    /// Even a negative pgrp (cannot happen from a healthy tcgetpgrp
+    /// but defends against future changes to the upstream) is treated
+    /// as the suspicious branch.
+    #[test]
+    fn skip_kill_refuses_negative_pgrp() {
+        assert_eq!(
+            should_skip_kill(-5, Some(12345)),
+            KillDecision::RefuseSuspiciousPgrp,
+        );
+    }
+
+    /// The race-window guard: a kill request lands while the fg pgrp
+    /// is still the shell's own (post-fork, pre-setpgid/tcsetpgrp
+    /// window). Skip silently — by the time the child has its own
+    /// pgrp, this branch falls through to Proceed.
+    #[test]
+    fn skip_kill_protects_shell_in_fork_window() {
+        // shell pid 12345 IS the foreground pgrp — child hasn't
+        // pgrp'd into its own group yet.
+        assert_eq!(
+            should_skip_kill(12345, Some(12345)),
+            KillDecision::SkipShellRace,
+        );
+    }
+
+    /// When shell_pid is None (portable_pty couldn't read it), the
+    /// race-window guard is unavailable but the pgrp<=1 floor still
+    /// holds. A legitimate-looking pgrp goes through.
+    #[test]
+    fn skip_kill_falls_back_without_shell_pid() {
+        assert_eq!(should_skip_kill(54321, None), KillDecision::Proceed);
+        assert_eq!(
+            should_skip_kill(1, None),
+            KillDecision::RefuseSuspiciousPgrp,
+        );
     }
 
     /* ---------- BlockSegmenter ---------- */

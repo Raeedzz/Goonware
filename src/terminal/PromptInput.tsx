@@ -22,6 +22,14 @@ export interface PromptInputHandle {
    * additional args / Enter to submit.
    */
   insertText: (text: string) => void;
+  /**
+   * Drop the double-tap Ctrl+C escalation timestamp so the next press
+   * is treated as a fresh single-tap cycle. Called by BlockTerminal's
+   * soft-reset orchestrator so all three Ctrl+C paths stay in sync
+   * after a 3-tap pane reset — otherwise a stale timestamp here could
+   * misfire SIGKILL on the very next keystroke.
+   */
+  clearEscalation: () => void;
 }
 
 interface Props {
@@ -433,6 +441,9 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
           const cursor = before.length + text.length;
           t.setSelectionRange(cursor, cursor);
         });
+      },
+      clearEscalation: () => {
+        lastCtrlCAtRef.current = null;
       },
     }));
 

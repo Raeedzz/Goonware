@@ -1,6 +1,8 @@
 import {
+  forwardRef,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -25,15 +27,74 @@ import { isGlobalChord, keyToBytes } from "./keyEncoding";
 import type { DirtyRow, RenderFrame } from "./types";
 
 /**
+ * Imperative handle for parents that need to poke the renderer
+ * directly. Today the soft-reset path in BlockTerminal calls
+ * `invalidate()` so a stuck-but-alive canvas (typical post-sleep
+ * symptom: surface configured, last frame still on screen, no new
+ * frames arriving) gets a synchronous re-render before the existing
+ * watchdog ticks. Heavier escalation (rendererEpoch bump) stays
+ * internal to CanvasGrid.
+ */
+export interface CanvasGridHandle {
+  /**
+   * Force the renderer to redraw the current frame on the next rAF,
+   * even if the seq hasn't changed. No-op if the renderer is null
+   * (pre-mount or post-tear-down).
+   */
+  invalidate: () => void;
+}
+
+/**
  * Half-open cell-coord range. `start` is the anchor (mouse-down
  * cell); `end` is the live mouse position. Either end can be
  * lexicographically less than the other — the renderer canonicalises.
+ *
+ * **Coordinate space**: `startRow` and `endRow` are ORIGINAL-GRID
+ * row indices (the same coordinate space `firstRowOffset` lives in),
+ * NOT window-relative indices. Mouse events arrive in window coords
+ * and are translated to grid coords on the way in (`eventToCell`);
+ * the renderer expects window coords and gets them via translation
+ * on the way out (`renderRequest`). Anchoring to the grid makes the
+ * selection survive row shifts caused by scrollback growth from
+ * large agent output — without it, the user-visible selection drifts
+ * to a different cell every time `firstRowOffset` changes.
  */
 interface Selection {
   startRow: number;
   startCol: number;
   endRow: number;
   endCol: number;
+}
+
+/**
+ * Translate a grid-coords selection to window-relative coords for the
+ * renderer. Returns null when the entire selection lies outside the
+ * visible window — the renderer's `selection: null` path short-
+ * circuits selection painting entirely, which is what we want when
+ * the user's selection has scrolled out of view above the window.
+ *
+ * Exported for unit testing; consumed locally by `renderRequest`
+ * and (via the inverse) by `extractSelectionText`.
+ */
+export function gridSelectionToWindow(
+  sel: Selection | null,
+  offset: number,
+  windowSize: number,
+): Selection | null {
+  if (!sel) return null;
+  const startWin = sel.startRow - offset;
+  const endWin = sel.endRow - offset;
+  // Canonicalise to test against the window range without caring
+  // which end is the anchor vs. the live drag head.
+  const lo = Math.min(startWin, endWin);
+  const hi = Math.max(startWin, endWin);
+  if (hi < 0 || lo >= windowSize) return null;
+  return {
+    startRow: startWin,
+    startCol: sel.startCol,
+    endRow: endWin,
+    endCol: sel.endCol,
+  };
 }
 
 interface Props {
@@ -137,7 +198,7 @@ interface Props {
  * (same pattern as FullGrid + PtyPassthrough). All three paths
  * encode keys via the shared keyEncoding module.
  */
-export function CanvasGrid({
+export const CanvasGrid = forwardRef<CanvasGridHandle, Props>(function CanvasGrid({
   frame,
   rows,
   mode = "fill",
@@ -148,7 +209,7 @@ export function CanvasGrid({
   firstRowOffset,
   isVisible = true,
   onCanvasUnrecoverable,
-}: Props) {
+}, ref) {
   // Cache the latest unrecoverable callback so the bootstrap effect's
   // setTimeout closures always fire the current parent's handler even
   // if React swaps the callback identity between renders.
@@ -175,10 +236,37 @@ export function CanvasGrid({
   const wrapperRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const rendererRef = useRef<GridRenderer | null>(null);
+  // Imperative escape hatch for parents (currently BlockTerminal's
+  // soft-reset path). `invalidate` is the lightest poke possible: it
+  // tells the existing rAF-coalesced render loop "redraw the current
+  // frame even if seq hasn't changed." Heavier escalation (renderer
+  // rebuild via rendererEpoch) is intentionally NOT exposed — the
+  // existing 1 s watchdog and the canvasGridEscalation ladder already
+  // own the rebuild path, and exposing both would create two callers
+  // racing the same recovery.
+  useImperativeHandle(ref, () => ({
+    invalidate: () => {
+      const renderer = rendererRef.current;
+      if (!renderer) return;
+      renderer.invalidate();
+      renderRequest(renderer);
+    },
+  }));
   const frameRef = useRef<RenderFrame | null>(frame);
   const rowsRef = useRef<DirtyRow[] | undefined>(rows);
+  // Synchronously-updated `firstRowOffset` mirror so the selection
+  // translation in eventToCell + renderRequest reads the latest
+  // window→grid offset without the callback closures rebinding
+  // every render. The renderer's selection input is window-relative;
+  // our stored Selection is grid-relative. This ref bridges the two
+  // at runtime, not at closure-capture time, so a row-window shift
+  // mid-drag (large agent output arrives while user is selecting)
+  // keeps the selection anchored to the cells the user actually
+  // clicked.
+  const firstRowOffsetRef = useRef<number | undefined>(firstRowOffset);
   frameRef.current = frame;
   rowsRef.current = rows;
+  firstRowOffsetRef.current = firstRowOffset;
 
   // rAF-coalesced render scheduling. React can land several state
   // updates (a fresh frame, a rows window change, a selection drag
@@ -259,6 +347,7 @@ export function CanvasGrid({
     const wrapper = wrapperRef.current;
     if (!canvas || !wrapper) return;
     let cancelled = false;
+    let bootstrapStarted = false;
     // All deferred work scheduled inside this bootstrap pass. The
     // cleanup loops through and clears each one so a rendererEpoch
     // bump (or unmount) doesn't leave timers firing against a
@@ -389,65 +478,78 @@ export function CanvasGrid({
           pendingTimers.push(id);
         });
     };
-    // Defer bootstrap until WKWebView's compositor has allocated the
-    // canvas's IOSurface. React's useEffect fires AFTER the commit
-    // but BEFORE the next paint cycle — at which point the brand-new
-    // canvas has no compositor layer yet. If `context.configure()`
-    // (inside createGridRenderer) runs in that window, WKWebView
-    // hands back a swapchain bound to a pending-and-never-resolved
-    // surface handle: getCurrentTexture() succeeds, draws are
-    // submitted, but the pixels never reach the screen. User sees
-    // the wrapper's surface-0 background through the canvas =
-    // "agent opens with a black canvas, but typing still works."
+
+    // ── Primary prevention: gate the FIRST context.configure() on a
+    // sized canvas ────────────────────────────────────────────────
     //
-    // The compositor allocates the layer during the next paint
-    // cycle. A requestAnimationFrame callback fires right before
-    // each paint, so by the time TWO rAFs have fired, the previous
-    // frame's paint (and its compositor work) is fully complete on
-    // both the main and compositor threads. We bootstrap then.
+    // The escalation ladder + DOM fallback below are the safety net
+    // for cases we can't predict (driver hiccup, GPU process reset).
+    // The root cause of the "open agent → all black, never recovers"
+    // bug is upstream of all that: createGridRenderer calls
+    // context.configure() synchronously, and WKWebView returns a
+    // zombie swapchain if that call runs against a 0×0 canvas (no
+    // backing surface yet). All later getCurrentTexture() calls
+    // succeed from JS — no device.lost, no exception — but the
+    // textures paint into the void. No subsequent context.configure
+    // (resize-driven or otherwise) reliably rescues this state, which
+    // is why a fresh adapter+device+context rebuild was needed at all.
     //
-    // The 100 ms setTimeout is a fallback for when rAFs aren't
-    // firing — e.g. the Goonware window is occluded by another
-    // macOS window. Whichever fires first kicks the bootstrap.
-    // Under normal foreground use the rAFs win (~32 ms);
-    // backgrounded windows progress on the timeout (100 ms).
-    let rafA: number | null = null;
-    let rafB: number | null = null;
-    let timeoutId: number | null = null;
-    let bootstrapKicked = false;
-    const kickBootstrap = () => {
-      if (bootstrapKicked || cancelled) return;
-      bootstrapKicked = true;
-      if (rafA !== null) {
-        cancelAnimationFrame(rafA);
-        rafA = null;
-      }
-      if (rafB !== null) {
-        cancelAnimationFrame(rafB);
-        rafB = null;
-      }
-      if (timeoutId !== null) {
-        window.clearTimeout(timeoutId);
-        timeoutId = null;
-      }
+    // The fix is to never enter that state. Wait for the wrapper to
+    // have nonzero CSS dimensions, pre-size the canvas to match, THEN
+    // bootstrap. The first swapchain is born on a real surface and
+    // the rebuild ladder almost never has to fire.
+    //
+    // Normal path: useEffect runs after React's layout commit, so the
+    // wrapper is already sized — startBootstrapIfSized fires
+    // synchronously here and bootstrapStarted flips to true before
+    // we ever set up the observer.
+    //
+    // Slow path: the wrapper is 0×0 (rare — initial mount under a
+    // keepalive layer that's currently `display: none`, or a
+    // first-paint reflow that hasn't settled). The ResizeObserver
+    // waits for the first nonzero rect and starts bootstrap then.
+    const startBootstrapIfSized = () => {
+      if (bootstrapStarted || cancelled || gaveUpRef.current) return;
+      const rect = wrapper.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      // Pre-size the canvas so the very first context.configure() in
+      // createGridRenderer lands on a properly-sized backing store.
+      // The renderer's own resize() will re-run configure if the
+      // wrapper later changes size, but starting at the wrapper's
+      // measured size means most agent panes never hit that path.
+      const dpr = window.devicePixelRatio || 1;
+      const physWidth = Math.max(1, Math.floor(rect.width * dpr));
+      const physHeight = Math.max(1, Math.ceil(rect.height * dpr));
+      canvas.width = physWidth;
+      canvas.height = physHeight;
+      canvas.style.width = `${physWidth / dpr}px`;
+      canvas.style.height = `${physHeight / dpr}px`;
+      bootstrapStarted = true;
       attemptBootstrap(0);
     };
-    rafA = requestAnimationFrame(() => {
-      rafA = null;
-      if (cancelled || bootstrapKicked) return;
-      rafB = requestAnimationFrame(() => {
-        rafB = null;
-        if (cancelled || bootstrapKicked) return;
-        kickBootstrap();
+
+    // Try synchronously first — covers the common case where layout
+    // is already complete by the time this effect fires.
+    startBootstrapIfSized();
+
+    // Fallback observer for the 0×0-at-mount edge case. Disconnects
+    // itself the moment bootstrap actually starts so a wrapper resize
+    // doesn't trigger a second createGridRenderer call.
+    let sizeObserver: ResizeObserver | null = null;
+    if (!bootstrapStarted) {
+      sizeObserver = new ResizeObserver(() => {
+        startBootstrapIfSized();
+        if (bootstrapStarted) {
+          sizeObserver?.disconnect();
+          sizeObserver = null;
+        }
       });
-    });
-    timeoutId = window.setTimeout(kickBootstrap, 100);
+      sizeObserver.observe(wrapper);
+    }
 
     return () => {
       cancelled = true;
-      if (rafA !== null) cancelAnimationFrame(rafA);
-      if (rafB !== null) cancelAnimationFrame(rafB);
-      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      sizeObserver?.disconnect();
       for (const id of pendingTimers) window.clearTimeout(id);
       rendererRef.current?.destroy();
       rendererRef.current = null;
@@ -572,6 +674,42 @@ export function CanvasGrid({
   useEffect(() => {
     const wrapper = wrapperRef.current;
     if (!wrapper) return;
+    // Sub-pixel reflow suppression. Some siblings of the canvas
+    // (notably AgentChrome's status pill, but also any future text
+    // strip whose content varies by status) can shift their rendered
+    // height by 1–2 px when their content changes. That tiny delta
+    // ripples through flex layout and lands here as a ResizeObserver
+    // tick with a fractional CSS-pixel rect change.
+    //
+    // `renderer.resize()` short-circuits when the resulting PHYSICAL
+    // pixel count is unchanged, so sub-pixel deltas at integer DPRs
+    // are mostly no-ops anyway. But at fractional DPRs (1.5, 2.5)
+    // and at certain ResizeObserver-rounded values, a sub-CSS-pixel
+    // shift can still cross an integer physical-pixel boundary,
+    // trigger the slow path (canvas.width = ...; context.configure;
+    // lastSeq = -1), and on WKWebView produce one frame of blank
+    // swapchain before the synchronous `renderRequest` lands the
+    // next paint. The user-reported symptom was "screen instantly
+    // blank when Claude asks for permission" — the permission pill
+    // in AgentChrome was changing the strip's rendered height by a
+    // couple of CSS px even though BlockTerminal had reserved a
+    // fixed 32px row for it.
+    //
+    // Defense: track the last rect we forwarded and ignore ticks
+    // whose CSS-pixel delta is below SUBPIXEL_REFLOW_THRESHOLD_PX in
+    // both dimensions. Real resizes (sidebar collapse, window
+    // resize, tab switch landing a different layout) are always
+    // many pixels and pass through immediately. Status-pill churn
+    // is sub-pixel and gets dropped — the swapchain stays alive and
+    // the renderer's per-second watchdog keeps painting.
+    //
+    // The 2 px threshold is chosen against JetBrains Mono at 13 px /
+    // 1.35 lh — one row of canvas is 17.5–18 CSS px, so a 2 px shift
+    // is still far below "one row gained/lost" territory. Anything
+    // larger than that legitimately needs a backbuffer realloc.
+    const SUBPIXEL_REFLOW_THRESHOLD_PX = 2;
+    let lastForwardedWidth = -1;
+    let lastForwardedHeight = -1;
     const observer = new ResizeObserver((entries) => {
       const renderer = rendererRef.current;
       if (!renderer) return;
@@ -587,11 +725,31 @@ export function CanvasGrid({
       // its pre-hide backbuffer means the next visibility tick can
       // paint the cached frame without a re-fit round-trip.
       if (rect.width === 0 || rect.height === 0) return;
+      // Sub-pixel reflow suppression — see comment above the
+      // observer. Only applies AFTER the first forwarded resize so
+      // the initial mount measurement always goes through.
+      if (lastForwardedWidth > 0 && lastForwardedHeight > 0) {
+        const dw = Math.abs(rect.width - lastForwardedWidth);
+        const dh = Math.abs(rect.height - lastForwardedHeight);
+        if (
+          dw < SUBPIXEL_REFLOW_THRESHOLD_PX &&
+          dh < SUBPIXEL_REFLOW_THRESHOLD_PX
+        ) {
+          return;
+        }
+      }
+      lastForwardedWidth = rect.width;
+      lastForwardedHeight = rect.height;
       renderer.resize(
         rect.width,
         rect.height,
         window.devicePixelRatio || 1,
       );
+      // Defense in depth: even if `resize()` took its dimensions-
+      // unchanged fast path (no reconfigure, no canvas clear), force
+      // a fresh paint. The cost is one renderer.render() call which
+      // dedupes by seq when nothing actually changed.
+      renderer.invalidate();
       renderRequest(renderer);
     });
     observer.observe(wrapper);
@@ -869,10 +1027,11 @@ export function CanvasGrid({
       // original grid. Without it we'd guess "the slice is the tail
       // of the grid" — fine for many shell commands, wrong for any
       // agent TUI where the trim moved the slice's start.
+      const windowSize = explicitRows.length;
+      const offset =
+        firstRowOffset ?? (f ? Math.max(0, f.rows - windowSize) : 0);
       let cursor: { row: number; col: number; visible: boolean } | null = null;
       if (f) {
-        const windowSize = explicitRows.length;
-        const offset = firstRowOffset ?? Math.max(0, f.rows - windowSize);
         const cursorRowInWindow = f.cursor_row - offset;
         if (cursorRowInWindow >= 0 && cursorRowInWindow < windowSize) {
           cursor = {
@@ -892,11 +1051,18 @@ export function CanvasGrid({
         cols: f?.cols ?? 80,
         seq: f?.seq ?? 0,
         cursor,
-        selection: sel,
+        // Selection is stored in grid coords; renderer wants window
+        // coords. Translate here so a firstRowOffset shift mid-drag
+        // (large output arrives while the user is selecting) keeps
+        // the highlight on the same cells the user clicked.
+        selection: gridSelectionToWindow(sel, offset, windowSize),
       });
     } else if (f) {
       // For the full-frame path we can't use renderFrame() because
       // it doesn't forward selection. Reconstruct the input shape.
+      // Full-frame path has no explicit window — original-grid and
+      // window-relative coords coincide (offset = 0), so the
+      // translation is a no-op pass-through.
       r.render({
         rows: f.dirty,
         cols: f.cols,
@@ -906,7 +1072,7 @@ export function CanvasGrid({
           col: f.cursor_col,
           visible: f.cursor_visible !== false,
         },
-        selection: sel,
+        selection: gridSelectionToWindow(sel, 0, f.rows),
       });
     } else {
       r.renderFrame(null);
@@ -947,9 +1113,12 @@ export function CanvasGrid({
   // highlight aligns with the cells the copy step extracts from.
 
   /**
-   * Convert a mouse event to (row, col) cell coordinates relative to
-   * the rendered grid. Returns null when the renderer hasn't booted
-   * yet (early frames before WebGPU init resolves).
+   * Convert a mouse event to (gridRow, col) cell coordinates. The
+   * returned `row` is in ORIGINAL-GRID coordinates (windowRow +
+   * firstRowOffset), so the selection state survives a row-window
+   * shift mid-drag (e.g. large agent output prepends scrollback while
+   * the user is selecting). Returns null when the renderer hasn't
+   * booted yet (early frames before WebGPU init resolves).
    */
   const eventToCell = useCallback(
     (e: ReactMouseEvent | MouseEvent): { row: number; col: number } | null => {
@@ -962,7 +1131,10 @@ export function CanvasGrid({
       const { widthCss, heightCss } = renderer.cellSize;
       if (widthCss <= 0 || heightCss <= 0) return null;
       const col = Math.max(0, Math.floor(x / widthCss));
-      const row = Math.max(0, Math.floor(y / heightCss));
+      const windowRow = Math.max(0, Math.floor(y / heightCss));
+      // Translate window-relative → original-grid coordinates so the
+      // stored Selection is stable across firstRowOffset shifts.
+      const row = windowRow + (firstRowOffsetRef.current ?? 0);
       return { row, col };
     },
     [],
@@ -1091,13 +1263,22 @@ export function CanvasGrid({
     const aBefore =
       sel.startRow < sel.endRow ||
       (sel.startRow === sel.endRow && sel.startCol <= sel.endCol);
-    const sr = aBefore ? sel.startRow : sel.endRow;
+    const srGrid = aBefore ? sel.startRow : sel.endRow;
     const sc = aBefore ? sel.startCol : sel.endCol;
-    const er = aBefore ? sel.endRow : sel.startRow;
+    const erGrid = aBefore ? sel.endRow : sel.startRow;
     const ec = aBefore ? sel.endCol : sel.startCol;
     const sourceRows: DirtyRow[] | undefined =
       rowsRef.current ?? frameRef.current?.dirty;
     if (!sourceRows || sourceRows.length === 0) return "";
+    // Translate grid → window. Selection is stored in original-grid
+    // coords; sourceRows is window-relative (indices 0..length-1
+    // correspond to the current windowed slice). Without this
+    // translation, large scrollback (firstRowOffset deeply negative)
+    // would have us slicing at negative or far-future indices and
+    // returning empty / mangled text.
+    const offset = firstRowOffsetRef.current ?? 0;
+    const sr = srGrid - offset;
+    const er = erGrid - offset;
     const lines: string[] = [];
     for (let r = sr; r <= er; r++) {
       if (r < 0 || r >= sourceRows.length) continue;
@@ -1311,5 +1492,5 @@ export function CanvasGrid({
       )}
     </div>
   );
-}
+});
 
