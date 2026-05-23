@@ -99,10 +99,6 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
     // (claude, codex, vim, htop) all funnel through this textarea, so
     // a stuck agent gets the same double-tap-Ctrl+C escape as a shell.
     const lastCtrlCAtRef = useRef<number | null>(null);
-    const commandRunningRef = useRef(commandRunning);
-    useEffect(() => {
-      commandRunningRef.current = commandRunning;
-    }, [commandRunning]);
     // Set on paste; cleared on the next onChange. Lets the input
     // handler wrap the value in OSC 200/201 markers without re-reading
     // clipboard data (which the browser only exposes on the paste
@@ -233,7 +229,14 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
         const decision = decideCtrlCAction({
           now: Date.now(),
           lastCtrlCAt: lastCtrlCAtRef.current,
-          commandRunning: commandRunningRef.current,
+          // Read the prop directly — `onKeyDown` is recreated on every
+          // render, so it closes over the freshest `commandRunning`.
+          // Mirroring into a ref via useEffect lagged one tick behind
+          // the prop, which let a Ctrl+C arriving between commit and
+          // effect escalate to SIGKILL on a process group whose
+          // foreground had already passed back to the shell. See
+          // term_kill_foreground for the matching server-side guard.
+          commandRunning,
         });
         lastCtrlCAtRef.current =
           decision.newLastCtrlCAt === 0 ? null : decision.newLastCtrlCAt;
