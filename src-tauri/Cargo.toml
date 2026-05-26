@@ -56,10 +56,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Native terminal migration (M0+): Warp's GPU UI kit (`warpui`), used to
 # render the terminal into a Metal NSView embedded in the Tauri window.
 # `warpui`/`warpui_core` are MIT but pull in AGPL `warp_*` crates, so
-# Goonware is AGPL as a result (accepted by maintainer). Vendored via a
-# local path during the spike — TODO before shipping: switch to an
-# in-repo vendored copy or a pinned fork for reproducible/downloadable builds.
-warpui = { path = "/Users/raeedz/Developer/warp-reference/crates/warpui" }
+# Goonware is AGPL as a result (accepted by maintainer). Vendored in-repo at
+# `vendor/` (warpui's 7-crate local closure + a trimmed workspace), so the build
+# is self-contained / downloadable — no sibling checkout required.
+warpui = { path = "../vendor/crates/warpui" }
 # PNG encoding for the dev-only native-surface frame capture (lets us verify
 # the warpui render off-screen). Matches warpui's image version to dedupe.
 image = "0.25"
