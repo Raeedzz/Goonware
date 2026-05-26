@@ -602,6 +602,159 @@ pub struct DirtyRow {
 }
 
 /* ------------------------------------------------------------------
+   Native render sink — in-process frame path for the embedded warpui
+   terminal (macOS). The native surface mirrors exactly ONE pty at a
+   time (the active terminal tab). When that pty's `maybe_flush`/re-emit
+   produces a frame, we hand it — by reference, no serde, no IPC — to a
+   sink the native renderer registered at startup. The sink patches its
+   retained grid and pokes a redraw. On non-macOS builds (or before the
+   surface attaches) the sink is absent and these calls are no-ops, so
+   `term.rs` stays UI-agnostic.
+   ------------------------------------------------------------------ */
+
+/// Sink installed by the native terminal renderer. Receives the same sparse
+/// `RenderFrame` that goes to the IPC channel; the renderer maintains its own
+/// retained grid by applying `dirty`/cursor/dims.
+pub type NativeFrameSink = Box<dyn Fn(&str, &RenderFrame) + Send + Sync + 'static>;
+
+static NATIVE_SINK: std::sync::OnceLock<NativeFrameSink> = std::sync::OnceLock::new();
+/// Ids of the ptys the native surface currently mirrors — one per visible pane
+/// (the main column + the right-panel side terminal can both be on-screen at
+/// once). Empty = none. Frames for any listed pty reach the sink, tagged with
+/// the pty id so the renderer routes each to the right pane's grid.
+static NATIVE_PTYS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Register the native render sink. Idempotent-ish: only the first wins
+/// (the surface is created once for the app's lifetime).
+pub fn set_native_frame_sink(sink: NativeFrameSink) {
+    let _ = NATIVE_SINK.set(sink);
+}
+
+/// Mirror `id` on the native surface (the pane attaching to it), or — with an
+/// empty string — stop mirroring everything. Idempotent (no duplicate ids).
+pub fn set_native_pty(id: &str) {
+    if let Ok(mut g) = NATIVE_PTYS.lock() {
+        if id.is_empty() {
+            g.clear();
+        } else if !g.iter().any(|p| p == id) {
+            g.push(id.to_string());
+        }
+    }
+}
+
+/// Stop mirroring a single pty (a pane detached / its tab closed) without
+/// disturbing the other mirrored panes.
+#[allow(dead_code)] // wired in the per-pane detach increment
+pub fn clear_native_pty(id: &str) {
+    if let Ok(mut g) = NATIVE_PTYS.lock() {
+        g.retain(|p| p != id);
+    }
+}
+
+/// Hand a freshly-built frame to the native sink iff `id` is a mirrored pty.
+#[inline]
+fn emit_native_frame(id: &str, frame: &RenderFrame) {
+    let sink_present = NATIVE_SINK.get().is_some();
+    let is_target = NATIVE_PTYS
+        .lock()
+        .map(|g| g.iter().any(|p| p == id))
+        .unwrap_or(false);
+    // Diagnostic (logged BEFORE the sink/match gate so it fires even when the
+    // sink is missing or the pty doesn't match): surfaces exactly why a frame
+    // did or didn't reach the native grid.
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 30 {
+            eprintln!(
+                "[warpui] emit_native_frame#{n}: pty={id} match={is_target} sink={sink_present} grid={}x{} dirty={}",
+                frame.cols, frame.rows, frame.dirty.len()
+            );
+        }
+    }
+    if is_target {
+        if let Some(sink) = NATIVE_SINK.get() {
+            sink(id, frame);
+        }
+    }
+}
+
+/// Sink for finished command blocks. Mirrors [`NativeFrameSink`] but for the
+/// closed-block list the native renderer stacks above the live grid (M2). The
+/// native side clones what it needs off the `ClosedBlock`.
+pub type NativeBlockSink = Box<dyn Fn(&str, &ClosedBlock) + Send + Sync + 'static>;
+
+static NATIVE_BLOCK_SINK: std::sync::OnceLock<NativeBlockSink> = std::sync::OnceLock::new();
+
+/// Register the native block sink. First caller wins (surface lives once).
+pub fn set_native_block_sink(sink: NativeBlockSink) {
+    let _ = NATIVE_BLOCK_SINK.set(sink);
+}
+
+/// Hand a finished block to the native sink iff `id` is a mirrored pty.
+#[inline]
+fn emit_native_block(id: &str, block: &ClosedBlock) {
+    let is_target = NATIVE_PTYS
+        .lock()
+        .map(|g| g.iter().any(|p| p == id))
+        .unwrap_or(false);
+    if !is_target {
+        return;
+    }
+    if let Some(sink) = NATIVE_BLOCK_SINK.get() {
+        sink(id, block);
+    }
+}
+
+/// Push a full-grid frame for `id` straight to the native sink (no IPC, no
+/// scrollback). Called when the native surface (re)attaches to a pty so it
+/// repaints immediately from current state instead of waiting for the pty's
+/// next output. No-op if the session isn't alive yet — then the first real
+/// frame from `term_start` fills the surface.
+pub fn reemit_native(state: &TerminalState, id: &str) {
+    let sess = {
+        let Ok(sessions) = state.sessions.lock() else {
+            return;
+        };
+        match sessions.get(id) {
+            Some(s) => s.clone(),
+            None => return,
+        }
+    };
+    let Ok(mut s) = sess.lock() else { return };
+    let snapshot = snapshot_grid(&s.term);
+    let cursor = s.term.grid().cursor.point;
+    let dirty: Vec<DirtyRow> = snapshot
+        .iter()
+        .enumerate()
+        .map(|(row, snap)| DirtyRow {
+            row: row as u16,
+            spans: snap.spans.clone(),
+        })
+        .collect();
+    let seq = s.next_frame_seq;
+    s.next_frame_seq = s.next_frame_seq.saturating_add(1);
+    let frame = RenderFrame {
+        seq,
+        block_id: s.segmenter.current_block_id(),
+        cols: s.cols,
+        rows: s.rows,
+        cursor_row: cursor.line.0,
+        cursor_col: cursor.column.0 as u16,
+        alt_screen: s.term.mode().contains(TermMode::ALT_SCREEN),
+        command_running: s.last_command_running,
+        app_cursor: s.term.mode().contains(TermMode::APP_CURSOR),
+        bracketed_paste: s.term.mode().contains(TermMode::BRACKETED_PASTE),
+        cursor_visible: s.term.mode().contains(TermMode::SHOW_CURSOR),
+        dirty,
+        scrollback_appended: Vec::new(),
+        scrollback_reset: false,
+    };
+    emit_native_frame(id, &frame);
+}
+
+/* ------------------------------------------------------------------
    Block segmenter — OSC 133 + idle fallback.
    ------------------------------------------------------------------ */
 
@@ -2005,6 +2158,7 @@ pub fn term_start(
     // struct. The frontend invokes with `{ args: {...}, frameChannel }`.
     frame_channel: Channel<RenderFrame>,
 ) -> Result<(), String> {
+    eprintln!("[warpui] term_start: id={}", args.id);
     // Idempotent path: if a PTY with this id is already alive, reuse
     // it and re-emit the full grid as a single "all rows dirty" frame
     // so the freshly-mounted React component can hydrate without ever
@@ -2058,6 +2212,7 @@ pub fn term_start(
                     scrollback_appended,
                     scrollback_reset: true,
                 };
+                emit_native_frame(&args.id, &frame);
                 let _ = s.frame_channel.send(frame);
             }
             return Ok(());
@@ -2369,6 +2524,9 @@ pub fn term_start(
                                 },
                             );
                         }
+                        // In-process path to the native surface (no serde/IPC)
+                        // — mirrors emit_native_frame for the closed-block list.
+                        emit_native_block(&id_for_reader, &block);
                         let _ = app_for_reader
                             .emit(&format!("term://{id_for_reader}/block"), block);
                     }
@@ -2654,6 +2812,14 @@ pub fn term_kill_foreground(
    ------------------------------------------------------------------ */
 
 fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n < 20 {
+            eprintln!("[warpui] maybe_flush#{n}: pty={id}");
+        }
+    }
     let cmd_running = s.segmenter.command_running();
     let cmd_running_changed = cmd_running != s.last_command_running;
     let throttle = session_frame_throttle(s.visible);
@@ -2727,6 +2893,10 @@ fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
         scrollback_appended,
         scrollback_reset,
     };
+    // In-process native path (macOS embedded warpui): mirror this frame to
+    // the native surface iff it's the active terminal's pty. By reference —
+    // no serde, no IPC — before the channel send consumes `frame`.
+    emit_native_frame(id, &frame);
     let _ = s.frame_channel.send(frame);
     s.last_snapshot = snapshot;
     s.last_flush = Instant::now();

@@ -22,6 +22,7 @@ import { useToast } from "@/primitives/Toast";
 import { FolderOffIcon } from "hugeicons-react";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { BlockTerminal } from "@/terminal/BlockTerminal";
+import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
 import { DiffView } from "@/git/DiffView";
 import { AllChangesView } from "@/git/AllChangesView";
 import { Editor } from "@/editor/Editor";
@@ -105,7 +106,11 @@ export function MainColumn() {
         display: "grid",
         gridTemplateRows: "auto 1fr",
         gridTemplateColumns: "minmax(0, 1fr)",
-        backgroundColor: "var(--surface-2)",
+        // Transparent so the active terminal pane is a true hole down
+        // to the native surface. The tab strip (surface-1), the
+        // non-terminal tab content and the empty-state placeholder each
+        // paint their own opaque surface-2, so the ONLY transparent
+        // region in the centre column is the active terminal pane.
       }}
     >
       <TabStrip
@@ -711,6 +716,9 @@ function TabContent({
   // no React commit cascade for the BlockTerminal subtree.
   return (
     <div style={{ minHeight: 0, minWidth: 0, position: "relative", overflow: "hidden" }}>
+      {/* Reports this pane's rect to the native warpui terminal surface so it
+          composites over exactly the terminal region. */}
+      <WarpSurfaceTracker visible={!!tab && tab.kind === "terminal"} />
       <ErrorBoundary>
         <TerminalKeepaliveLayer
           activeTerminalTabId={
@@ -877,6 +885,9 @@ function TerminalTabContent({
       projectId={worktree.projectId}
       sessionId={worktree.id}
       isVisible={isVisible}
+      // Main-column terminals drive the native warpui surface; right-panel
+      // agent terminals do not (single surface until multi-pane, M6).
+      nativeSurface
       // Re-seed agent state on remount so an in-flight claude/codex
       // session doesn't briefly drop back to shell mode (which paints
       // PromptInput under the agent's own UI) when the user navigates

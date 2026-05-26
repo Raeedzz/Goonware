@@ -237,7 +237,13 @@
 html, body, #root {
   height: 100%;
   margin: 0;
-  background: var(--surface-0);
+  /* Transparent base: the native warpui terminal surface is a child
+     window ordered BELOW the webview, so the terminal pane must be a
+     true hole all the way down to the window. Every other region is
+     painted opaque by its own panel (window chrome, sidebars, and
+     MainColumn's tab strip / non-terminal content), so the only
+     see-through region is the terminal pane itself. */
+  background: transparent;
   color: var(--text-primary);
   font-family: var(--font-sans);
   font-size: var(--text-base);

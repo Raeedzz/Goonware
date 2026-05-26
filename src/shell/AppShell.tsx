@@ -163,7 +163,10 @@ export function AppShell() {
         width: "100vw",
         display: "flex",
         flexDirection: "column",
-        backgroundColor: "var(--surface-0)",
+        // Transparent: the native terminal surface sits behind the
+        // webview and shows through the terminal-pane hole. Window
+        // chrome, sidebars and the right panel each paint their own
+        // opaque bg, so only the terminal pane is see-through.
         overflow: "hidden",
       }}
     >

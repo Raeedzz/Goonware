@@ -23,6 +23,7 @@ tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 portable-pty = "0.9"
 alacritty_terminal = "0.25"
@@ -51,6 +52,18 @@ base64 = "0.22"
 # + embedded migrations live in src/persistence/.
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Native terminal migration (M0+): Warp's GPU UI kit (`warpui`), used to
+# render the terminal into a Metal NSView embedded in the Tauri window.
+# `warpui`/`warpui_core` are MIT but pull in AGPL `warp_*` crates, so
+# Goonware is AGPL as a result (accepted by maintainer). Vendored via a
+# local path during the spike — TODO before shipping: switch to an
+# in-repo vendored copy or a pinned fork for reproducible/downloadable builds.
+warpui = { path = "/Users/raeedz/Developer/warp-reference/crates/warpui" }
+# PNG encoding for the dev-only native-surface frame capture (lets us verify
+# the warpui render off-screen). Matches warpui's image version to dedupe.
+image = "0.25"
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -61,3 +74,17 @@ lto = true
 opt-level = "s"
 strip = true
 panic = "abort"
+
+# warpui pulls Warp's forked graphics/text stack, which requires these
+# low-level crates unified to a single source — otherwise the `font-kit`
+# fork and `core-text` disagree on `core-graphics` types (E0308). These
+# mirror Warp's root Cargo.toml `[patch]` so warpui resolves identically.
+# (If Tauri's own mac bindings conflict with these revs, revisit the
+# integration approach — e.g. a unified workspace.)
+[patch.crates-io]
+core-foundation = { git = "https://github.com/servo/core-foundation-rs", rev = "6f844cf1a1a18e25b70fcdf1bcdc458555bd2eff" }
+core-foundation-sys = { git = "https://github.com/servo/core-foundation-rs", rev = "6f844cf1a1a18e25b70fcdf1bcdc458555bd2eff" }
+core-graphics = { git = "https://github.com/servo/core-foundation-rs", rev = "6f844cf1a1a18e25b70fcdf1bcdc458555bd2eff" }
+core-text = { git = "https://github.com/servo/core-foundation-rs", rev = "6f844cf1a1a18e25b70fcdf1bcdc458555bd2eff" }
+objc = { git = "https://github.com/warpdotdev/rust-objc.git", rev = "5b656827fa9f863ef0eb22e444a3fedac009e78a" }
+pathfinder_simd = { git = "https://github.com/warpdotdev/pathfinder.git", rev = "34128a129ca6aee168fbc5060a4f21b4f7e486a9" }

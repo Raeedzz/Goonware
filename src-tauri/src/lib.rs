@@ -18,6 +18,8 @@
 /// Per-feature plumbing lives in `crate::*` modules — registered below.
 #[cfg(target_os = "macos")]
 mod browser;
+#[cfg(target_os = "macos")]
+mod warp_term;
 mod agent_hooks;
 mod block_id;
 mod claude_usage;
@@ -142,6 +144,17 @@ pub fn run() {
             agent_hooks::install_hooks();
             agent_hooks::start_socket_server(app.handle().clone());
 
+            // Native terminal migration (M0 spike): stand up an embedded
+            // warpui render surface under Tauri's run loop (no second
+            // [NSApp run]). v0 renders a solid surface to prove the
+            // runtime works embedded; the grid renderer (fed by term.rs
+            // RenderFrames) lands in M1.
+            eprintln!("[warpui] attaching embedded surface…");
+            // Hand warpui the app handle: it reparents its surface into the
+            // Goonware window (host NSWindow) and registers the in-process
+            // frame sink so term.rs frames drive the native grid directly.
+            warp_term::attach(app.handle());
+
             Ok(())
         });
 
@@ -242,6 +255,22 @@ pub fn run() {
             browser::browser_bound_port,
             #[cfg(target_os = "macos")]
             browser::browser_restart,
+            #[cfg(target_os = "macos")]
+            warp_term::term_surface_set_rect,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_attach,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_detach,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_set_agent_mode,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_scroll,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_mouse,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_selection_text,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_set_viewport,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Goonware");

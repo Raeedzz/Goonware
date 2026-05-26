@@ -35,9 +35,11 @@
 //!   the next slice (add a v2 migration + a new `Event::Snapshot`
 //!   variant that fills those tables in a transaction, then drop the
 //!   blob).
-//! - **No block / scrollback persistence.** Terminal history isn't
-//!   touched here — `flat_storage.rs` still owns in-memory grids and
-//!   block segmentation isn't VTE-wired yet.
+//! - **Block history persistence (Warp-parity).** Closed blocks are
+//!   persisted in full and never evicted by count, so terminal history
+//!   is never cut off across restarts. `load_blocks` windows the
+//!   most-recent rows for fast restore; older blocks page in on
+//!   scroll-back.
 //! - **No graceful shutdown.** The writer thread relies on macOS
 //!   tearing it down at app exit; WAL recovers any half-finished
 //!   transaction on next launch. If we add long-running async writes
@@ -113,10 +115,17 @@ pub struct SavedBlock {
     pub duration_ms: Option<i64>,
 }
 
-/// Return every persisted block for a pty_id in insertion order
-/// (oldest first), matching how the frontend's `sessionMemory.blocks`
-/// array is ordered. Returns an empty vec for unknown pty_ids — no
-/// error.
+/// How many of the most-recent blocks `load_blocks` returns on restore.
+/// History is retained in full on disk (Warp-parity — never cut off);
+/// the renderer pages in older blocks on scroll-back. Kept in sync with
+/// the front-end's `MAX_BLOCKS` in `sessionMemory.ts`.
+const HISTORY_LOAD_WINDOW: i64 = 500;
+
+/// Return the most-recent `HISTORY_LOAD_WINDOW` persisted blocks for a
+/// pty_id in insertion order (oldest first), matching how the
+/// frontend's `sessionMemory.blocks` array is ordered. Older blocks
+/// stay on disk for scroll-back. Returns an empty vec for unknown
+/// pty_ids — no error.
 pub fn load_blocks(
     db_path: &std::path::Path,
     pty_id: &str,
@@ -125,13 +134,19 @@ pub fn load_blocks(
         .map_err(|e| format!("open RO at {}: {e}", db_path.display()))?;
     let mut stmt = conn
         .prepare(
+            // Window to the most-recent rows (newest-first inner, then
+            // re-sorted oldest-first). Restore stays fast even when a
+            // pty has accumulated huge history; older blocks remain on
+            // disk and page in on scroll-back.
             "SELECT block_id, input, transcript, block_rows, \
-                    exit_code, cwd, duration_ms \
-             FROM blocks WHERE pty_id = ?1 ORDER BY id ASC",
+                    exit_code, cwd, duration_ms FROM (\
+                 SELECT * FROM blocks WHERE pty_id = ?1 \
+                 ORDER BY id DESC LIMIT ?2\
+             ) ORDER BY id ASC",
         )
         .map_err(|e| format!("prepare load_blocks: {e}"))?;
     let rows = stmt
-        .query_map(rusqlite::params![pty_id], |row| {
+        .query_map(rusqlite::params![pty_id, HISTORY_LOAD_WINDOW], |row| {
             let rows_text: String = row.get(3)?;
             // Stored as a known-shape JSON literal we wrote ourselves
             // last save — parse failures here are real corruption and
@@ -376,33 +391,40 @@ mod tests {
     }
 
     #[test]
-    fn block_cap_evicts_oldest_per_pty() {
+    fn history_is_retained_in_full_and_load_is_windowed() {
         let (_dir, path) = fresh_db();
         let conn = db::open_rw(&path).unwrap();
         let w = writer::start(conn, path.clone());
 
-        // Push 5 over the cap of 500. We poke the eviction by inserting
-        // > MAX_BLOCKS_PER_PTY rows; the cap constant is module-private
-        // so we hard-code the expected behavior: the last 500 survive.
-        const CAP: i64 = 500;
-        for i in 1..=(CAP + 5) {
+        // Insert past the load window. Warp-parity: nothing is evicted
+        // on save — the read path windows instead, so older history is
+        // never cut off on disk.
+        const WINDOW: i64 = 500;
+        for i in 1..=(WINDOW + 5) {
             w.save_block(mk_block(i, &format!("cmd-{i}")));
         }
-        // Each insert is atomic with its own eviction, so len pins at
-        // CAP as soon as the 500th block lands — checking len alone
-        // races against the trailing 5 inserts still in the writer
-        // mailbox. Wait until the *final* block_id is visible.
         wait_for(|| {
             load_blocks(&path, "pty-A")
-                .map(|v| v.last().map(|b| b.block_id) == Some(CAP + 5))
+                .map(|v| v.last().map(|b| b.block_id) == Some(WINDOW + 5))
                 .unwrap_or(false)
         });
 
+        // Every row is retained on disk — history is never cut off.
+        let total: i64 = db::open_ro(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM blocks WHERE pty_id = 'pty-A'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, WINDOW + 5, "history must be retained in full");
+
+        // ...but load_blocks returns only the most-recent WINDOW, oldest-first.
         let blocks = load_blocks(&path, "pty-A").unwrap();
-        assert_eq!(blocks.len(), CAP as usize);
-        // Oldest survivor should be block_id = 6 (1..=5 evicted).
-        assert_eq!(blocks[0].block_id, 6);
-        assert_eq!(blocks.last().unwrap().block_id, CAP + 5);
+        assert_eq!(blocks.len(), WINDOW as usize);
+        assert_eq!(blocks[0].block_id, 6); // 1..=5 fall outside the window
+        assert_eq!(blocks.last().unwrap().block_id, WINDOW + 5);
     }
 
     #[test]

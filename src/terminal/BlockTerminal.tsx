@@ -84,6 +84,12 @@ function commandLineIsAgent(line: string): boolean {
 interface Props {
   /** Stable PTY session ID — must be unique per running PTY. */
   id: string;
+  /**
+   * When true (main column only), this terminal drives the native warpui
+   * surface while it's the active tab. Right-panel agent terminals leave this
+   * unset so they don't hijack the single native surface (multi-pane is M6).
+   */
+  nativeSurface?: boolean;
   /** Command to spawn (e.g. "zsh", "claude", "codex"). */
   command: string;
   args?: string[];
@@ -205,6 +211,7 @@ export function BlockTerminal({
   autoFocus = true,
   isVisible = true,
   allowHorizontalScroll = false,
+  nativeSurface = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   /**
@@ -233,6 +240,18 @@ export function BlockTerminal({
   // `term://${id}/frame`. `-r<n>` works and reads cleanly in logs.
   const [generation, setGeneration] = useState(0);
   const ptyId = generation === 0 ? id : `${id}-r${generation}`;
+  // Native warpui terminal surface (macOS): when THIS terminal is the active
+  // tab, tell the backend to mirror this pty. Key on the real `ptyId`
+  // (generation-adjusted) the PTY actually runs under — not the tab's base id,
+  // which would miss the `-r<n>` suffix after a restart and mirror nothing.
+  // No detach on cleanup: the next visible terminal's attach overwrites the
+  // target, and WarpSurfaceTracker clears it when no terminal tab is active —
+  // avoiding a tab-switch race where an outgoing slot's cleanup clobbers the
+  // incoming slot's attach.
+  useEffect(() => {
+    if (!nativeSurface || !isVisible) return;
+    invoke("term_native_attach", { id: ptyId }).catch(() => {});
+  }, [nativeSurface, isVisible, ptyId]);
   // In-memory ring buffer of past commands (newest at index 0).
   // Hydrated from module-scoped memory so it survives session/project
   // switches; module memory is keyed by terminal id, not component
@@ -727,6 +746,176 @@ export function BlockTerminal({
   // After the PTY exits, downshift back to shell-mode chrome regardless
   // of what the last frame's flags were — those readings are stale.
   const agentMode = !exited && (altScreen || foregroundIsAgent);
+
+  // Tell the native surface when this pane is in agent mode. In agent mode the
+  // PromptInput is hidden and keystrokes go raw to the PTY (PtyPassthrough), so
+  // the native live grid — not the React input box — is what the user sees and
+  // types into. Crucially this stays latched across the ~1.5s agent-exit
+  // debounce, so a just-killed agent keeps showing its shell prompt instead of
+  // a dark surface ("Ctrl+C doesn't come back"). `ptyId` is a dep so the push
+  // re-fires after a tab-switch attach reset.
+  useEffect(() => {
+    if (!nativeSurface || !isVisible) return;
+    invoke("term_native_set_agent_mode", { active: agentMode }).catch(() => {});
+  }, [nativeSurface, isVisible, agentMode, ptyId]);
+
+  // The native surface drives ALL modes on a native pane: shell, inline agents
+  // (claude/codex), AND alt-screen TUIs (vim/htop). Alt-screen used to fall back
+  // to the React WebGPU CanvasGrid; it now renders through the native alt-grid
+  // path too (the native surface was already painting it behind the opaque
+  // canvas — we just stop covering it), so the WebGPU stack is only used by
+  // non-native (right-panel) terminals. Input is captured by React and forwarded
+  // to the PTY — PromptInput (shell), PtyPassthrough (inline agent OR native
+  // alt-screen) — and the native grid shows the echo. Non-native panes
+  // (nativeSurface=false) keep CanvasGrid for both display and input.
+  const nativeActive = nativeSurface;
+
+  // Autofocus the invisible PtyPassthrough whenever an inline agent engages on
+  // the visible pane. With the native surface rendering the agent through a
+  // transparent hole there's no visible element to click, so nothing would
+  // otherwise focus the passthrough — leaving the user unable to type or Ctrl+C
+  // into the agent. (Shell mode doesn't need this: its PromptInput box is
+  // visible and grabs focus on click.) Click-to-refocus + the window-level
+  // Ctrl+C fallback cover focus drift after that.
+  useEffect(() => {
+    // PtyPassthrough is the input layer for inline agents AND native alt-screen
+    // (vim/htop on a native pane). Focus it whenever it's the one mounted so the
+    // user can type / Ctrl+C without a visible element to click.
+    const needsPassthrough =
+      (foregroundIsAgent && !altScreen) || (altScreen && nativeSurface);
+    if (!isVisible || !needsPassthrough) return;
+    const t = setTimeout(() => passthroughRef.current?.focus(), 0);
+    return () => clearTimeout(t);
+  }, [isVisible, foregroundIsAgent, altScreen, nativeSurface]);
+
+  // Scroll-back wheel bridge. The native surface renders the shell transcript
+  // through a transparent hole; the embedded child window has
+  // `ignoresMouseEvents: YES`, so wheel events land on this (invisible) React
+  // scroll container instead. Forward the delta to the native
+  // `ClippedScrollable` via `term_native_scroll` and swallow it so the empty
+  // container doesn't also scroll. Only while the native surface owns the
+  // SHELL transcript: agent / alt-screen panes keep their own React scrolling
+  // (and the native render ignores the offset there anyway). A NON-passive
+  // listener is required — React's synthetic `onWheel` is passive, so
+  // `preventDefault` would no-op. `deltaY > 0` (scroll down) advances toward
+  // newer output; the Rust side drops stick-to-bottom and re-arms it when the
+  // user scrolls back down or the content fits.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el || !nativeActive || agentMode) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      // Most devices report pixels (deltaMode 0); convert line/page deltas.
+      const px =
+        e.deltaMode === 1
+          ? e.deltaY * 16
+          : e.deltaMode === 2
+            ? e.deltaY * (el.clientHeight || 400)
+            : e.deltaY;
+      invoke("term_native_scroll", { deltaPx: px }).catch(() => {});
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [nativeActive, agentMode]);
+
+  // Selection mouse bridge. Same situation as the wheel bridge: the native
+  // surface renders the shell transcript through a transparent hole and ignores
+  // mouse events, so drags land on this (invisible) container. Forward
+  // down/drag/up to `term_native_mouse` → warpui's own hit-testing + selection.
+  // `(x, y)` are relative to this container's top-left, which in shell mode is
+  // the pane (and therefore surface) top-left. Move/up listen on the window so a
+  // drag tracks past the container edge. `preventDefault` on mousedown stops the
+  // hidden DOM block list from starting its own text selection. Left button only.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el || !nativeActive || agentMode) return;
+    let dragging = false;
+    const send = (kind: string, e: globalThis.MouseEvent) => {
+      const r = el.getBoundingClientRect();
+      invoke("term_native_mouse", {
+        kind,
+        x: e.clientX - r.left,
+        y: e.clientY - r.top,
+        clickCount: e.detail || 1,
+        shift: e.shiftKey,
+        cmd: e.metaKey,
+        alt: e.altKey,
+        ctrl: e.ctrlKey,
+      }).catch(() => {});
+    };
+    const onMove = (e: globalThis.MouseEvent) => {
+      if (dragging) send("drag", e);
+    };
+    const onUp = (e: globalThis.MouseEvent) => {
+      if (!dragging) return;
+      dragging = false;
+      send("up", e);
+      window.removeEventListener("mousemove", onMove, true);
+      window.removeEventListener("mouseup", onUp, true);
+    };
+    const onDown = (e: globalThis.MouseEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      dragging = true;
+      send("down", e);
+      window.addEventListener("mousemove", onMove, true);
+      window.addEventListener("mouseup", onUp, true);
+    };
+    el.addEventListener("mousedown", onDown, true);
+    return () => {
+      el.removeEventListener("mousedown", onDown, true);
+      window.removeEventListener("mousemove", onMove, true);
+      window.removeEventListener("mouseup", onUp, true);
+    };
+  }, [nativeActive, agentMode]);
+
+  // Cmd+C copies the native transcript selection (kept by warpui's
+  // SelectableArea, exposed via term_native_selection_text) through the existing
+  // pbcopy path. Capture-phase + window-level so it wins over the focused
+  // PromptInput textarea — UNLESS that textarea has its own selection, in which
+  // case we defer to the browser's normal copy. Shell-transcript only (agent
+  // mode routes Cmd+C through PtyPassthrough; alt-screen has no native surface).
+  useEffect(() => {
+    if (!nativeActive || agentMode || !isVisible) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.metaKey || e.ctrlKey || e.altKey || e.key.toLowerCase() !== "c") return;
+      const ae = document.activeElement;
+      if (ae && (ae.tagName === "TEXTAREA" || ae.tagName === "INPUT")) {
+        const inp = ae as HTMLInputElement | HTMLTextAreaElement;
+        if (inp.selectionStart != null && inp.selectionStart !== inp.selectionEnd) return;
+      }
+      e.preventDefault();
+      invoke<string | null>("term_native_selection_text")
+        .then((t) => {
+          if (t) void writeClipboardTextWithFallback(t);
+        })
+        .catch(() => {});
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [nativeActive, agentMode, isVisible]);
+
+  // Report this scroll container's region (top offset within the pane + height)
+  // to the native surface, so native content pins to exactly it: the shell
+  // transcript sits just above the input bar, and an agent grid sits just below
+  // the AgentChrome strip — never behind either. The native surface still spans
+  // the whole pane; this only bounds the content. Covers shell AND agent (the top
+  // offset differs); re-reports on resize and when agent mode toggles the strip.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el || !nativeActive) return;
+    const report = () => {
+      const sr = el.getBoundingClientRect();
+      const cr = containerRef.current?.getBoundingClientRect();
+      const top = cr ? sr.top - cr.top : 0;
+      if (sr.height > 0)
+        invoke("term_native_set_viewport", { top, height: sr.height }).catch(() => {});
+    };
+    report();
+    const ro = new ResizeObserver(report);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [nativeActive, agentMode]);
 
   // Force re-anchoring when agent mode turns on — i.e. a new agent
   // is detected in this pane. The input bar hides, the PTY re-fits
@@ -1649,7 +1838,12 @@ export function BlockTerminal({
         width: "100%",
         display: "flex",
         flexDirection: "column",
-        backgroundColor: "var(--surface-0)",
+        // When this pane drives the native warpui surface, the root is
+        // transparent so the Metal surface (a child window ordered
+        // below the webview) shows through. Right-panel agent terminals
+        // (nativeSurface=false) keep their opaque surface-0 background
+        // and render entirely in the webview as before.
+        backgroundColor: nativeActive ? "transparent" : "var(--surface-0)",
         position: "relative",
         // Soft warm pulse when the terminal rings the bell. CSS handles
         // the easing so the runtime cost is one class flip. When a file
@@ -1709,10 +1903,12 @@ export function BlockTerminal({
           agent case (a print-mode invocation that still trips the
           banner sniffer). The strip is driven by hook events, so it
           stays accurate without polling the PTY. */}
-      {agentMode && <AgentChrome cwd={liveCwd ?? cwd} />}
-      {!exited && altScreen && (
-        // Alt-screen TUI (vim, htop, claude-in-alt-screen) renders
-        // exclusively through the WebGPU CanvasGrid. The previous
+      {!exited && foregroundIsAgent && <AgentChrome cwd={liveCwd ?? cwd} />}
+      {!exited && altScreen && !nativeActive && (
+        // Non-native (right-panel) alt-screen TUI (vim, htop, claude-in-alt-
+        // screen) renders through the WebGPU CanvasGrid. Native panes render
+        // alt-screen on the Metal surface instead (nativeActive), so this is
+        // skipped there. The previous
         // DOM-backed FullGrid is retired — CanvasGrid handles
         // selection, cursor, and the full feature set, and keeping
         // two paths invited drift bugs. The `autoFocus` prop isn't
@@ -1739,6 +1935,10 @@ export function BlockTerminal({
             minHeight: 0,
             display: "flex",
             flexDirection: "column",
+            // Alt-screen is an agent/TUI mode, so the native surface does NOT
+            // drive it (nativeActive is false): the WebGPU CanvasGrid renders
+            // and takes input as usual, painted opaquely over the surface.
+            opacity: nativeActive ? 0 : undefined,
           }}
         >
           {altScreenCanvasFailed ? (
@@ -1785,7 +1985,14 @@ export function BlockTerminal({
           className={
             allowHorizontalScroll ? "goonware-no-horizontal-scrollbar" : undefined
           }
-          style={agentScrollContainerStyle(allowHorizontalScroll)}
+          style={{
+            ...agentScrollContainerStyle(allowHorizontalScroll),
+            // Shell mode with the native surface active: hide the React block
+            // list / live block so the native rendering shows through the hole.
+            // In agent mode (nativeActive false) this stays visible so the
+            // agent's LiveBlock/CanvasGrid renders and takes input as before.
+            opacity: nativeActive ? 0 : undefined,
+          }}
         >
           {/* Width-sizing wrapper. In `allowHorizontalScroll` mode,
               CellRows render with `whiteSpace: pre` and the LiveBlock
@@ -1864,11 +2071,15 @@ export function BlockTerminal({
       {!agentMode && effectiveCwd && (
         <TerminalStatusBar cwd={effectiveCwd} command={command} />
       )}
-      {agentMode && effectiveCwd && (
+      {agentMode && effectiveCwd && !nativeActive && (
         // Agent-mode info strip: icon + diff + path + branch, no
         // controls. Same component as shell mode in `readonly` form —
         // share data + styling, drop the branch-switcher picker so it
         // can't fire mid-agent-session.
+        //
+        // Hidden when the NATIVE surface is rendering the agent (nativeActive):
+        // the agent's grid bottom-anchors to the pane, and this opaque bar would
+        // sit over its input row. Freeing the bottom keeps the input on-screen.
         <TerminalStatusBar
           cwd={effectiveCwd}
           command={activeCommand || command}
@@ -1888,7 +2099,7 @@ export function BlockTerminal({
           autoFocus={autoFocus}
         />
       )}
-      {foregroundIsAgent && !altScreen && (
+      {((foregroundIsAgent && !altScreen) || (altScreen && nativeSurface)) && (
         <PtyPassthrough
           ref={passthroughRef}
           onSendBytes={onSendBytesVoid}
