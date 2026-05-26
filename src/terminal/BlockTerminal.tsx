@@ -90,6 +90,10 @@ interface Props {
    * unset so they don't hijack the single native surface (multi-pane is M6).
    */
   nativeSurface?: boolean;
+  /** Which native pane this terminal drives: "main" (main column) or "side"
+   *  (right-panel). Threaded into every native command so the two panes' grids
+   *  / scroll / selection stay independent on the one embedded surface. */
+  paneKey?: "main" | "side";
   /** Command to spawn (e.g. "zsh", "claude", "codex"). */
   command: string;
   args?: string[];
@@ -212,6 +216,7 @@ export function BlockTerminal({
   isVisible = true,
   allowHorizontalScroll = false,
   nativeSurface = false,
+  paneKey = "main",
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   /**
@@ -250,8 +255,8 @@ export function BlockTerminal({
   // incoming slot's attach.
   useEffect(() => {
     if (!nativeSurface || !isVisible) return;
-    invoke("term_native_attach", { id: ptyId }).catch(() => {});
-  }, [nativeSurface, isVisible, ptyId]);
+    invoke("term_native_attach", { paneKey, id: ptyId }).catch(() => {});
+  }, [nativeSurface, isVisible, ptyId, paneKey]);
   // In-memory ring buffer of past commands (newest at index 0).
   // Hydrated from module-scoped memory so it survives session/project
   // switches; module memory is keyed by terminal id, not component
@@ -756,8 +761,8 @@ export function BlockTerminal({
   // re-fires after a tab-switch attach reset.
   useEffect(() => {
     if (!nativeSurface || !isVisible) return;
-    invoke("term_native_set_agent_mode", { active: agentMode }).catch(() => {});
-  }, [nativeSurface, isVisible, agentMode, ptyId]);
+    invoke("term_native_set_agent_mode", { paneKey, active: agentMode }).catch(() => {});
+  }, [nativeSurface, isVisible, agentMode, ptyId, paneKey]);
 
   // The native surface drives ALL modes on a native pane: shell, inline agents
   // (claude/codex), AND alt-screen TUIs (vim/htop). Alt-screen used to fall back
@@ -812,11 +817,11 @@ export function BlockTerminal({
           : e.deltaMode === 2
             ? e.deltaY * (el.clientHeight || 400)
             : e.deltaY;
-      invoke("term_native_scroll", { deltaPx: px }).catch(() => {});
+      invoke("term_native_scroll", { paneKey, deltaPx: px }).catch(() => {});
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
-  }, [nativeActive, agentMode]);
+  }, [nativeActive, agentMode, paneKey]);
 
   // Selection mouse bridge. Same situation as the wheel bridge: the native
   // surface renders the shell transcript through a transparent hole and ignores
@@ -831,11 +836,13 @@ export function BlockTerminal({
     if (!el || !nativeActive || agentMode) return;
     let dragging = false;
     const send = (kind: string, e: globalThis.MouseEvent) => {
-      const r = el.getBoundingClientRect();
+      // Window-content coords (clientX/Y); Rust subtracts the combined surface
+      // origin so the event lands in this pane's region (warpui hit-tests by
+      // position across both panes' SelectableAreas).
       invoke("term_native_mouse", {
         kind,
-        x: e.clientX - r.left,
-        y: e.clientY - r.top,
+        x: e.clientX,
+        y: e.clientY,
         clickCount: e.detail || 1,
         shift: e.shiftKey,
         cmd: e.metaKey,
@@ -885,7 +892,7 @@ export function BlockTerminal({
         if (inp.selectionStart != null && inp.selectionStart !== inp.selectionEnd) return;
       }
       e.preventDefault();
-      invoke<string | null>("term_native_selection_text")
+      invoke<string | null>("term_native_selection_text", { paneKey })
         .then((t) => {
           if (t) void writeClipboardTextWithFallback(t);
         })
@@ -893,7 +900,7 @@ export function BlockTerminal({
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [nativeActive, agentMode, isVisible]);
+  }, [nativeActive, agentMode, isVisible, paneKey]);
 
   // Report this scroll container's region (top offset within the pane + height)
   // to the native surface, so native content pins to exactly it: the shell
@@ -909,13 +916,13 @@ export function BlockTerminal({
       const cr = containerRef.current?.getBoundingClientRect();
       const top = cr ? sr.top - cr.top : 0;
       if (sr.height > 0)
-        invoke("term_native_set_viewport", { top, height: sr.height }).catch(() => {});
+        invoke("term_native_set_viewport", { paneKey, top, height: sr.height }).catch(() => {});
     };
     report();
     const ro = new ResizeObserver(report);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [nativeActive, agentMode]);
+  }, [nativeActive, agentMode, paneKey]);
 
   // Force re-anchoring when agent mode turns on — i.e. a new agent
   // is detected in this pane. The input bar hides, the PTY re-fits

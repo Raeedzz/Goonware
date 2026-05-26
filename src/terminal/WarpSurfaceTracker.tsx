@@ -16,7 +16,15 @@ import { invoke } from "@tauri-apps/api/core";
  * is the pane's rect. When `visible` is false (a non-terminal tab is active) we
  * report a zero rect, which hides the surface.
  */
-export function WarpSurfaceTracker({ visible }: { visible: boolean }) {
+export function WarpSurfaceTracker({
+  visible,
+  paneKey = "main",
+}: {
+  visible: boolean;
+  /** Which native pane this tracker reports for: "main" (main column) or "side"
+   *  (right panel). The surface covers the combined box of both. */
+  paneKey?: "main" | "side";
+}) {
   const ref = useRef<HTMLDivElement>(null);
 
   // When no terminal tab is active, stop mirroring any pty (the surface is
@@ -24,9 +32,9 @@ export function WarpSurfaceTracker({ visible }: { visible: boolean }) {
   // driven by BlockTerminal, which owns the real, generation-adjusted pty id.
   useEffect(() => {
     if (!visible) {
-      invoke("term_native_detach").catch(() => {});
+      invoke("term_native_detach", { paneKey }).catch(() => {});
     }
-  }, [visible]);
+  }, [visible, paneKey]);
 
   useEffect(() => {
     const el = ref.current;
@@ -41,7 +49,7 @@ export function WarpSurfaceTracker({ visible }: { visible: boolean }) {
         ? { x: r.left, y: r.top, width: r.width, height: r.height }
         : { x: 0, y: 0, width: 0, height: 0 };
       // No-op on non-macOS (command absent) — swallow.
-      invoke("term_surface_set_rect", rect).catch(() => {});
+      invoke("term_surface_set_rect", { paneKey, ...rect }).catch(() => {});
     };
     const schedule = () => {
       cancelAnimationFrame(raf);
@@ -58,7 +66,7 @@ export function WarpSurfaceTracker({ visible }: { visible: boolean }) {
       ro.disconnect();
       window.removeEventListener("resize", schedule);
     };
-  }, [visible]);
+  }, [visible, paneKey]);
 
   return (
     <div

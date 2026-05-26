@@ -176,69 +176,131 @@ impl TermGrid {
     }
 }
 
-/// The single shared grid, created lazily before attach so the frame sink and
-/// the view share one `Arc`.
-static GRID: OnceLock<Arc<Mutex<TermGrid>>> = OnceLock::new();
-fn grid() -> &'static Arc<Mutex<TermGrid>> {
-    GRID.get_or_init(|| Arc::new(Mutex::new(TermGrid::empty())))
+/// All native state for ONE pane. The embedded surface hosts up to two panes
+/// side-by-side — the main column + the right-panel side terminal — each
+/// mirroring its own pty. This was process-global singletons (one pane); it's
+/// now per-pane so both terminals can render in the single surface at once.
+struct Pane {
+    /// The pty this pane mirrors ("" = none / detached). Used for sink routing.
+    pty: Mutex<String>,
+    /// Retained grid the frame sink patches and `build_pane_column` paints from.
+    grid: Arc<Mutex<TermGrid>>,
+    /// Scroll-back handle for this pane's `ClippedScrollable` (survives the
+    /// per-frame element rebuild; render mirrors scroll_px/stick_bottom in,
+    /// `term_native_scroll` reads the clamped offset back out).
+    scroll: ClippedScrollStateHandle,
+    /// Selection handle for this pane's `SelectableArea` (driven by injected mouse).
+    sel: SelectionHandle,
+    /// Latest selected text in this pane (read by `term_native_selection_text`).
+    selection: Mutex<Option<String>>,
+    /// Agent-mode latch: a foreground agent / alt-screen TUI owns the pane, so
+    /// the live grid keeps painting across the React exit debounce. Kept out of
+    /// `TermGrid` so attach's grid reset can't race it.
+    agent_mode: std::sync::atomic::AtomicBool,
+    /// This pane's rect in window-content CSS px (x, y, w, h), reported by React.
+    /// Drives surface coverage (the combined bounding box) + side-by-side layout.
+    /// w/h ≈ 0 → pane not placed (collapsed / detached).
+    rect: Mutex<(f32, f32, f32, f32)>,
+    /// Content region within the pane (top offset + height, CSS px) — the area
+    /// clear of React chrome (input bar below, AgentChrome strip above). `0` =
+    /// not reported → fall back to the pane's full height.
+    viewport_top: Mutex<f32>,
+    viewport_h: Mutex<f32>,
 }
 
-/// Shared scroll-back state handle for the shell-transcript `ClippedScrollable`.
-/// Persisted across the per-frame element rebuild (the element tree is recreated
-/// every `render`, but the scroll offset must survive). `render` mirrors
-/// `TermGrid::{scroll_px, stick_bottom}` into it; `term_native_scroll` reads the
-/// post-layout clamped offset back out of it. Arc-backed + `Clone`, so a clone
-/// goes into each rebuilt `ClippedScrollable`.
-static SCROLL: OnceLock<ClippedScrollStateHandle> = OnceLock::new();
-fn scroll_handle() -> &'static ClippedScrollStateHandle {
-    SCROLL.get_or_init(ClippedScrollStateHandle::new)
+impl Pane {
+    fn new() -> Self {
+        Self {
+            pty: Mutex::new(String::new()),
+            grid: Arc::new(Mutex::new(TermGrid::empty())),
+            scroll: ClippedScrollStateHandle::new(),
+            sel: SelectionHandle::default(),
+            selection: Mutex::new(None),
+            agent_mode: std::sync::atomic::AtomicBool::new(false),
+            rect: Mutex::new((0.0, 0.0, 0.0, 0.0)),
+            viewport_top: Mutex::new(0.0),
+            viewport_h: Mutex::new(0.0),
+        }
+    }
+    fn pty_id(&self) -> String {
+        self.pty.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+    fn rect(&self) -> (f32, f32, f32, f32) {
+        *self.rect.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Placed on-screen: has a non-trivial rect (an unattached placed pane just
+    /// renders empty/black, which is harmless and avoids attach-vs-rect races).
+    fn active(&self) -> bool {
+        let (_, _, w, h) = self.rect();
+        w > 1.0 && h > 1.0
+    }
 }
 
-/// Last known terminal-pane height (CSS px ≈ warpui points), reported by
-/// `term_surface_set_rect`. Used ONLY to size the scroll-back top spacer and
-/// decide whether the transcript fits — the real clip viewport comes from
-/// warpui's own layout, so an inaccurate value here can't break clipping. `0.0`
-/// means "not yet reported": render falls back to the proven bottom-anchored
-/// path (no spacer guesswork) until the first rect arrives.
-static SURFACE_H: Mutex<f32> = Mutex::new(0.0);
-
-/// Shared selection state for the shell-transcript `SelectableArea`. Persisted
-/// across the per-frame element rebuild (like the scroll handle) so a drag's
-/// head/tail survive re-renders. warpui drives it from the injected mouse events
-/// (`term_native_mouse`) and paints the highlight from it.
-static SEL_HANDLE: OnceLock<SelectionHandle> = OnceLock::new();
-fn sel_handle() -> &'static SelectionHandle {
-    SEL_HANDLE.get_or_init(SelectionHandle::default)
+/// The panes: index 0 = main column, 1 = right-panel side terminal. Created
+/// lazily before attach so the sinks and the view share the same `Pane`s.
+static PANES: OnceLock<[Pane; 2]> = OnceLock::new();
+fn panes() -> &'static [Pane; 2] {
+    PANES.get_or_init(|| [Pane::new(), Pane::new()])
+}
+/// Resolve a React pane key to its `Pane`. Anything but "side" is the main pane
+/// (so a missing/legacy key maps safely to main).
+fn pane(key: &str) -> &'static Pane {
+    &panes()[if key == "side" { 1 } else { 0 }]
+}
+/// The pane currently mirroring `pty_id`, if any (frame/block sink routing).
+fn pane_for_pty(pty_id: &str) -> Option<&'static Pane> {
+    panes().iter().find(|p| p.pty_id() == pty_id)
 }
 
-/// Latest selected transcript text, updated by the `SelectableArea` selection
-/// handler on every selection change. Read by `term_native_selection_text` for
-/// Cmd+C. `None`/empty means nothing is selected.
-static SELECTION: Mutex<Option<String>> = Mutex::new(None);
+/// Combined surface rect (window-content CSS px) = bounding box of the placed
+/// panes. The single embedded surface covers exactly this; `term_native_mouse`
+/// subtracts its origin to map window coords → surface coords. Recomputed each
+/// time a pane reports its rect. When only the main pane is placed this equals
+/// the main pane's rect (i.e. unchanged from the single-pane layout).
+static COMBINED: Mutex<(f32, f32, f32, f32)> = Mutex::new((0.0, 0.0, 0.0, 0.0));
 
-/// Height (CSS px) of the React content region — the scroll container that holds
-/// the transcript / agent grid, reported by `term_native_set_viewport`. The
-/// native surface spans the whole pane, but content is pinned to this region so
-/// it clears the surrounding React chrome (the input bar below, the AgentChrome
-/// strip above). `0.0` = not reported → fall back to the full surface height
-/// (prior behavior).
-static VIEWPORT_H: Mutex<f32> = Mutex::new(0.0);
-
-/// Top offset (CSS px) of the React content region within the pane — i.e. the
-/// height of any chrome above it (the AgentChrome strip in agent mode; ~0 for the
-/// shell). Reported alongside `VIEWPORT_H` so an agent grid pins BELOW the strip
-/// instead of rendering its top rows behind it.
-static VIEWPORT_TOP: Mutex<f32> = Mutex::new(0.0);
-
-/// React-pushed flag (`term_native_set_agent_mode`): the active pane is in
-/// agent mode — a foreground agent or alt-screen TUI owns the surface, so the
-/// React PromptInput is hidden and keystrokes go RAW to the PTY. The native
-/// live grid must keep painting while this is latched: when an agent is killed,
-/// `command_running` flips false ~1.5s before agent mode releases (the React
-/// exit debounce), and without this the shell stays alive and echoing into a
-/// grid we'd otherwise stop drawing — the "Ctrl+C doesn't come back" gap. Kept
-/// out of `TermGrid` so `term_native_attach`'s grid reset can't race it.
-static AGENT_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Recompute the combined surface rect from the placed panes and reposition the
+/// embedded child window to cover it. Main-thread reposition; safe to call from
+/// any thread (it hops via `run_on_main_thread`).
+fn reposition_surface() {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, 0.0f32, 0.0f32);
+    let mut any = false;
+    for p in panes() {
+        let (x, y, w, h) = p.rect();
+        if w > 1.0 && h > 1.0 {
+            any = true;
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + w);
+            y1 = y1.max(y + h);
+        }
+    }
+    let combined = if any {
+        (x0, y0, x1 - x0, y1 - y0)
+    } else {
+        (0.0, 0.0, 0.0, 0.0)
+    };
+    if let Ok(mut c) = COMBINED.lock() {
+        *c = combined;
+    }
+    if let Some(app) = APP_HANDLE.get() {
+        let app2 = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            use tauri::Manager as _;
+            if let Some(win) = app2.get_webview_window("main") {
+                if let Ok(parent) = win.ns_window() {
+                    warpui::platform::reposition_embedded_surface(
+                        parent,
+                        combined.0 as f64,
+                        combined.1 as f64,
+                        combined.2 as f64,
+                        combined.3 as f64,
+                    );
+                }
+            }
+        });
+    }
+}
 
 /// Tauri handle, stashed at attach for `run_on_main_thread` (sink redraw poke
 /// + commands that touch AppKit).
@@ -633,8 +695,171 @@ fn pin_region(content: Box<dyn Element>, top: f32, height: f32) -> Box<dyn Eleme
    Root view.
    ------------------------------------------------------------------ */
 
+/// Build one pane's content column from its retained grid + handles: the
+/// alt-screen full grid (top-anchored), an inline agent's bottom-anchored live
+/// grid (pinned below the AgentChrome strip), or the scroll-back shell transcript
+/// (blocks + running-command grid, pinned above the input bar). This was the body
+/// of `render` before multi-pane; now called once per visible pane, reading that
+/// pane's state. `p` is `&'static` so the selection handler closure can cache
+/// into `p.selection`.
+fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
+    let agent_on = p.agent_mode.load(std::sync::atomic::Ordering::Relaxed);
+    let (_, _, _, pane_h) = p.rect();
+    let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
+    let alt_mode = g.alt_screen;
+    let cursor_on = g.cursor_visible && g.cursor_row >= 0;
+    let cursor_row = g.cursor_row.max(0) as usize;
+    let cursor_col = g.cursor_col;
+    let n_blocks = g.blocks.len();
+
+    if alt_mode {
+        // Alt-screen: the app owns a fixed full grid, painted top-down.
+        let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(g.rows.len());
+        for (r, row) in g.rows.iter().enumerate() {
+            let cur = if cursor_on && r == cursor_row {
+                Some(cursor_col)
+            } else {
+                None
+            };
+            row_els.push(build_row(&row.spans, cur, mono));
+        }
+        Flex::column()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::Start)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(0.0)
+            .with_children(row_els)
+            .finish()
+    } else if agent_on {
+        // Agent owns the pane: live grid only, bottom-anchored, NO scroll-back.
+        let row_count = live_row_count(&g.rows, cursor_on, cursor_row);
+        let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(row_count);
+        for (r, row) in g.rows.iter().take(row_count).enumerate() {
+            let cur = if cursor_on && r == cursor_row {
+                Some(cursor_col)
+            } else {
+                None
+            };
+            row_els.push(build_row(&row.spans, cur, mono));
+        }
+        let grid = Flex::column()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::End)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(0.0)
+            .with_children(row_els)
+            .finish();
+        // Pin below the AgentChrome strip when React has reported the content
+        // region; otherwise fill the pane (prior behavior).
+        let top = *p.viewport_top.lock().unwrap_or_else(|e| e.into_inner());
+        let h = *p.viewport_h.lock().unwrap_or_else(|e| e.into_inner());
+        if h > 1.0 {
+            pin_region(grid, top, h)
+        } else {
+            grid
+        }
+    } else {
+        // Shell transcript: closed blocks (oldest first, capped) + the running
+        // command's live grid, top→bottom, wrapped for scroll-back.
+        let mut children: Vec<Box<dyn Element>> = Vec::new();
+        let mut content_est = 0.0f32;
+        let start = n_blocks.saturating_sub(BLOCK_RENDER_CAP);
+        for block in &g.blocks[start..] {
+            content_est += est_block_height(block);
+            children.push(build_block(block, mono));
+        }
+        if g.command_running {
+            let row_count = live_row_count(&g.rows, cursor_on, cursor_row);
+            content_est += row_count as f32 * LINE_PX;
+            let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(row_count);
+            for (r, row) in g.rows.iter().take(row_count).enumerate() {
+                let cur = if cursor_on && r == cursor_row {
+                    Some(cursor_col)
+                } else {
+                    None
+                };
+                row_els.push(build_row(&row.spans, cur, mono));
+            }
+            children.push(
+                Flex::column()
+                    .with_spacing(0.0)
+                    .with_children(row_els)
+                    .finish(),
+            );
+        }
+
+        let viewport = pane_h;
+        if viewport <= 1.0 {
+            // Pane height not reported yet — bottom-anchored fallback.
+            Flex::column()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::End)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_spacing(BLOCK_GAP)
+                .with_children(children)
+                .finish()
+        } else {
+            let content_vp = {
+                let vp = *p.viewport_h.lock().unwrap_or_else(|e| e.into_inner());
+                if vp > 1.0 {
+                    vp
+                } else {
+                    viewport
+                }
+            };
+            if content_est < content_vp {
+                g.stick_bottom = true;
+            } else if !g.stick_bottom && g.scroll_px > p.scroll.scroll_start().as_f32() + 1.0 {
+                g.stick_bottom = true;
+            }
+            if g.stick_bottom {
+                p.scroll.scroll_to(Pixels::new(1.0e9));
+            } else {
+                p.scroll.scroll_to(Pixels::new(g.scroll_px));
+            }
+            let spacer = (content_vp - content_est).max(0.0);
+            let mut col_children: Vec<Box<dyn Element>> = Vec::new();
+            if spacer > 0.5 {
+                col_children.push(Box::new(
+                    ConstrainedBox::new(Rect::new().finish()).with_height(spacer),
+                ));
+            }
+            col_children.extend(children);
+            let content = Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_main_axis_alignment(MainAxisAlignment::Start)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_spacing(BLOCK_GAP)
+                .with_children(col_children)
+                .finish();
+            let selectable = SelectableArea::new(
+                p.sel.clone(),
+                move |args, _ctx, _app| {
+                    *p.selection.lock().unwrap_or_else(|e| e.into_inner()) = args.selection;
+                },
+                content,
+            );
+            let scrollable = ClippedScrollable::vertical(
+                p.scroll.clone(),
+                Box::new(selectable),
+                ScrollbarWidth::None,
+                Fill::None,
+                Fill::None,
+                Fill::None,
+            )
+            .with_overlayed_scrollbar();
+            let viewport_top = *p.viewport_top.lock().unwrap_or_else(|e| e.into_inner());
+            pin_region(Box::new(scrollable), viewport_top, content_vp)
+        }
+    }
+}
+
+/* ------------------------------------------------------------------
+   Root view.
+   ------------------------------------------------------------------ */
+
+/// Stateless: reads the pane registry directly (the panes hold all state).
 pub struct TerminalRootView {
-    grid: Arc<Mutex<TermGrid>>,
     mono: FamilyId,
 }
 
@@ -649,219 +874,49 @@ impl View for TerminalRootView {
 
     fn render(&self, _: &AppContext) -> Box<dyn Element> {
         let t0 = Instant::now();
+        let ps = panes();
+        let main = &ps[0];
+        let side = &ps[1];
 
-        let (frames, n_rows, n_cols, n_blocks, rendered_blocks, live_on, alt_mode, agent_on);
-        let column: Box<dyn Element>;
-        {
-            let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
-            frames = g.frames;
-            n_rows = g.rows.len();
-            n_cols = g.n_cols;
-            n_blocks = g.blocks.len();
-
-            agent_on = AGENT_MODE.load(std::sync::atomic::Ordering::Relaxed);
-            alt_mode = g.alt_screen;
-            // Command output (shell or an inline agent like claude) and the shell
-            // prompt all flow UPWARD — newest at the bottom — so everything is
-            // bottom-anchored like a real terminal. The one exception is a
-            // full-screen alt-screen app (vim/htop), which paints a fixed grid
-            // from the top.
-            live_on = g.command_running || agent_on || alt_mode;
-
-            let cursor_on = g.cursor_visible && g.cursor_row >= 0;
-            let cursor_row = g.cursor_row.max(0) as usize;
-            let cursor_col = g.cursor_col;
-
-            if alt_mode {
-                // Alt-screen: the app owns a fixed full grid, painted top-down.
-                rendered_blocks = 0;
-                let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(g.rows.len());
-                for (r, row) in g.rows.iter().enumerate() {
-                    let cur = if cursor_on && r == cursor_row {
-                        Some(cursor_col)
-                    } else {
-                        None
-                    };
-                    row_els.push(build_row(&row.spans, cur, self.mono));
-                }
-                column = Flex::column()
-                    .with_main_axis_size(MainAxisSize::Max)
-                    .with_main_axis_alignment(MainAxisAlignment::Start)
-                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                    .with_spacing(0.0)
-                    .with_children(row_els)
-                    .finish();
-            } else if agent_on {
-                // Agent owns the pane: live grid only, bottom-anchored, NO
-                // scroll-back. An agent TUI (claude/codex) redraws within the
-                // viewport rather than growing a transcript, so there's nothing to
-                // scroll — this keeps the proven inline-agent path untouched.
-                rendered_blocks = 0;
-                let row_count = live_row_count(&g.rows, cursor_on, cursor_row);
-                let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(row_count);
-                for (r, row) in g.rows.iter().take(row_count).enumerate() {
-                    let cur = if cursor_on && r == cursor_row {
-                        Some(cursor_col)
-                    } else {
-                        None
-                    };
-                    row_els.push(build_row(&row.spans, cur, self.mono));
-                }
-                let grid = Flex::column()
-                    .with_main_axis_size(MainAxisSize::Max)
-                    .with_main_axis_alignment(MainAxisAlignment::End)
-                    .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                    .with_spacing(0.0)
-                    .with_children(row_els)
-                    .finish();
-                // Pin below the AgentChrome strip when React has reported the
-                // content region; otherwise fill the surface (prior behavior).
-                let top = *VIEWPORT_TOP.lock().unwrap_or_else(|e| e.into_inner());
-                let h = *VIEWPORT_H.lock().unwrap_or_else(|e| e.into_inner());
-                column = if h > 1.0 { pin_region(grid, top, h) } else { grid };
-            } else {
-                // Shell transcript: closed blocks (oldest first, capped) + the
-                // running command's live grid, in document order (top→bottom),
-                // wrapped for scroll-back. Estimate content height as we build so
-                // we can size the bottom-anchoring top spacer.
-                let mut children: Vec<Box<dyn Element>> = Vec::new();
-                let mut content_est = 0.0f32;
-
-                let start = n_blocks.saturating_sub(BLOCK_RENDER_CAP);
-                rendered_blocks = n_blocks - start;
-                for block in &g.blocks[start..] {
-                    content_est += est_block_height(block);
-                    children.push(build_block(block, self.mono));
-                }
-                if g.command_running {
-                    let row_count = live_row_count(&g.rows, cursor_on, cursor_row);
-                    content_est += row_count as f32 * LINE_PX;
-                    let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(row_count);
-                    for (r, row) in g.rows.iter().take(row_count).enumerate() {
-                        let cur = if cursor_on && r == cursor_row {
-                            Some(cursor_col)
-                        } else {
-                            None
-                        };
-                        row_els.push(build_row(&row.spans, cur, self.mono));
-                    }
-                    children.push(
-                        Flex::column()
-                            .with_spacing(0.0)
-                            .with_children(row_els)
-                            .finish(),
-                    );
-                }
-
-                let viewport = *SURFACE_H.lock().unwrap_or_else(|e| e.into_inner());
-                if viewport <= 1.0 {
-                    // Pane height not reported yet — use the proven bottom-anchored
-                    // path (the real layout constraint anchors it without a spacer
-                    // guess). Scroll-back arms once the first rect arrives.
-                    column = Flex::column()
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_main_axis_alignment(MainAxisAlignment::End)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                        .with_spacing(BLOCK_GAP)
-                        .with_children(children)
-                        .finish();
-                } else {
-                    // Pin the transcript to the region ABOVE the input bar
-                    // (content_vp), not the full surface, so the newest block lands
-                    // right above the input like Warp. Falls back to the full
-                    // surface height until React reports the transcript region.
-                    let content_vp = {
-                        let vp = *VIEWPORT_H.lock().unwrap_or_else(|e| e.into_inner());
-                        if vp > 1.0 {
-                            vp
-                        } else {
-                            viewport
-                        }
-                    };
-                    // Content shorter than the viewport always sticks to the bottom
-                    // (nothing to scroll). Otherwise re-arm stick if a downward
-                    // scroll overshot the clamped bottom last frame (scroll_px got
-                    // pulled in by `after_layout`).
-                    if content_est < content_vp {
-                        g.stick_bottom = true;
-                    } else if !g.stick_bottom
-                        && g.scroll_px > scroll_handle().scroll_start().as_f32() + 1.0
-                    {
-                        g.stick_bottom = true;
-                    }
-                    if g.stick_bottom {
-                        // Huge sentinel — `after_layout` clamps it to the true
-                        // bottom, pinning the newest line and auto-following output.
-                        scroll_handle().scroll_to(Pixels::new(1.0e9));
-                    } else {
-                        scroll_handle().scroll_to(Pixels::new(g.scroll_px));
-                    }
-
-                    // Top spacer pushes short content down so it bottom-anchors like
-                    // a terminal (warpui's Flex can't bottom-align under the
-                    // unbounded-height constraint a scrollable hands its child).
-                    let spacer = (content_vp - content_est).max(0.0);
-                    let mut col_children: Vec<Box<dyn Element>> = Vec::new();
-                    if spacer > 0.5 {
-                        col_children.push(Box::new(
-                            ConstrainedBox::new(Rect::new().finish()).with_height(spacer),
-                        ));
-                    }
-                    col_children.extend(children);
-                    let content = Flex::column()
-                        .with_main_axis_size(MainAxisSize::Min)
-                        .with_main_axis_alignment(MainAxisAlignment::Start)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                        .with_spacing(BLOCK_GAP)
-                        .with_children(col_children)
-                        .finish();
-                    // Wrap the transcript so warpui's own selection runs on it:
-                    // injected mouse events (term_native_mouse) drive head/tail,
-                    // the descendant Text paints the highlight from
-                    // ctx.current_selection, and the handler caches the extracted
-                    // text for Cmd+C. Sits INSIDE the scrollable, so the scroll
-                    // offset cancels in the coordinate math (injected viewport px
-                    // hit the right glyphs at a fixed scroll position).
-                    let selectable = SelectableArea::new(
-                        sel_handle().clone(),
-                        |args, _ctx, _app| {
-                            *SELECTION.lock().unwrap_or_else(|e| e.into_inner()) = args.selection;
-                        },
-                        content,
-                    );
-                    let scrollable = ClippedScrollable::vertical(
-                        scroll_handle().clone(),
-                        Box::new(selectable),
-                        ScrollbarWidth::None,
-                        Fill::None,
-                        Fill::None,
-                        Fill::None,
-                    )
-                    .with_overlayed_scrollbar();
-                    // Constrain the scrollable to the transcript region and anchor
-                    // it to the TOP of the surface; the rest of the surface
-                    // (content_vp..full height) stays black behind the React input
-                    // bar + status strip. When content_vp == full surface (no rect
-                    // reported yet) this is the whole surface, i.e. prior behavior.
-                    let viewport_top = *VIEWPORT_TOP.lock().unwrap_or_else(|e| e.into_inner());
-                    column = pin_region(Box::new(scrollable), viewport_top, content_vp);
-                }
+        let main_col = build_pane_column(main, self.mono);
+        let side_on = side.active();
+        let column: Box<dyn Element> = if side_on {
+            // Both panes visible (the right-panel split is open). The surface
+            // covers the combined bounding box; lay the panes side-by-side by
+            // width (they share the AppShell row's top + height), with the gap
+            // between them (the React divider) left black.
+            let (mx, _my, mw, _mh) = main.rect();
+            let (sx, _sy, sw, _sh) = side.rect();
+            let gap = (sx - (mx + mw)).max(0.0);
+            let side_col = build_pane_column(side, self.mono);
+            let mut kids: Vec<Box<dyn Element>> = Vec::new();
+            kids.push(Box::new(ConstrainedBox::new(main_col).with_width(mw.max(1.0))));
+            if gap > 0.5 {
+                kids.push(Box::new(
+                    ConstrainedBox::new(Rect::new().finish()).with_width(gap),
+                ));
             }
-        }
+            kids.push(Box::new(ConstrainedBox::new(side_col).with_width(sw.max(1.0))));
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_children(kids)
+                .finish()
+        } else {
+            main_col
+        };
 
         let root = Stack::new()
             .with_child(Rect::new().with_background_color(ColorU::black()).finish())
             .with_child(column)
             .finish();
 
-        // Diagnostic: confirm frames/blocks flow and measure build cost.
-        // Steady-state build must stay well under the frame budget.
         use std::sync::atomic::{AtomicU64, Ordering};
         static RENDERS: AtomicU64 = AtomicU64::new(0);
         let n = RENDERS.fetch_add(1, Ordering::Relaxed);
         if n < 5 || n % 120 == 0 {
             eprintln!(
-                "[warpui] render #{n}: frames={frames} grid={n_cols}x{n_rows} blocks={rendered_blocks}/{n_blocks} live={live_on} alt={alt_mode} agent={agent_on} build={:.2}ms",
+                "[warpui] render #{n}: side={side_on} build={:.2}ms",
                 t0.elapsed().as_secs_f64() * 1000.0
             );
         }
@@ -898,26 +953,18 @@ pub fn attach(app: &tauri::AppHandle) {
     // Register the frame sink BEFORE any pty starts. Runs on the PTY reader
     // thread: patch the shared grid, then poke a redraw on the main thread.
     let app_for_sink = app.clone();
-    crate::term::set_native_frame_sink(Box::new(move |_pty_id: &str, frame: &RenderFrame| {
-        let (rows, cols);
-        {
-            let mut g = grid().lock().unwrap_or_else(|e| e.into_inner());
+    crate::term::set_native_frame_sink(Box::new(move |pty_id: &str, frame: &RenderFrame| {
+        // Route the frame to whichever pane mirrors this pty (main or side).
+        if let Some(p) = pane_for_pty(pty_id) {
+            let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
             g.apply_frame(frame);
-            rows = g.rows.len();
-            cols = g.n_cols;
         }
+        let _ = app_for_sink.run_on_main_thread(|| {
+            warpui::platform::poke_embedded_redraw();
+        });
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        if n < 12 {
-            eprintln!("[warpui] sink#{n}: applied frame -> grid={cols}x{rows}, poking redraw");
-        }
-        let r = app_for_sink.run_on_main_thread(|| {
-            warpui::platform::poke_embedded_redraw();
-        });
-        if n < 12 {
-            eprintln!("[warpui] sink#{n}: run_on_main_thread ok={}", r.is_ok());
-        }
         // Dev-only off-screen snapshot, gated behind WARP_CAPTURE (off by
         // default). The PNG encode + disk write runs on the main thread, so
         // leaving it on injects a periodic multi-ms hitch during output bursts —
@@ -938,9 +985,9 @@ pub fn attach(app: &tauri::AppHandle) {
     // Block sink: append each finished command block to the shared model and
     // poke a redraw. Runs on the PTY reader thread, like the frame sink.
     let app_for_block = app.clone();
-    crate::term::set_native_block_sink(Box::new(move |_pty_id: &str, block: &ClosedBlock| {
-        {
-            let mut g = grid().lock().unwrap_or_else(|e| e.into_inner());
+    crate::term::set_native_block_sink(Box::new(move |pty_id: &str, block: &ClosedBlock| {
+        if let Some(p) = pane_for_pty(pty_id) {
+            let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
             g.blocks.push(NativeBlock {
                 command: block.input.clone(),
                 rows: block.block_rows.clone(),
@@ -967,10 +1014,7 @@ pub fn attach(app: &tauri::AppHandle) {
     .attach_embedded(parent, |ctx| {
         let (window_id, _view) = ctx.add_window(warpui::AddWindowOptions::default(), |cx| {
             let mono = load_mono(cx);
-            TerminalRootView {
-                grid: grid().clone(),
-                mono,
-            }
+            TerminalRootView { mono }
         });
         if let Ok(mut w) = CAPTURE_WID.lock() {
             *w = Some(window_id);
@@ -991,7 +1035,7 @@ pub fn attach(app: &tauri::AppHandle) {
             loop {
                 std::thread::sleep(Duration::from_millis(500));
                 waited += 500;
-                let h = *SURFACE_H.lock().unwrap_or_else(|e| e.into_inner());
+                let h = pane("main").rect().3;
                 if (h > 50.0 && waited >= 2000) || waited > 9000 {
                     break;
                 }
@@ -1001,18 +1045,19 @@ pub fn attach(app: &tauri::AppHandle) {
             // render would stay on the no-selection fallback path. Force a
             // viewport so the SelectableArea path engages, then repaint before
             // injecting. (In real use the window is focused and set_rect fires.)
+            let mp = pane("main");
             let h = {
-                let mut g = SURFACE_H.lock().unwrap_or_else(|e| e.into_inner());
-                if *g <= 50.0 {
-                    *g = 800.0;
+                let mut r = mp.rect.lock().unwrap_or_else(|e| e.into_inner());
+                if r.3 <= 50.0 {
+                    *r = (0.0, 0.0, 800.0, 800.0);
                 }
-                *g as f64
+                r.3 as f64
             };
             // Also simulate the transcript region (above the input bar) at 80% of
             // the surface, so the test exercises the Warp-style bottom inset:
             // content should occupy only the top `vp` px, the rest black.
             let vp = {
-                let mut g = VIEWPORT_H.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = mp.viewport_h.lock().unwrap_or_else(|e| e.into_inner());
                 if *g <= 50.0 {
                     *g = (h * 0.8) as f32;
                 }
@@ -1043,7 +1088,8 @@ pub fn attach(app: &tauri::AppHandle) {
                 std::thread::sleep(Duration::from_millis(150));
             }
             std::thread::sleep(Duration::from_millis(200));
-            let sel = SELECTION
+            let sel = mp
+                .selection
                 .lock()
                 .ok()
                 .and_then(|g| g.clone())
@@ -1059,48 +1105,46 @@ pub fn attach(app: &tauri::AppHandle) {
     }
 }
 
-/// Tauri command: position the embedded surface over the terminal pane's rect
-/// (CSS px from the webview top-left), reported by `WarpSurfaceTracker`.
+/// Tauri command: report a pane's on-screen rect (CSS px from the webview
+/// top-left), reported by each pane's `WarpSurfaceTracker`. Stored per pane; the
+/// single embedded surface is then repositioned to cover the combined bounding
+/// box of all placed panes (just the main pane's rect when the side is closed).
 #[tauri::command]
-pub fn term_surface_set_rect(app: tauri::AppHandle, x: f64, y: f64, width: f64, height: f64) {
-    use tauri::Manager as _;
-    {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        if n < 8 {
-            eprintln!("[warpui] term_surface_set_rect#{n}: css=({x},{y}) {width}x{height}");
-        }
+pub fn term_surface_set_rect(pane_key: String, x: f64, y: f64, width: f64, height: f64) {
+    let p = pane(&pane_key);
+    if let Ok(mut r) = p.rect.lock() {
+        *r = (x as f32, y as f32, width as f32, height as f32);
     }
-    // Stash the pane height for the scroll-back spacer / fit decision (render
-    // reads it; the real clip viewport still comes from warpui's layout).
-    if let Ok(mut h) = SURFACE_H.lock() {
-        *h = height as f32;
+    reposition_surface();
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
     }
-    let app2 = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Some(win) = app2.get_webview_window("main") {
-            if let Ok(parent) = win.ns_window() {
-                warpui::platform::reposition_embedded_surface(parent, x, y, width, height);
-            } else {
-                eprintln!("[warpui] term_surface_set_rect: ns_window() failed");
-            }
-        } else {
-            eprintln!("[warpui] term_surface_set_rect: no main webview window");
-        }
-    });
 }
 
 /// Tauri command: point the native surface at `id`'s pty (the active terminal
 /// tab). Clears the retained grid so the prior pty's content can't bleed
 /// through before the new pty's first frame / `term_start` re-emit arrives.
 #[tauri::command]
-pub fn term_native_attach(id: String, state: tauri::State<crate::term::TerminalState>) {
+pub fn term_native_attach(
+    pane_key: String,
+    id: String,
+    state: tauri::State<crate::term::TerminalState>,
+) {
     use tauri::Manager as _;
-    eprintln!("[warpui] term_native_attach: id={id}");
+    eprintln!("[warpui] term_native_attach: pane={pane_key} id={id}");
+    let p = pane(&pane_key);
+    // Stop mirroring this pane's previous pty, then mirror the new one.
+    let prev = p.pty_id();
+    if !prev.is_empty() && prev != id {
+        crate::term::clear_native_pty(&prev);
+    }
+    if let Ok(mut g) = p.pty.lock() {
+        g.clear();
+        g.push_str(&id);
+    }
     crate::term::set_native_pty(&id);
     {
-        let mut g = grid().lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
         *g = TermGrid::empty();
     }
     // Rehydrate saved closed blocks so history survives tab switches and
@@ -1111,7 +1155,7 @@ pub fn term_native_attach(id: String, state: tauri::State<crate::term::TerminalS
         if let Ok(dir) = app.path().app_data_dir() {
             if let Ok(saved) = crate::persistence::load_blocks(&dir.join("goonware.db"), &id) {
                 if !saved.is_empty() {
-                    let mut g = grid().lock().unwrap_or_else(|e| e.into_inner());
+                    let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
                     g.blocks = saved
                         .into_iter()
                         .map(|sb| NativeBlock {
@@ -1138,8 +1182,25 @@ pub fn term_native_attach(id: String, state: tauri::State<crate::term::TerminalS
 /// Tauri command: stop mirroring any pty (a non-terminal tab is active). The
 /// surface is also hidden via a zero rect by `WarpSurfaceTracker`.
 #[tauri::command]
-pub fn term_native_detach() {
-    crate::term::set_native_pty("");
+pub fn term_native_detach(pane_key: String) {
+    let p = pane(&pane_key);
+    let prev = p.pty_id();
+    if !prev.is_empty() {
+        crate::term::clear_native_pty(&prev);
+    }
+    if let Ok(mut g) = p.pty.lock() {
+        g.clear();
+    }
+    if let Ok(mut r) = p.rect.lock() {
+        *r = (0.0, 0.0, 0.0, 0.0);
+    }
+    if let Ok(mut g) = p.grid.lock() {
+        *g = TermGrid::empty();
+    }
+    reposition_surface();
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
+    }
 }
 
 /// Tauri command: report whether the active pane is in agent mode (foreground
@@ -1147,8 +1208,10 @@ pub fn term_native_detach() {
 /// grid painting across the agent-exit debounce so a killed agent's shell
 /// prompt stays visible — see `AGENT_MODE`.
 #[tauri::command]
-pub fn term_native_set_agent_mode(active: bool) {
-    AGENT_MODE.store(active, std::sync::atomic::Ordering::Relaxed);
+pub fn term_native_set_agent_mode(pane_key: String, active: bool) {
+    pane(&pane_key)
+        .agent_mode
+        .store(active, std::sync::atomic::Ordering::Relaxed);
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
     }
@@ -1163,10 +1226,11 @@ pub fn term_native_set_agent_mode(active: bool) {
 /// the content fits. No-op effect in alt-screen / agent mode (render ignores the
 /// offset there).
 #[tauri::command]
-pub fn term_native_scroll(delta_px: f64) {
+pub fn term_native_scroll(pane_key: String, delta_px: f64) {
+    let p = pane(&pane_key);
     {
-        let mut g = grid().lock().unwrap_or_else(|e| e.into_inner());
-        let cur = scroll_handle().scroll_start().as_f32();
+        let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
+        let cur = p.scroll.scroll_start().as_f32();
         g.scroll_px = (cur + delta_px as f32).max(0.0);
         g.stick_bottom = false;
     }
@@ -1176,12 +1240,11 @@ pub fn term_native_scroll(delta_px: f64) {
 }
 
 /// Tauri command: forward a left-mouse event (captured by the React overlay over
-/// the transparent pane) into the native surface, so warpui's normal hit-testing
-/// + selection machinery runs on it. The embedded child window has
-/// `ignoresMouseEvents: YES`, so these events never reach warpui natively — React
-/// relays them. `kind` is "down" | "drag" | "up"; `(x, y)` are CSS px relative to
-/// the pane top-left, which equals the surface's top-left logical points. No-op
-/// until the surface is attached.
+/// the transparent pane) into the native surface, so warpui's hit-testing +
+/// selection runs on it. `(x, y)` are WINDOW-content CSS px (clientX/clientY);
+/// we subtract the combined surface origin to get surface-local coords, so the
+/// event lands in the correct pane's region (warpui hit-tests by position). No
+/// pane key needed — the coordinates route it.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn term_native_mouse(
@@ -1197,6 +1260,11 @@ pub fn term_native_mouse(
     let Some(wid) = CAPTURE_WID.lock().ok().and_then(|g| *g) else {
         return;
     };
+    let (ox, oy) = COMBINED
+        .lock()
+        .map(|c| (c.0 as f64, c.1 as f64))
+        .unwrap_or((0.0, 0.0));
+    let (sx, sy) = (x - ox, y - oy);
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.run_on_main_thread(move || {
             use warpui::platform::EmbeddedMouseKind as K;
@@ -1205,23 +1273,11 @@ pub fn term_native_mouse(
                 "drag" => K::Dragged,
                 _ => K::Up,
             };
-            // Diagnostic (first few only): confirm the inject path end-to-end
-            // before selection rendering is wired.
-            {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static N: AtomicU32 = AtomicU32::new(0);
-                let n = N.fetch_add(1, Ordering::Relaxed);
-                if n < 12 {
-                    eprintln!(
-                        "[warpui] term_native_mouse#{n}: {kind} ({x},{y}) clicks={click_count}"
-                    );
-                }
-            }
             warpui::platform::dispatch_embedded_mouse(
                 wid,
                 k,
-                x,
-                y,
+                sx,
+                sy,
                 click_count,
                 shift,
                 cmd,
@@ -1237,8 +1293,9 @@ pub fn term_native_mouse(
 /// reads this on Cmd+C in the shell and writes it to the clipboard via the
 /// existing pbcopy path.
 #[tauri::command]
-pub fn term_native_selection_text() -> Option<String> {
-    SELECTION
+pub fn term_native_selection_text(pane_key: String) -> Option<String> {
+    pane(&pane_key)
+        .selection
         .lock()
         .ok()
         .and_then(|g| g.clone())
@@ -1250,11 +1307,12 @@ pub fn term_native_selection_text() -> Option<String> {
 /// native shell transcript to this region so the newest block lands just above
 /// the input (Warp layout) instead of behind it.
 #[tauri::command]
-pub fn term_native_set_viewport(top: f64, height: f64) {
-    if let Ok(mut t) = VIEWPORT_TOP.lock() {
+pub fn term_native_set_viewport(pane_key: String, top: f64, height: f64) {
+    let p = pane(&pane_key);
+    if let Ok(mut t) = p.viewport_top.lock() {
         *t = top as f32;
     }
-    if let Ok(mut h) = VIEWPORT_H.lock() {
+    if let Ok(mut h) = p.viewport_h.lock() {
         *h = height as f32;
     }
     if let Some(app) = APP_HANDLE.get() {
