@@ -1101,6 +1101,40 @@ pub fn attach(app: &tauri::AppHandle) {
                     Box::new(|frame| save_capture_png(&frame, "/tmp/warpui_selftest.png")),
                 );
             });
+            std::thread::sleep(Duration::from_millis(300));
+
+            // Two-pane layout check: shrink main and place a (content-less) side
+            // pane to its right, reposition the surface to the combined box, and
+            // capture — verifies the Flex::row side-by-side render + combined
+            // surface geometry that real multi-pane (right panel open) exercises.
+            {
+                let mp = pane("main");
+                if let Ok(mut r) = mp.rect.lock() {
+                    *r = (0.0, 0.0, 500.0, 800.0);
+                }
+                let sp = pane("side");
+                if let Ok(mut g) = sp.pty.lock() {
+                    g.clear();
+                    g.push_str("selftest-side");
+                }
+                if let Ok(mut r) = sp.rect.lock() {
+                    *r = (508.0, 0.0, 300.0, 800.0);
+                }
+                reposition_surface();
+                let _ =
+                    app_for_test.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
+                std::thread::sleep(Duration::from_millis(400));
+                eprintln!("[selftest] two-pane: main(0,0,500,800) + side(508,0,300,800)");
+                if let Some(wid) = CAPTURE_WID.lock().ok().and_then(|g| *g) {
+                    let _ = app_for_test.run_on_main_thread(move || {
+                        warpui::platform::capture_embedded(
+                            wid,
+                            Box::new(|frame| save_capture_png(&frame, "/tmp/warpui_twopane.png")),
+                        );
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
         });
     }
 }

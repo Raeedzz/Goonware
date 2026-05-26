@@ -24,6 +24,7 @@ import { git, type StatusEntry } from "@/lib/git";
 import { FileTree } from "@/files/FileTree";
 import { paneSlotStyle } from "./paneSlotLayout";
 import { BlockTerminal } from "@/terminal/BlockTerminal";
+import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
 import { useToast } from "@/primitives/Toast";
 import { Loader } from "@/primitives/Loader";
 import { BrowserPane } from "@/browser/BrowserPane";
@@ -1757,6 +1758,10 @@ function SecondaryTerminals({ worktree }: { worktree: Worktree }) {
         inset: 0,
       }}
     >
+      {/* Reports the side pane's rect to the native surface (paneKey="side") so
+          the embedded surface expands to cover the main column + this panel and
+          renders the active side terminal here. */}
+      <WarpSurfaceTracker paneKey="side" visible={!!active} />
       {list.map((ptyId) => {
         const isActive = ptyId === active;
         return (
@@ -1776,6 +1781,12 @@ function SecondaryTerminals({ worktree }: { worktree: Worktree }) {
               cwd={worktree.path}
               projectId={worktree.projectId}
               sessionId={`${worktree.id}:${ptyId}`}
+              // The ACTIVE side terminal drives the native "side" pane on the
+              // shared embedded surface (alongside the main column); inactive
+              // ones stay on the React/WebGPU path while hidden. Only one side
+              // terminal is visible at a time, so only it mirrors "side".
+              nativeSurface={isActive}
+              paneKey="side"
               // Forward visibility so only the active side terminal
               // owns its window-level Cmd+C / Ctrl+C / drag-drop
               // listeners. Without this gate, every hidden secondary
