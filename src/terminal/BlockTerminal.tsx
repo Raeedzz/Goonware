@@ -1158,18 +1158,22 @@ export function BlockTerminal({
       // the pane width on every sidebar / right-panel resize, like Warp.
       const cellWidth = 13 * (nativeSurface ? 0.6 : 0.66);
       const visibleRows = Math.max(8, Math.floor(usableHeight / cellHeight));
-      // Warp gives a foregrounded agent the FULL terminal height — the
-      // agent's own TUI (scrollable conversation + input box pinned to the
-      // bottom) fills the pane. The native surface bottom-anchors the agent
-      // grid to the whole pane, so capping the PTY to 12 rows left the agent
-      // as a ~200px block floating at the bottom with ~580px of black above
-      // it — the "claude renders half the pane / spawns broken" report. So on
-      // native panes the agent gets the full viewport, exactly like Warp.
+      // Warp gives a foregrounded agent the FULL terminal height on a
+      // NATIVE pane — the agent's own TUI (scrollable conversation + input
+      // box pinned to the bottom) fills the pane. The native surface
+      // bottom-anchors the agent grid to the whole pane, so capping the PTY
+      // left the agent as a short block floating at the bottom with black
+      // space above it — the "claude renders half the pane / spawns broken"
+      // report. So on native panes the agent gets the full viewport, exactly
+      // like Warp.
       //
       // Non-native (right-panel CanvasGrid) agents keep the bounded block:
-      // their canvas lives inside a scroll container tuned around that cap, so
-      // changing it there is a separate concern.
-      const AGENT_PTY_MAX_ROWS = 12;
+      // their canvas lives inside a scroll container tuned around the cap.
+      // 17 rows leaves room for ~9 slash-command picker items above Claude's
+      // ~8 rows of chrome (input box, status footer, hint, picker
+      // header/footer); arrow keys scroll within the picker for the rest
+      // (cap raised from 12 → 17 on main, #44).
+      const AGENT_PTY_MAX_ROWS = 17;
       const rows =
         foregroundIsAgent && !nativeSurface
           ? Math.min(visibleRows, AGENT_PTY_MAX_ROWS)
