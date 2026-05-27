@@ -12,7 +12,6 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { joinShellPaths } from "@/lib/shellQuote";
 import { BlockList } from "./BlockList";
 import { AgentChrome, AGENT_CHROME_HEIGHT_PX } from "./AgentChrome";
-import { CellRow } from "./CellRow";
 import { LiveBlock } from "./LiveBlock";
 import { PromptInput, type PromptInputHandle } from "./PromptInput";
 import { PtyPassthrough, type PtyPassthroughHandle } from "./PtyPassthrough";

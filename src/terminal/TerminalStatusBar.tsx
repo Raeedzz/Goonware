@@ -67,7 +67,11 @@ export function TerminalStatusBar({ cwd, command, readonly = false }: Props) {
         alignItems: "center",
         gap: "var(--space-2)",
         padding: "var(--space-2) var(--space-3)",
-        backgroundColor: "var(--surface-0)",
+        // surface-1 (not -0): the input tray reads as a distinct chrome strip
+        // over the terminal's pure-black native surface. At surface-0 (a 7%
+        // step off black) the tray visually vanished — the "where's my input
+        // box" report. The borderTop hairline separates it from the output.
+        backgroundColor: "var(--surface-1)",
         borderTop: "var(--border-1)",
         fontFamily: "var(--font-sans)",
         fontSize: "var(--text-2xs)",
