@@ -18,6 +18,8 @@
 /// Per-feature plumbing lives in `crate::*` modules — registered below.
 #[cfg(target_os = "macos")]
 mod browser;
+#[cfg(target_os = "macos")]
+mod warp_term;
 mod agent_hooks;
 mod block_id;
 mod claude_usage;
@@ -142,6 +144,17 @@ pub fn run() {
             agent_hooks::install_hooks();
             agent_hooks::start_socket_server(app.handle().clone());
 
+            // Native terminal migration (M0 spike): stand up an embedded
+            // warpui render surface under Tauri's run loop (no second
+            // [NSApp run]). v0 renders a solid surface to prove the
+            // runtime works embedded; the grid renderer (fed by term.rs
+            // RenderFrames) lands in M1.
+            eprintln!("[warpui] attaching embedded surface…");
+            // Hand warpui the app handle: it reparents its surface into the
+            // Goonware window (host NSWindow) and registers the in-process
+            // frame sink so term.rs frames drive the native grid directly.
+            warp_term::attach(app.handle());
+
             Ok(())
         });
 
@@ -163,6 +176,7 @@ pub fn run() {
             // Terminal (alacritty_terminal + custom React renderer)
             term::term_start,
             term::term_input,
+            term::term_native_wheel,
             term::term_resize,
             term::term_reset_grid,
             term::term_close,
@@ -242,6 +256,24 @@ pub fn run() {
             browser::browser_bound_port,
             #[cfg(target_os = "macos")]
             browser::browser_restart,
+            #[cfg(target_os = "macos")]
+            warp_term::term_surface_set_rect,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_attach,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_detach,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_set_agent_mode,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_scroll,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_hscroll,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_mouse,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_selection_text,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_set_viewport,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Goonware");
@@ -664,32 +696,6 @@ mod clipboard_handler_gating_tests {
     }
 
     #[test]
-    fn canvas_grid_cmd_c_bails_on_focused_editable() {
-        // The window-level Cmd+C handler in CanvasGrid would
-        // otherwise steal Cmd+C anywhere on the page whenever a
-        // canvas selection ref was stale (user dragged once in a
-        // closed agent block, never clicked away to clear it).
-        // Pin the active-element bailout: when focus is on a real
-        // editable, the canvas handler must return before
-        // preventDefault.
-        let src = read_repo_file("src/terminal/CanvasGrid.tsx");
-        assert!(
-            src.contains("document.activeElement"),
-            "CanvasGrid.tsx window-level Cmd+C handler must check \
-             `document.activeElement` and bail when focus is on a \
-             real editable. Otherwise a stale canvas selection \
-             steals Cmd+C from the file editor / commit composer / \
-             side terminal."
-        );
-        assert!(
-            src.contains("isContentEditable"),
-            "CanvasGrid.tsx Cmd+C handler must use `isContentEditable` \
-             so CodeMirror / TipTap focus correctly suppresses the \
-             canvas-selection copy path."
-        );
-    }
-
-    #[test]
     fn secondary_terminals_forward_is_visible() {
         // The fix from 4856c46 — pin that the right-panel side
         // terminals still forward `isVisible={isActive}` to their
@@ -878,77 +884,6 @@ mod clipboard_handler_gating_tests {
                 path,
             );
         }
-    }
-
-    #[test]
-    fn canvas_grid_visibility_restore_is_wired() {
-        // The black-screen fix chain. The user reports the screen
-        // going black:
-        //   - On `/model` selection inside Claude
-        //   - On switching to editor / diff / markdown and back
-        //   - On worktree switch
-        //   - Randomly mid-prompt-stream
-        //
-        // Root cause (memory observation 650): WKWebView releases
-        // the GPU swapchain for `display: none`-hosted canvases
-        // without firing `device.lost`. The fix is a multi-layer
-        // visibility-restore that re-calls `context.configure(...)`
-        // on hidden→visible and on resize. These grep-tests pin
-        // every load-bearing piece.
-        let grid_renderer =
-            read_repo_file("src/terminal/gpu/GridRenderer.ts");
-        assert!(
-            grid_renderer.contains("reconfigure(): void"),
-            "GridRenderer must expose a `reconfigure()` method that \
-             re-calls context.configure(...). Without it, a canvas \
-             hidden under `display: none` never recovers its GPU \
-             swapchain when the user comes back — the entire pane \
-             stays black."
-        );
-        // The configure call must include `alphaMode` so a future
-        // descriptor change can't silently break transparency
-        // handling.
-        assert!(
-            grid_renderer.contains("alphaMode: \"premultiplied\""),
-            "GridRenderer.reconfigure / resize must pass \
-             `alphaMode: \"premultiplied\"` to context.configure — \
-             matches the bootstrap descriptor exactly so the \
-             swapchain shape doesn't change between configures."
-        );
-        let canvas_grid = read_repo_file("src/terminal/CanvasGrid.tsx");
-        assert!(
-            canvas_grid.contains("renderer.reconfigure()"),
-            "CanvasGrid must call `renderer.reconfigure()` on the \
-             hidden→visible transition. The visibility-restore state \
-             machine in gpu/visibilityRestore.ts encodes the call \
-             order (reconfigure → resize → invalidate → paint) — drop \
-             the reconfigure and the visibility-restore lands on a \
-             dead surface."
-        );
-        // Pin the ResizeObserver 0×0 bail. Without it, the keepalive's
-        // display:none transition shrinks the GPU backbuffer to 1×1
-        // physical pixels — and the next show can't recover because
-        // the canvas's CSS style.width/height was also clobbered to
-        // ~0.5 CSS px.
-        assert!(
-            canvas_grid.contains("rect.width === 0 || rect.height === 0"),
-            "CanvasGrid's ResizeObserver must bail on a 0×0 contentRect. \
-             Without this guard, `display: none` shrinks the renderer \
-             backbuffer to 1×1 and the next visibility tick paints \
-             into a tiny surface — black pane."
-        );
-        let visibility_restore =
-            read_repo_file("src/terminal/gpu/visibilityRestore.ts");
-        assert!(
-            visibility_restore.contains("decideVisibilityAction")
-                && visibility_restore.contains("executeVisibilityAction"),
-            "gpu/visibilityRestore.ts must export BOTH \
-             `decideVisibilityAction` and `executeVisibilityAction`. \
-             The exhaustive unit tests in \
-             gpu/visibilityRestore.test.ts only protect the contract \
-             if these exports exist — a refactor that inlines them \
-             back into CanvasGrid silently bypasses every test."
-        );
     }
 
     #[test]

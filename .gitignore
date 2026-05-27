@@ -1,5 +1,8 @@
 # Rust / Cargo
-debug
+# NOTE: no bare `debug` rule here — as a pattern with no slash it matches
+# any path named `debug` at any depth, which silently excluded vendored
+# source (warpui_core/src/debug/) and broke the CI build. Cargo build
+# output lives under target/ (below), which already covers target/debug.
 target
 **/*.rs.bk
 *.pdb

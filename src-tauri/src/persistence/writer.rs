@@ -71,11 +71,11 @@ pub struct SavedBlockPayload {
     pub duration_ms: Option<i64>,
 }
 
-/// How many of the most-recent blocks to keep per pty_id before
-/// evicting the oldest. Matches the front-end's `MAX_BLOCKS` in
-/// `sessionMemory.ts` — there's no point keeping rows on disk that
-/// the renderer would slice off on load anyway.
-const MAX_BLOCKS_PER_PTY: i64 = 500;
+// Block history is retained in full on disk — Warp-parity: terminal
+// history is never cut off across restarts. The read path
+// (`load_blocks` in `mod.rs`) windows the most-recent rows so restore
+// stays fast no matter how large the history grows; older blocks page
+// in on scroll-back.
 
 /// Public handle to the writer. Cloneable so multiple Tauri commands
 /// can hold a sender without coordinating.
@@ -278,17 +278,9 @@ fn apply(
                     now,
                 ],
             )?;
-            // Evict everything older than the newest
-            // MAX_BLOCKS_PER_PTY rows for this pty.
-            tx.execute(
-                "DELETE FROM blocks WHERE pty_id = ?1 AND id NOT IN (\
-                     SELECT id FROM blocks \
-                     WHERE pty_id = ?1 \
-                     ORDER BY id DESC \
-                     LIMIT ?2\
-                 )",
-                rusqlite::params![p.pty_id, MAX_BLOCKS_PER_PTY],
-            )?;
+            // Warp-parity: never evict by count. Full block history is
+            // retained on disk so it's never cut off; `load_blocks`
+            // windows the most-recent rows for fast restore.
             tx.commit()?;
         }
         Event::ForgetPty(pty_id) => {

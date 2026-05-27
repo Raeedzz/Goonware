@@ -163,7 +163,10 @@ export function AppShell() {
         width: "100vw",
         display: "flex",
         flexDirection: "column",
-        backgroundColor: "var(--surface-0)",
+        // Transparent: the native terminal surface sits behind the
+        // webview and shows through the terminal-pane hole. Window
+        // chrome, sidebars and the right panel each paint their own
+        // opaque bg, so only the terminal pane is see-through.
         overflow: "hidden",
       }}
     >
@@ -214,7 +217,14 @@ export function AppShell() {
             width: rightPx,
             flexShrink: 0,
             overflow: "hidden",
-            backgroundColor: "var(--surface-1)",
+            // No background here: the right panel hosts the native warpui SIDE
+            // pane, whose terminal region must be a transparent hole down to the
+            // Metal surface below the webview. An opaque --surface-1 here covered
+            // it (the "side panel renders nothing" bug). The panel's own chrome
+            // (UpperPanel, the SecondaryPanel header, and its content area when
+            // NOT showing the terminal) each paint --surface-1, so the only
+            // transparent region is the terminal itself — mirrors the main
+            // column's <main>, which likewise has no background.
             borderLeft: rightPx > 0 ? "var(--border-1)" : "none",
             position: "relative",
           }}

@@ -12,8 +12,6 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { joinShellPaths } from "@/lib/shellQuote";
 import { BlockList } from "./BlockList";
 import { AgentChrome, AGENT_CHROME_HEIGHT_PX } from "./AgentChrome";
-import { CanvasGrid, type CanvasGridHandle } from "./CanvasGrid";
-import { CellRow } from "./CellRow";
 import { LiveBlock } from "./LiveBlock";
 import { PromptInput, type PromptInputHandle } from "./PromptInput";
 import { PtyPassthrough, type PtyPassthroughHandle } from "./PtyPassthrough";
@@ -84,6 +82,16 @@ function commandLineIsAgent(line: string): boolean {
 interface Props {
   /** Stable PTY session ID — must be unique per running PTY. */
   id: string;
+  /**
+   * When true (main column only), this terminal drives the native warpui
+   * surface while it's the active tab. Right-panel agent terminals leave this
+   * unset so they don't hijack the single native surface (multi-pane is M6).
+   */
+  nativeSurface?: boolean;
+  /** Which native pane this terminal drives: "main" (main column) or "side"
+   *  (right-panel). Threaded into every native command so the two panes' grids
+   *  / scroll / selection stay independent on the one embedded surface. */
+  paneKey?: "main" | "side";
   /** Command to spawn (e.g. "zsh", "claude", "codex"). */
   command: string;
   args?: string[];
@@ -205,6 +213,8 @@ export function BlockTerminal({
   autoFocus = true,
   isVisible = true,
   allowHorizontalScroll = false,
+  nativeSurface = false,
+  paneKey = "main",
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   /**
@@ -217,12 +227,6 @@ export function BlockTerminal({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const promptRef = useRef<PromptInputHandle>(null);
   const passthroughRef = useRef<PtyPassthroughHandle>(null);
-  // Alt-screen CanvasGrid handle. Used by the soft-reset path to
-  // poke the renderer when a sleep/wake leaves the canvas stuck on
-  // its last frame (alive surface, no new frames arriving). Only
-  // the alt-screen grid gets a ref because the inline agent grid
-  // unmounts as soon as resetPane() flips foregroundIsAgent off.
-  const canvasGridRef = useRef<CanvasGridHandle>(null);
   // Generation counter — bumped when the user clicks "restart" on the
   // session-ended banner. Suffixed onto the session id so the underlying
   // useTerminalSession effect tears down the dead PTY and spawns a fresh
@@ -233,6 +237,18 @@ export function BlockTerminal({
   // `term://${id}/frame`. `-r<n>` works and reads cleanly in logs.
   const [generation, setGeneration] = useState(0);
   const ptyId = generation === 0 ? id : `${id}-r${generation}`;
+  // Native warpui terminal surface (macOS): when THIS terminal is the active
+  // tab, tell the backend to mirror this pty. Key on the real `ptyId`
+  // (generation-adjusted) the PTY actually runs under — not the tab's base id,
+  // which would miss the `-r<n>` suffix after a restart and mirror nothing.
+  // No detach on cleanup: the next visible terminal's attach overwrites the
+  // target, and WarpSurfaceTracker clears it when no terminal tab is active —
+  // avoiding a tab-switch race where an outgoing slot's cleanup clobbers the
+  // incoming slot's attach.
+  useEffect(() => {
+    if (!nativeSurface || !isVisible) return;
+    invoke("term_native_attach", { paneKey, id: ptyId }).catch(() => {});
+  }, [nativeSurface, isVisible, ptyId, paneKey]);
   // In-memory ring buffer of past commands (newest at index 0).
   // Hydrated from module-scoped memory so it survives session/project
   // switches; module memory is keyed by terminal id, not component
@@ -244,6 +260,16 @@ export function BlockTerminal({
   // mirror so the inline detection logic doesn't fire twice.
   const [claudeDetectedLocal, setClaudeDetectedLocal] = useState(false);
   const sniffBufferRef = useRef("");
+  // Latched by an explicit force-kill (double-tap Ctrl+C / soft reset) to
+  // SUPPRESS agent auto-detection until the next user submission. After the
+  // user SIGKILLs an agent, `command_running` can stay stuck true — the shell
+  // never emits the OSC 133 "done" marker for the killed child — so both the
+  // banner sniff and the command-line classifier would otherwise re-detect the
+  // dead agent from its leftover grid bytes (or the still-"claude" activeCommand)
+  // and flip `foregroundIsAgent` back on, pinning the PromptInput off-screen
+  // forever ("I killed claude and the input never came back"). Cleared in
+  // `onSubmit` so re-running an agent immediately works.
+  const forceKilledRef = useRef(false);
   const onClaudeDetectedRef = useRef(onClaudeDetected);
   useEffect(() => {
     onClaudeDetectedRef.current = onClaudeDetected;
@@ -728,6 +754,280 @@ export function BlockTerminal({
   // of what the last frame's flags were — those readings are stale.
   const agentMode = !exited && (altScreen || foregroundIsAgent);
 
+  // Tell the native surface when this pane is in agent mode. In agent mode the
+  // PromptInput is hidden and keystrokes go raw to the PTY (PtyPassthrough), so
+  // the native live grid — not the React input box — is what the user sees and
+  // types into. Crucially this stays latched across the ~1.5s agent-exit
+  // debounce, so a just-killed agent keeps showing its shell prompt instead of
+  // a dark surface ("Ctrl+C doesn't come back"). `ptyId` is a dep so the push
+  // re-fires after a tab-switch attach reset.
+  useEffect(() => {
+    if (!nativeSurface || !isVisible) return;
+    invoke("term_native_set_agent_mode", { paneKey, active: agentMode }).catch(() => {});
+  }, [nativeSurface, isVisible, agentMode, ptyId, paneKey]);
+
+  // The native surface drives ALL modes on a native pane: shell, inline agents
+  // (claude/codex), AND alt-screen TUIs (vim/htop). Alt-screen used to fall back
+  // to the React WebGPU CanvasGrid; it now renders through the native alt-grid
+  // path too (the native surface was already painting it behind the opaque
+  // canvas — we just stop covering it), so the WebGPU stack is only used by
+  // non-native (right-panel) terminals. Input is captured by React and forwarded
+  // to the PTY — PromptInput (shell), PtyPassthrough (inline agent OR native
+  // alt-screen) — and the native grid shows the echo. Non-native panes
+  // (nativeSurface=false) keep CanvasGrid for both display and input.
+  const nativeActive = nativeSurface;
+
+  // Autofocus the invisible PtyPassthrough whenever an inline agent engages on
+  // the visible pane. With the native surface rendering the agent through a
+  // transparent hole there's no visible element to click, so nothing would
+  // otherwise focus the passthrough — leaving the user unable to type or Ctrl+C
+  // into the agent. (Shell mode doesn't need this: its PromptInput box is
+  // visible and grabs focus on click.) Click-to-refocus + the window-level
+  // Ctrl+C fallback cover focus drift after that.
+  useEffect(() => {
+    // PtyPassthrough is the input layer for inline agents AND native alt-screen
+    // (vim/htop on a native pane). Focus it whenever it's the one mounted so the
+    // user can type / Ctrl+C without a visible element to click.
+    const needsPassthrough =
+      (foregroundIsAgent && !altScreen) || (altScreen && nativeSurface);
+    if (!isVisible || !needsPassthrough) return;
+    const t = setTimeout(() => passthroughRef.current?.focus(), 0);
+    return () => clearTimeout(t);
+  }, [isVisible, foregroundIsAgent, altScreen, nativeSurface]);
+
+  // Scroll-back wheel bridge. The native surface renders the shell transcript
+  // through a transparent hole; the embedded child window has
+  // `ignoresMouseEvents: YES`, so wheel events land on this (invisible) React
+  // scroll container instead. Forward the delta to the native
+  // `ClippedScrollable` via `term_native_scroll` and swallow it so the empty
+  // container doesn't also scroll. Only while the native surface owns the
+  // SHELL transcript: agent / alt-screen panes keep their own React scrolling
+  // (and the native render ignores the offset there anyway). A NON-passive
+  // listener is required — React's synthetic `onWheel` is passive, so
+  // `preventDefault` would no-op. `deltaY > 0` (scroll down) advances toward
+  // newer output; the Rust side drops stick-to-bottom and re-arms it when the
+  // user scrolls back down or the content fits.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    // Active for the shell transcript AND inline agents (claude/codex) — both
+    // now render in the one scrollable native transcript, so the wheel scrolls
+    // the whole terminal up through history while an agent is foregrounded
+    // (Warp's continuous scroll). Alt-screen (vim/htop) renders no scroll
+    // container, so `el` is null there and this no-ops automatically.
+    if (!el || !nativeActive) return;
+    // Coalesce to ONE batched scroll per animation frame. Each invoke pokes a
+    // full native re-render of the transcript; one per wheel event (60–120/sec
+    // on a trackpad) floods the main thread and the scroll-back stutters.
+    // Accumulate the pixel delta and flush once per rAF (display refresh) so the
+    // transcript re-renders at most ~60fps with the summed delta — smooth.
+    let accumPx = 0;
+    let accumPxX = 0;
+    let raf = 0;
+    const flush = () => {
+      raf = 0;
+      // Vertical pan (always meaningful) and horizontal pan (only when the grid
+      // is wider than the pane — the native renderer builds the horizontal
+      // ClippedScrollable then; a no-op otherwise). Each axis is sent only when
+      // it actually moved, so a pure vertical scroll never fires an hscroll.
+      if (accumPx !== 0) {
+        const px = accumPx;
+        accumPx = 0;
+        invoke("term_native_scroll", { paneKey, deltaPx: px }).catch(() => {});
+      }
+      if (accumPxX !== 0) {
+        const px = accumPxX;
+        accumPxX = 0;
+        invoke("term_native_hscroll", { paneKey, deltaPx: px }).catch(() => {});
+      }
+    };
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      // Most devices report pixels (deltaMode 0); convert line/page deltas.
+      accumPx +=
+        e.deltaMode === 1
+          ? e.deltaY * 16
+          : e.deltaMode === 2
+            ? e.deltaY * (el.clientHeight || 400)
+            : e.deltaY;
+      accumPxX +=
+        e.deltaMode === 1
+          ? e.deltaX * 16
+          : e.deltaMode === 2
+            ? e.deltaX * (el.clientWidth || 400)
+            : e.deltaX;
+      if (!raf) raf = requestAnimationFrame(flush);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [nativeActive, agentMode, paneKey]);
+
+  // Alt-screen wheel → forward to the PTY so the app (vim, htop, claude's TUI)
+  // scrolls ITS OWN view — exactly like a real terminal. In alt-screen the
+  // native surface paints the full grid and NO React scroll container is
+  // mounted, so the wheel lands on the pane container instead; term_native_wheel
+  // translates it to mouse-wheel / arrow bytes based on the app's mode. This is
+  // why "I can't scroll while claude is running" — claude is an alt-screen TUI,
+  // so the transcript scroll-back bridge above (which needs the scroll
+  // container) never applied. Pixel→notch conversion + the cell coords under
+  // the cursor (SF Mono 0.6em × 1.3 line) are sent so mouse-aware apps scroll
+  // the right region.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !nativeActive || !altScreen) return;
+    const CELL_W = 13 * 0.6;
+    const CELL_H = 13 * 1.3;
+    const LINE_PX = 16; // px of wheel travel per scroll line/notch
+    // Coalesce wheel input to ONE batched scroll per animation frame. A trackpad
+    // fires 60–120 wheel events/sec; sending an invoke + a full PTY redraw for
+    // each floods the round-trip and Claude scrolls in lurches ("low
+    // framerate"). Accumulating the delta and flushing once per rAF caps it to
+    // the display refresh, keeps sub-line precision (the remainder carries), and
+    // collapses a burst into a single proportional scroll — smooth + cheap.
+    const MAX_LINES_PER_FRAME = 6; // cap per frame so a fast flick stays smooth
+    let accumPx = 0;
+    let raf = 0;
+    let col = 1;
+    let row = 1;
+    const flush = () => {
+      raf = 0;
+      const want = Math.trunc(accumPx / LINE_PX);
+      if (want === 0) return;
+      const lines = Math.max(
+        -MAX_LINES_PER_FRAME,
+        Math.min(MAX_LINES_PER_FRAME, want),
+      );
+      accumPx -= lines * LINE_PX;
+      invoke("term_native_wheel", { id: ptyId, deltaLines: lines, col, row }).catch(
+        () => {},
+      );
+      // Drain a fast flick across subsequent frames (momentum) rather than one
+      // big jump — smooth deceleration.
+      if (Math.abs(accumPx) >= LINE_PX) raf = requestAnimationFrame(flush);
+    };
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      accumPx +=
+        e.deltaMode === 1
+          ? e.deltaY * 16
+          : e.deltaMode === 2
+            ? e.deltaY * (el.clientHeight || 400)
+            : e.deltaY;
+      const rect = el.getBoundingClientRect();
+      col = Math.max(1, Math.floor((e.clientX - rect.left) / CELL_W) + 1);
+      row = Math.max(1, Math.floor((e.clientY - rect.top) / CELL_H) + 1);
+      if (!raf) raf = requestAnimationFrame(flush);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [nativeActive, altScreen, ptyId]);
+
+  // Selection mouse bridge. Same situation as the wheel bridge: the native
+  // surface renders the shell transcript through a transparent hole and ignores
+  // mouse events, so drags land on this (invisible) container. Forward
+  // down/drag/up to `term_native_mouse` → warpui's own hit-testing + selection.
+  // `(x, y)` are relative to this container's top-left, which in shell mode is
+  // the pane (and therefore surface) top-left. Move/up listen on the window so a
+  // drag tracks past the container edge. `preventDefault` on mousedown stops the
+  // hidden DOM block list from starting its own text selection. Left button only.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el || !nativeActive || agentMode) return;
+    let dragging = false;
+    const send = (kind: string, e: globalThis.MouseEvent) => {
+      // Window-content coords (clientX/Y); Rust subtracts the combined surface
+      // origin so the event lands in this pane's region (warpui hit-tests by
+      // position across both panes' SelectableAreas).
+      invoke("term_native_mouse", {
+        kind,
+        x: e.clientX,
+        y: e.clientY,
+        clickCount: e.detail || 1,
+        shift: e.shiftKey,
+        cmd: e.metaKey,
+        alt: e.altKey,
+        ctrl: e.ctrlKey,
+      }).catch(() => {});
+    };
+    const onMove = (e: globalThis.MouseEvent) => {
+      if (dragging) send("drag", e);
+    };
+    const onUp = (e: globalThis.MouseEvent) => {
+      if (!dragging) return;
+      dragging = false;
+      send("up", e);
+      window.removeEventListener("mousemove", onMove, true);
+      window.removeEventListener("mouseup", onUp, true);
+    };
+    const onDown = (e: globalThis.MouseEvent) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      dragging = true;
+      send("down", e);
+      window.addEventListener("mousemove", onMove, true);
+      window.addEventListener("mouseup", onUp, true);
+    };
+    el.addEventListener("mousedown", onDown, true);
+    return () => {
+      el.removeEventListener("mousedown", onDown, true);
+      window.removeEventListener("mousemove", onMove, true);
+      window.removeEventListener("mouseup", onUp, true);
+    };
+  }, [nativeActive, agentMode]);
+
+  // Cmd+C copies the native transcript selection (kept by warpui's
+  // SelectableArea, exposed via term_native_selection_text) through the existing
+  // pbcopy path. Capture-phase + window-level so it wins over the focused
+  // PromptInput textarea — UNLESS that textarea has its own selection, in which
+  // case we defer to the browser's normal copy. Shell-transcript only (agent
+  // mode routes Cmd+C through PtyPassthrough; alt-screen has no native surface).
+  useEffect(() => {
+    if (!nativeActive || agentMode || !isVisible) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.metaKey || e.ctrlKey || e.altKey || e.key.toLowerCase() !== "c") return;
+      const ae = document.activeElement;
+      if (ae && (ae.tagName === "TEXTAREA" || ae.tagName === "INPUT")) {
+        const inp = ae as HTMLInputElement | HTMLTextAreaElement;
+        if (inp.selectionStart != null && inp.selectionStart !== inp.selectionEnd) return;
+      }
+      e.preventDefault();
+      invoke<string | null>("term_native_selection_text", { paneKey })
+        .then((t) => {
+          if (t) void writeClipboardTextWithFallback(t);
+        })
+        .catch(() => {});
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [nativeActive, agentMode, isVisible, paneKey]);
+
+  // Report this scroll container's region (top offset within the pane + height)
+  // to the native surface, so native content pins to exactly it: the shell
+  // transcript sits just above the input bar, and an agent grid sits just below
+  // the AgentChrome strip — never behind either. The native surface still spans
+  // the whole pane; this only bounds the content. Covers shell AND agent (the top
+  // offset differs); re-reports on resize and when agent mode toggles the strip.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el || !nativeActive) return;
+    const report = () => {
+      const sr = el.getBoundingClientRect();
+      const cr = containerRef.current?.getBoundingClientRect();
+      const top = cr ? sr.top - cr.top : 0;
+      if (sr.height > 0)
+        invoke("term_native_set_viewport", { paneKey, top, height: sr.height }).catch(() => {});
+    };
+    report();
+    const ro = new ResizeObserver(report);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [nativeActive, agentMode, paneKey]);
+
   // Force re-anchoring when agent mode turns on — i.e. a new agent
   // is detected in this pane. The input bar hides, the PTY re-fits
   // to claim that ~80px, and `term_resize` bumps the next liveFrame.
@@ -770,21 +1070,6 @@ export function BlockTerminal({
     const t = window.setTimeout(() => setBellFlash(false), BELL_FLASH_MS);
     return () => window.clearTimeout(t);
   }, [bellTick]);
-
-  // DOM-fallback latch for the alt-screen CanvasGrid. When the
-  // canvas's recovery ladder gives up (WKWebView surface dead and
-  // no rebuild ever painted), this flips and the alt-screen path
-  // renders alacritty rows through DOM CellRow rows instead. Reset
-  // whenever `altScreen` itself flips off-then-on so a NEW alt-screen
-  // entry attempts the canvas path fresh — the GPU may be healthy
-  // again on the next agent invocation.
-  const [altScreenCanvasFailed, setAltScreenCanvasFailed] = useState(false);
-  useEffect(() => {
-    if (!altScreen) setAltScreenCanvasFailed(false);
-  }, [altScreen]);
-  const handleAltScreenCanvasUnrecoverable = useCallback(() => {
-    setAltScreenCanvasFailed(true);
-  }, []);
 
   // Re-fit on container resize OR when we toggle agent mode (since
   // hiding the PromptInput frees ~80px of vertical real estate that
@@ -838,9 +1123,21 @@ export function BlockTerminal({
       // few px, which fired CanvasGrid's inner ResizeObserver and
       // reconfigured the WebGPU swapchain mid-frame.
       const agentChromeHeight = agentMode ? AGENT_CHROME_HEIGHT_PX : 0;
-      const reserved = inputChrome + liveBlockChrome + agentChromeHeight;
+      // On a NATIVE agent pane the only real chrome is the AgentChrome strip:
+      // the input bar is hidden and the live block is opacity:0, so reserving
+      // their heights (inputChrome + liveBlockChrome) would shrink Claude's PTY
+      // below the pane the native surface actually fills — leaving black space
+      // above the agent. Reserve only the strip there so Claude fills the pane.
+      const reserved =
+        agentMode && nativeSurface
+          ? agentChromeHeight
+          : inputChrome + liveBlockChrome + agentChromeHeight;
       const usableHeight = Math.max(120, rect.height - reserved);
-      const cellHeight = 13 * 1.35;
+      // Match the native renderer's row pitch (LINE_HEIGHT_RATIO 1.3 in
+      // warp_term.rs) on native panes so PTY rows × pitch == the painted grid
+      // height and Claude lands flush against the bottom with no residual gap;
+      // the WebGPU/DOM path keeps its 1.35 metric.
+      const cellHeight = 13 * (nativeSurface ? 1.3 : 1.35);
       // JetBrains Mono at 13px has a raw glyph advance of ~7.8px, but
       // the atlas rounds the physical-pixel advance UP and divides by
       // DPR, so the rendered cell width in CSS px is
@@ -852,25 +1149,35 @@ export function BlockTerminal({
       // than the canvas can actually render. The prior 0.62 multiplier
       // undercounted on the 8.5-cell DPR path and was the direct cause
       // of the "fresh sta[te]" right-edge clipping in agent panes.
-      const cellWidth = 13 * 0.66;
+      // Native panes use SF Mono / Menlo / Monaco, whose advance is 0.6 em
+      // (7.8 px at 13 px) — measured exactly from the surface: a 90-col grid
+      // left ~113 px dead in an 815 px pane (90 × 7.8 = 702). The WebGPU/DOM
+      // path keeps 0.66 (its atlas-rounded JetBrains Mono cell). Using 0.66 on
+      // a native pane under-counts columns and is the "dead space on the right
+      // / doesn't fill the pane" report; 0.6 makes the grid fill and reflow to
+      // the pane width on every sidebar / right-panel resize, like Warp.
+      const cellWidth = 13 * (nativeSurface ? 0.6 : 0.66);
       const visibleRows = Math.max(8, Math.floor(usableHeight / cellHeight));
-      // Warp behavior: Claude's PTY is constrained so its slash menu
-      // paints ~9 visible items. Empirically Claude's TUI now reserves
-      // ~8 rows for chrome (input box, status footer, hint line, the
-      // picker's own header/footer), so 17 PTY rows leaves room for
-      // 9 picker entries. Arrow keys scroll *within* Claude's picker
-      // for the rest of the list. Trade-off: Claude's normal
-      // conversation view is also bounded — this matches Warp's
-      // "agent lives in a small block" aesthetic. Tune
-      // AGENT_PTY_MAX_ROWS to taste; 17 is the minimum that still
-      // shows 9 picker items with current Claude chrome.
+      // Warp gives a foregrounded agent the FULL terminal height on a
+      // NATIVE pane — the agent's own TUI (scrollable conversation + input
+      // box pinned to the bottom) fills the pane. The native surface
+      // bottom-anchors the agent grid to the whole pane, so capping the PTY
+      // left the agent as a short block floating at the bottom with black
+      // space above it — the "claude renders half the pane / spawns broken"
+      // report. So on native panes the agent gets the full viewport, exactly
+      // like Warp.
+      //
+      // Non-native (right-panel CanvasGrid) agents keep the bounded block:
+      // their canvas lives inside a scroll container tuned around the cap.
+      // 17 rows leaves room for ~9 slash-command picker items above Claude's
+      // ~8 rows of chrome (input box, status footer, hint, picker
+      // header/footer); arrow keys scroll within the picker for the rest
+      // (cap raised from 12 → 17 on main, #44).
       const AGENT_PTY_MAX_ROWS = 17;
-      // For panes smaller than the cap we follow the visible viewport
-      // — never tell Claude its PTY is taller than the canvas can
-      // render or its TUI footer slides off-screen.
-      const rows = foregroundIsAgent
-        ? Math.min(visibleRows, AGENT_PTY_MAX_ROWS)
-        : visibleRows;
+      const rows =
+        foregroundIsAgent && !nativeSurface
+          ? Math.min(visibleRows, AGENT_PTY_MAX_ROWS)
+          : visibleRows;
       // Horizontal gutter:
       //   12 px LiveBlock left padding
       // + 12 px LiveBlock right padding
@@ -881,7 +1188,14 @@ export function BlockTerminal({
       // The prior 24 px only covered the LiveBlock padding and the
       // user reported the symptom directly as "text spills behind
       // the right sidebar."
-      const fitCols = Math.max(20, Math.floor((rect.width - 36) / cellWidth));
+      //
+      // Native panes have NO LiveBlock padding and NO scrollbar — the grid
+      // paints edge-to-edge on the Metal surface — so the 36 px canvas gutter
+      // would leave ~4 columns of dead space. Use a 1-cell safety margin there
+      // so the grid fills the pane (floor() already guarantees cols × advance
+      // never exceeds the pane width, so the last column can't clip).
+      const colGutter = nativeSurface ? 4 : 36;
+      const fitCols = Math.max(20, Math.floor((rect.width - colGutter) / cellWidth));
       // In `allowHorizontalScroll` mode (the narrow right-panel
       // secondary terminal) the visual pane width is much smaller than
       // a normal terminal. If we sized the PTY to that width the shell
@@ -891,6 +1205,14 @@ export function BlockTerminal({
       // has a wide terminal; the outer scroll container then handles
       // horizontal panning over the wider rendered grid.
       const PAN_MIN_COLS = 120;
+      // `allowHorizontalScroll` (the narrow right-panel secondary terminal) pins
+      // a wide PTY so the shell lays out as if it had a wide terminal — `ls`
+      // prints columns side-by-side instead of one entry per line — and the user
+      // pans to the off-screen columns. On the DOM/WebGPU path an outer scroll
+      // container does the panning; on a native Metal pane the warpui renderer
+      // does it (a horizontal ClippedScrollable, gated on grid-wider-than-pane,
+      // fed by `term_native_hscroll` — see warp_term.rs). Either way the PTY must
+      // believe it's wide, so size it the same on both paths.
       const cols = allowHorizontalScroll
         ? Math.max(fitCols, PAN_MIN_COLS)
         : fitCols;
@@ -975,7 +1297,7 @@ export function BlockTerminal({
       observer.disconnect();
       if (timerId !== null) window.clearTimeout(timerId);
     };
-  }, [resize, agentMode, foregroundIsAgent, allowHorizontalScroll]);
+  }, [resize, agentMode, foregroundIsAgent, allowHorizontalScroll, nativeSurface]);
 
   // Sniff the live frame for the Claude banner so the 5h usage bar
   // attaches automatically AND we know to hide PromptInput in favor
@@ -1009,6 +1331,9 @@ export function BlockTerminal({
   // as soon as detectClaude succeeds.
   useEffect(() => {
     if (foregroundIsAgent) return;
+    // Suppressed after an explicit force-kill until the next submit — see
+    // forceKilledRef. Stops the dead agent's leftover banner from re-arming.
+    if (forceKilledRef.current) return;
     if (!liveFrame) return;
     if (!liveFrame.command_running) return;
     if (activeCommand.length > 0 && !commandLineIsAgent(activeCommand)) return;
@@ -1041,6 +1366,9 @@ export function BlockTerminal({
   useEffect(() => {
     if (directAgent) return;
     if (foregroundIsAgent) return;
+    // Suppressed after an explicit force-kill until the next submit — see
+    // forceKilledRef. Stops the still-"claude" activeCommand from re-arming.
+    if (forceKilledRef.current) return;
     if (!liveFrame?.command_running) return;
     if (!commandLineIsAgent(activeCommand)) return;
     setForegroundIsAgent(true);
@@ -1118,6 +1446,14 @@ export function BlockTerminal({
       window.clearTimeout(exitDebounceRef.current);
       exitDebounceRef.current = null;
     }
+    // Latch suppression + clear the state the re-detect effects feed on: the
+    // dead agent's command line and the sniff accumulator. Without this, a
+    // stuck-true `command_running` after the SIGKILL lets the banner sniff /
+    // command-line classifier immediately re-arm agent mode from the leftover
+    // grid, and the PromptInput never returns.
+    forceKilledRef.current = true;
+    setActiveCommand("");
+    sniffBufferRef.current = "";
     setForegroundIsAgent(false);
     setTimeout(() => promptRef.current?.focus(), 0);
   }, [ptyId]);
@@ -1134,6 +1470,9 @@ export function BlockTerminal({
 
   const onSubmit = useCallback(
     (text: string) => {
+      // A new submission re-enables agent auto-detection that a prior
+      // force-kill suppressed — so re-running `claude` foregrounds again.
+      forceKilledRef.current = false;
       setActiveCommand(text);
       // Defensive grid reset for agent transitions. When the user
       // Ctrl+C's an agent and immediately types another agent,
@@ -1149,6 +1488,18 @@ export function BlockTerminal({
           // Best-effort — if the backend is mid-flight we just fall
           // back to the OSC 133 C clear path. No need to surface.
         });
+        // Engage agent mode OPTIMISTICALLY — we just launched a known agent,
+        // so don't wait for the banner sniff / `command_running=true` edge to
+        // confirm it. That edge is the source of an intermittent "claude opens
+        // but the PromptInput stays / input doesn't route to the agent" failure:
+        // if the OSC 133 C marker is transient or arrives in a frame the
+        // classifier effect doesn't observe, agent mode never engages. Setting
+        // it here makes the takeover deterministic. If the launch actually fails
+        // (typo, not installed), the 1500ms exit-debounce below releases it and
+        // the PromptInput returns — same self-heal as a real exit. The grid was
+        // just reset, so there's no stale content to flash under the agent.
+        sniffBufferRef.current = "";
+        setForegroundIsAgent(true);
       }
       void sendLine(text);
       if (text.trim().length > 0) {
@@ -1500,11 +1851,9 @@ export function BlockTerminal({
     const path = cwdRef.current;
     if (path) forceIdleForCwd(path);
     setTimeout(() => promptRef.current?.focus(), 0);
-    canvasGridRef.current?.invalidate();
-    // Also force the React-side frame pipeline to flush any pending
-    // ref state into committed liveFrame. The canvas invalidate above
-    // re-paints the renderer's current input; forceResync makes sure
-    // that input is the latest cached frame, not whatever React last
+    // Force the React-side frame pipeline to flush any pending ref
+    // state into committed liveFrame, so the native surface repaints
+    // from the latest cached frame rather than whatever React last
     // committed before the pipeline got stuck.
     forceResync();
   }, [onForceKill, forceResync]);
@@ -1651,7 +2000,12 @@ export function BlockTerminal({
         width: "100%",
         display: "flex",
         flexDirection: "column",
-        backgroundColor: "var(--surface-0)",
+        // When this pane drives the native warpui surface, the root is
+        // transparent so the Metal surface (a child window ordered
+        // below the webview) shows through. Right-panel agent terminals
+        // (nativeSurface=false) keep their opaque surface-0 background
+        // and render entirely in the webview as before.
+        backgroundColor: nativeActive ? "transparent" : "var(--surface-0)",
         position: "relative",
         // Soft warm pulse when the terminal rings the bell. CSS handles
         // the easing so the runtime cost is one class flip. When a file
@@ -1711,75 +2065,21 @@ export function BlockTerminal({
           agent case (a print-mode invocation that still trips the
           banner sniffer). The strip is driven by hook events, so it
           stays accurate without polling the PTY. */}
-      {agentMode && <AgentChrome cwd={liveCwd ?? cwd} />}
-      {!exited && altScreen && (
-        // Alt-screen TUI (vim, htop, claude-in-alt-screen) renders
-        // exclusively through the WebGPU CanvasGrid. The previous
-        // DOM-backed FullGrid is retired — CanvasGrid handles
-        // selection, cursor, and the full feature set, and keeping
-        // two paths invited drift bugs. The `autoFocus` prop isn't
-        // forwarded because CanvasGrid manages its own focus through
-        // the hidden textarea overlay.
-        //
-        // `isVisible` IS forwarded — when this terminal is hidden by
-        // the keepalive layer (display: none), the canvas needs to
-        // skip ResizeObserver-driven 0×0 resizes and force a fresh
-        // paint when it comes back, or the alt-screen picker /
-        // model selector lands on a black surface.
-        //
-        // DOM fallback: when CanvasGrid's recovery ladder gives up
-        // (WKWebView returned a persistently-dead GPU surface, no
-        // rebuild ever painted), we render alacritty rows through
-        // CellRow rows instead. No interactive input encoding (the
-        // alt-screen path needs onSendBytes for keystrokes), but at
-        // least the user sees the agent's UI text — and they can
-        // Ctrl+C / kill the agent to start a fresh attempt at the
-        // canvas path.
-        <div
-          style={{
-            flex: 1,
-            minHeight: 0,
-            display: "flex",
-            flexDirection: "column",
-          }}
-        >
-          {altScreenCanvasFailed ? (
-            <div
-              style={{
-                flex: 1,
-                minHeight: 0,
-                overflowY: "auto",
-                fontFamily: "var(--font-mono)",
-                fontSize: 13,
-                fontVariantLigatures: "none",
-                color: "var(--text-primary)",
-                backgroundColor: "var(--surface-0)",
-                padding: "var(--space-2) var(--space-3)",
-              }}
-            >
-              {(liveFrame?.dirty ?? []).map((row) => (
-                <CellRow key={row.row} spans={row.spans} wrap={false} />
-              ))}
-            </div>
-          ) : (
-            <CanvasGrid
-              ref={canvasGridRef}
-              frame={liveFrame}
-              onSendBytes={sendBytes}
-              isVisible={isVisible}
-              onCanvasUnrecoverable={handleAltScreenCanvasUnrecoverable}
-            />
-          )}
-        </div>
-      )}
+      {!exited && foregroundIsAgent && <AgentChrome cwd={liveCwd ?? cwd} />}
+
+      {/* Alt-screen TUIs (vim, htop, claude-in-alt-screen) render on the
+          native Metal surface. The previous React WebGPU CanvasGrid
+          alt-screen path has been retired now that the native surface
+          drives all modes. */}
 
       {/* Unified Warp-style scroll: closed blocks + the live block
           (shell command output OR the agent's TUI) flow together in
           one scroll container. The agent is just another block in the
           stream — the whole pane scrolls as one continuous history.
-          `preserveGrid` switches the LiveBlock body between DOM CellRow
-          rendering (shell output, soft-wrap) and the WebGPU CanvasGrid
-          (agent TUI, fixed grid). */}
+          The LiveBlock body renders DOM CellRow rows; `preserveGrid`
+          only switches wrapping (shell output soft-wraps, agent TUI
+          stays fixed-grid). The agent surface itself is drawn natively
+          (Rust/Metal). */}
       {!altScreen && (
         <div
           ref={scrollContainerRef}
@@ -1787,7 +2087,14 @@ export function BlockTerminal({
           className={
             allowHorizontalScroll ? "goonware-no-horizontal-scrollbar" : undefined
           }
-          style={agentScrollContainerStyle(allowHorizontalScroll)}
+          style={{
+            ...agentScrollContainerStyle(allowHorizontalScroll),
+            // Shell mode with the native surface active: hide the React block
+            // list / live block so the native rendering shows through the hole.
+            // In agent mode (nativeActive false) this stays visible so the
+            // agent's LiveBlock/CanvasGrid renders and takes input as before.
+            opacity: nativeActive ? 0 : undefined,
+          }}
         >
           {/* Width-sizing wrapper. In `allowHorizontalScroll` mode,
               CellRows render with `whiteSpace: pre` and the LiveBlock
@@ -1852,11 +2159,6 @@ export function BlockTerminal({
                 // first row at the visible top edge — what users mean
                 // by "I want to see what I'm picking."
                 fill={foregroundIsAgent}
-                // Forwarded so the embedded CanvasGrid can rebuild /
-                // repaint on tab-switch (display: none → display:
-                // flex). See CanvasGrid.Props.isVisible for the
-                // WKWebView GPU-surface-release dance this guards.
-                isVisible={isVisible}
               />
             )}
           </div>
@@ -1866,11 +2168,15 @@ export function BlockTerminal({
       {!agentMode && effectiveCwd && (
         <TerminalStatusBar cwd={effectiveCwd} command={command} />
       )}
-      {agentMode && effectiveCwd && (
+      {agentMode && effectiveCwd && !nativeActive && (
         // Agent-mode info strip: icon + diff + path + branch, no
         // controls. Same component as shell mode in `readonly` form —
         // share data + styling, drop the branch-switcher picker so it
         // can't fire mid-agent-session.
+        //
+        // Hidden when the NATIVE surface is rendering the agent (nativeActive):
+        // the agent's grid bottom-anchors to the pane, and this opaque bar would
+        // sit over its input row. Freeing the bottom keeps the input on-screen.
         <TerminalStatusBar
           cwd={effectiveCwd}
           command={activeCommand || command}
@@ -1890,7 +2196,7 @@ export function BlockTerminal({
           autoFocus={autoFocus}
         />
       )}
-      {foregroundIsAgent && !altScreen && (
+      {((foregroundIsAgent && !altScreen) || (altScreen && nativeSurface)) && (
         <PtyPassthrough
           ref={passthroughRef}
           onSendBytes={onSendBytesVoid}

@@ -856,7 +856,10 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
       <div
         style={{
           flexShrink: 0,
-          backgroundColor: "var(--surface-0)",
+          // surface-1 matches the TerminalStatusBar above so the cwd strip +
+          // command input read as one cohesive tray, distinct from the black
+          // native terminal surface behind it (see TerminalStatusBar note).
+          backgroundColor: "var(--surface-1)",
           padding: "var(--space-2) var(--space-3) var(--space-2)",
           display: "flex",
           flexDirection: "column",

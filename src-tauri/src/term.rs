@@ -602,6 +602,144 @@ pub struct DirtyRow {
 }
 
 /* ------------------------------------------------------------------
+   Native render sink — in-process frame path for the embedded warpui
+   terminal (macOS). The native surface mirrors exactly ONE pty at a
+   time (the active terminal tab). When that pty's `maybe_flush`/re-emit
+   produces a frame, we hand it — by reference, no serde, no IPC — to a
+   sink the native renderer registered at startup. The sink patches its
+   retained grid and pokes a redraw. On non-macOS builds (or before the
+   surface attaches) the sink is absent and these calls are no-ops, so
+   `term.rs` stays UI-agnostic.
+   ------------------------------------------------------------------ */
+
+/// Sink installed by the native terminal renderer. Receives the same sparse
+/// `RenderFrame` that goes to the IPC channel; the renderer maintains its own
+/// retained grid by applying `dirty`/cursor/dims.
+pub type NativeFrameSink = Box<dyn Fn(&str, &RenderFrame) + Send + Sync + 'static>;
+
+static NATIVE_SINK: std::sync::OnceLock<NativeFrameSink> = std::sync::OnceLock::new();
+/// Ids of the ptys the native surface currently mirrors — one per visible pane
+/// (the main column + the right-panel side terminal can both be on-screen at
+/// once). Empty = none. Frames for any listed pty reach the sink, tagged with
+/// the pty id so the renderer routes each to the right pane's grid.
+static NATIVE_PTYS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Register the native render sink. Idempotent-ish: only the first wins
+/// (the surface is created once for the app's lifetime).
+pub fn set_native_frame_sink(sink: NativeFrameSink) {
+    let _ = NATIVE_SINK.set(sink);
+}
+
+/// Mirror `id` on the native surface (the pane attaching to it), or — with an
+/// empty string — stop mirroring everything. Idempotent (no duplicate ids).
+pub fn set_native_pty(id: &str) {
+    if let Ok(mut g) = NATIVE_PTYS.lock() {
+        if id.is_empty() {
+            g.clear();
+        } else if !g.iter().any(|p| p == id) {
+            g.push(id.to_string());
+        }
+    }
+}
+
+/// Stop mirroring a single pty (a pane detached / its tab closed) without
+/// disturbing the other mirrored panes.
+#[allow(dead_code)] // wired in the per-pane detach increment
+pub fn clear_native_pty(id: &str) {
+    if let Ok(mut g) = NATIVE_PTYS.lock() {
+        g.retain(|p| p != id);
+    }
+}
+
+/// Hand a freshly-built frame to the native sink iff `id` is a mirrored pty.
+#[inline]
+fn emit_native_frame(id: &str, frame: &RenderFrame) {
+    let is_target = NATIVE_PTYS
+        .lock()
+        .map(|g| g.iter().any(|p| p == id))
+        .unwrap_or(false);
+    if is_target {
+        if let Some(sink) = NATIVE_SINK.get() {
+            sink(id, frame);
+        }
+    }
+}
+
+/// Sink for finished command blocks. Mirrors [`NativeFrameSink`] but for the
+/// closed-block list the native renderer stacks above the live grid (M2). The
+/// native side clones what it needs off the `ClosedBlock`.
+pub type NativeBlockSink = Box<dyn Fn(&str, &ClosedBlock) + Send + Sync + 'static>;
+
+static NATIVE_BLOCK_SINK: std::sync::OnceLock<NativeBlockSink> = std::sync::OnceLock::new();
+
+/// Register the native block sink. First caller wins (surface lives once).
+pub fn set_native_block_sink(sink: NativeBlockSink) {
+    let _ = NATIVE_BLOCK_SINK.set(sink);
+}
+
+/// Hand a finished block to the native sink iff `id` is a mirrored pty.
+#[inline]
+fn emit_native_block(id: &str, block: &ClosedBlock) {
+    let is_target = NATIVE_PTYS
+        .lock()
+        .map(|g| g.iter().any(|p| p == id))
+        .unwrap_or(false);
+    if !is_target {
+        return;
+    }
+    if let Some(sink) = NATIVE_BLOCK_SINK.get() {
+        sink(id, block);
+    }
+}
+
+/// Push a full-grid frame for `id` straight to the native sink (no IPC, no
+/// scrollback). Called when the native surface (re)attaches to a pty so it
+/// repaints immediately from current state instead of waiting for the pty's
+/// next output. No-op if the session isn't alive yet — then the first real
+/// frame from `term_start` fills the surface.
+pub fn reemit_native(state: &TerminalState, id: &str) {
+    let sess = {
+        let Ok(sessions) = state.sessions.lock() else {
+            return;
+        };
+        match sessions.get(id) {
+            Some(s) => s.clone(),
+            None => return,
+        }
+    };
+    let Ok(mut s) = sess.lock() else { return };
+    let snapshot = snapshot_grid(&s.term);
+    let cursor = s.term.grid().cursor.point;
+    let dirty: Vec<DirtyRow> = snapshot
+        .iter()
+        .enumerate()
+        .map(|(row, snap)| DirtyRow {
+            row: row as u16,
+            spans: snap.spans.clone(),
+        })
+        .collect();
+    let seq = s.next_frame_seq;
+    s.next_frame_seq = s.next_frame_seq.saturating_add(1);
+    let frame = RenderFrame {
+        seq,
+        block_id: s.segmenter.current_block_id(),
+        cols: s.cols,
+        rows: s.rows,
+        cursor_row: cursor.line.0,
+        cursor_col: cursor.column.0 as u16,
+        alt_screen: s.term.mode().contains(TermMode::ALT_SCREEN),
+        command_running: s.last_command_running,
+        app_cursor: s.term.mode().contains(TermMode::APP_CURSOR),
+        bracketed_paste: s.term.mode().contains(TermMode::BRACKETED_PASTE),
+        cursor_visible: s.term.mode().contains(TermMode::SHOW_CURSOR),
+        dirty,
+        scrollback_appended: Vec::new(),
+        scrollback_reset: false,
+    };
+    emit_native_frame(id, &frame);
+}
+
+/* ------------------------------------------------------------------
    Block segmenter — OSC 133 + idle fallback.
    ------------------------------------------------------------------ */
 
@@ -1514,7 +1652,7 @@ impl EventListener for NullEventProxy {
 /// to actual content; otherwise short commands would render with
 /// dozens of blank rows below them (one for each unused row of the
 /// scratch Term's screen).
-fn snapshot_transcript(transcript: &str, cols: u16, rows: u16) -> Vec<RowSnapshot> {
+pub(crate) fn snapshot_transcript(transcript: &str, cols: u16, rows: u16) -> Vec<RowSnapshot> {
     if transcript.is_empty() {
         return Vec::new();
     }
@@ -2058,6 +2196,7 @@ pub fn term_start(
                     scrollback_appended,
                     scrollback_reset: true,
                 };
+                emit_native_frame(&args.id, &frame);
                 let _ = s.frame_channel.send(frame);
             }
             return Ok(());
@@ -2369,6 +2508,9 @@ pub fn term_start(
                                 },
                             );
                         }
+                        // In-process path to the native surface (no serde/IPC)
+                        // — mirrors emit_native_frame for the closed-block list.
+                        emit_native_block(&id_for_reader, &block);
                         let _ = app_for_reader
                             .emit(&format!("term://{id_for_reader}/block"), block);
                     }
@@ -2401,6 +2543,70 @@ pub fn term_input(
     };
     let mut s = arc.lock().map_err(|e| e.to_string())?;
     s.pty_writer.write_all(&data).map_err(|e| e.to_string())?;
+    s.pty_writer.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Forward a mouse-wheel scroll to the PTY for an alt-screen / mouse-mode app
+/// (vim, htop, claude's TUI) so the APP scrolls its own view — exactly what a
+/// real terminal does. The normal-screen shell scrolls the native transcript
+/// instead (via `term_native_scroll`); this is the alt-screen path. Encoding
+/// follows the pty's current mode:
+///   - mouse reporting on  → mouse-wheel buttons (SGR `\e[<64/65;c;rM`, else X10)
+///   - else alternate-scroll (DECSET 1007, alacritty's alt-screen default)
+///     → arrow keys (cursor-app-mode aware)
+/// `delta_lines` is signed wheel notches: negative = up/older, positive =
+/// down/newer. No-op when the app wants neither (nothing to scroll).
+#[tauri::command]
+pub fn term_native_wheel(
+    state: State<TerminalState>,
+    id: String,
+    delta_lines: i32,
+    col: u16,
+    row: u16,
+) -> Result<(), String> {
+    let arc = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.get(&id).cloned().ok_or("unknown term session")?
+    };
+    let mut s = arc.lock().map_err(|e| e.to_string())?;
+    let mode = s.term.mode();
+    let notches = (delta_lines.unsigned_abs() as usize).clamp(1, 8);
+    let up = delta_lines < 0;
+    let c = col.clamp(1, s.cols.max(1));
+    let r = row.clamp(1, s.rows.max(1));
+    let mut out: Vec<u8> = Vec::new();
+    // Send mouse-wheel events — a smooth, app-native scroll — to any TUI that is
+    // mouse/SGR aware (claude sets SGR mode 1006). We do NOT fall back to arrow
+    // keys: `ALTERNATE_SCROLL` is alacritty's *default*, not something the app
+    // opted into, so translating the wheel to arrows fires for every alt-screen
+    // app and an app like claude reads those arrows as input-cursor movement,
+    // not scroll — which is the "scroll sends arrows / doesn't scroll" report.
+    // An app that ignores mouse reports simply discards the CSI sequence (no
+    // stray characters), so this is safe even when only the SGR encoding is set.
+    if mode.contains(TermMode::MOUSE_MODE) || mode.contains(TermMode::SGR_MOUSE) {
+        // Wheel button codes: 64 = up, 65 = down.
+        let btn: u32 = if up { 64 } else { 65 };
+        for _ in 0..notches {
+            if mode.contains(TermMode::SGR_MOUSE) {
+                out.extend_from_slice(format!("\x1b[<{btn};{c};{r}M").as_bytes());
+            } else {
+                out.extend_from_slice(&[
+                    0x1b,
+                    b'[',
+                    b'M',
+                    (32 + btn) as u8,
+                    32u8.saturating_add(c.min(223) as u8),
+                    32u8.saturating_add(r.min(223) as u8),
+                ]);
+            }
+        }
+    } else {
+        // App isn't mouse-aware — forwarding anything (arrows included) would
+        // mis-drive it. No-op; a future enhancement can scroll native scrollback.
+        return Ok(());
+    }
+    s.pty_writer.write_all(&out).map_err(|e| e.to_string())?;
     s.pty_writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -2441,6 +2647,16 @@ pub fn term_resize(
         })
         .map_err(|e| e.to_string())?;
     s.last_snapshot.clear();
+    // Release the session lock before `reemit_native` re-acquires it.
+    drop(s);
+    // Push the freshly reflowed grid to the native renderer NOW. `term.resize`
+    // above reflowed alacritty's grid to the new width, but the native surface
+    // only repaints on the pty's next frame — and an idle shell prompt emits
+    // nothing on SIGWINCH, so without this the embedded main pane keeps showing
+    // stale-width text after a sidebar / right-panel drag (the "main shell
+    // doesn't re-wrap on resize" report). Re-emitting snapshots the reflowed
+    // grid and feeds it straight to the surface. No-op for non-mirrored ptys.
+    reemit_native(&state, &id);
     Ok(())
 }
 
@@ -2581,6 +2797,16 @@ pub(crate) enum KillDecision {
     RefuseSuspiciousPgrp,
 }
 
+/// Terminal cleanup a force-killed full-screen app never got to send itself:
+/// leave the alternate screen (1049/1047/47), disable every mouse-reporting +
+/// extended-encoding mode, turn off bracketed paste, and show the cursor.
+/// Without this, SIGKILLing an alt-screen TUI (claude, vim, htop) leaves the
+/// emulator pinned in alt-screen — and since the UI treats alt-screen as "an
+/// agent owns the pane", the shell prompt/input never returns ("Ctrl+C doesn't
+/// bring the input box back").
+#[cfg(unix)]
+const KILL_TERM_RESET: &[u8] = b"\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?25h";
+
 /// SIGKILL the PTY's foreground process group. The escape hatch when
 /// a single Ctrl+C didn't take — bun's run wrapper, some node/python
 /// dev servers, and certain build watchers trap SIGINT and refuse to
@@ -2603,7 +2829,7 @@ pub fn term_kill_foreground(
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         sessions.get(&id).cloned().ok_or("unknown term session")?
     };
-    let s = arc.lock().map_err(|e| e.to_string())?;
+    let mut s = arc.lock().map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         // process_group_leader() returns the foreground pgrp's pid via
@@ -2634,12 +2860,24 @@ pub fn term_kill_foreground(
             let err = std::io::Error::last_os_error();
             // ESRCH = the pgrp already exited between the tcgetpgrp
             // read and the kill call — a benign race, the user got
-            // what they wanted.
+            // what they wanted. Still reset: it may have died dirty.
             if err.raw_os_error() == Some(libc::ESRCH) {
+                s.last_snapshot.clear();
+                let Session { parser, term, .. } = &mut *s;
+                parser.advance(term, KILL_TERM_RESET);
                 return Ok(());
             }
             return Err(format!("kill(-{pgrp}, SIGKILL) failed: {err}"));
         }
+        // A SIGKILLed full-screen TUI (claude, vim) never got to leave the
+        // alternate screen or disable mouse reporting — so the emulator stays
+        // stuck in alt-screen. The UI gates "agent mode" on alt-screen, so the
+        // shell PromptInput would never come back. Feed alacritty the cleanup
+        // the dead app owed us (clearing last_snapshot forces a full re-emit of
+        // the now normal-screen grid).
+        s.last_snapshot.clear();
+        let Session { parser, term, .. } = &mut *s;
+        parser.advance(term, KILL_TERM_RESET);
         Ok(())
     }
     #[cfg(not(unix))]
@@ -2727,6 +2965,10 @@ fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
         scrollback_appended,
         scrollback_reset,
     };
+    // In-process native path (macOS embedded warpui): mirror this frame to
+    // the native surface iff it's the active terminal's pty. By reference —
+    // no serde, no IPC — before the channel send consumes `frame`.
+    emit_native_frame(id, &frame);
     let _ = s.frame_channel.send(frame);
     s.last_snapshot = snapshot;
     s.last_flush = Instant::now();
@@ -3427,7 +3669,10 @@ mod tests {
         // foreground; the " normal" tail must NOT inherit the colour.
         let row = &out[0];
         let red = row.spans.iter().find(|s| s.text.contains("red")).unwrap();
-        assert_eq!(red.fg.as_ref(), ANSI_16[1]); // workshop rust
+        // `&*` pins the Cow<str> to a concrete `&str` so the comparison resolves
+        // to core's PartialEq (a bare `.as_ref()` leaves `&_` ambiguous between
+        // core and muda's `impl PartialEq<&str> for &MenuId`, which fails to infer).
+        assert_eq!(&*red.fg, ANSI_16[1]);
         let after = row
             .spans
             .iter()
@@ -3435,7 +3680,7 @@ mod tests {
             .unwrap();
         // SGR 0 reset means the trailing span's fg goes back to the
         // default ("var(--text-primary)") — anything but the red.
-        assert_ne!(after.fg.as_ref(), ANSI_16[1]);
+        assert_ne!(&*after.fg, ANSI_16[1]);
     }
 
     #[test]
