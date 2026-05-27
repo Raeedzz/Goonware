@@ -176,6 +176,7 @@ pub fn run() {
             // Terminal (alacritty_terminal + custom React renderer)
             term::term_start,
             term::term_input,
+            term::term_native_wheel,
             term::term_resize,
             term::term_reset_grid,
             term::term_close,

@@ -23,6 +23,7 @@
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "transparent": true,
+        "shadow": false,
         "theme": "Dark",
         "fullscreen": false,
         "resizable": true,

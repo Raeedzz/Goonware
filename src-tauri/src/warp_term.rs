@@ -20,7 +20,6 @@
 
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
 
 use warpui::color::ColorU;
 use warpui::elements::{
@@ -48,6 +47,10 @@ const LINE_HEIGHT_RATIO: f32 = 1.3;
 /// only ever leave a little blank scroll-space ABOVE old content, never a gap
 /// below the newest line.
 const LINE_PX: f32 = FONT_SIZE * LINE_HEIGHT_RATIO;
+/// Painted height of the gray meta line (cwd + duration). It renders at a
+/// 1px-smaller font than the body, so its line box is shorter than `LINE_PX`;
+/// `est_block_height` + `build_block` use this so block heights are exact.
+const META_LINE_PX: f32 = (FONT_SIZE - 1.0) * LINE_HEIGHT_RATIO;
 /// `var(--text-primary)` — default foreground (warm light gray).
 const DEFAULT_FG: ColorU = ColorU { r: 0xc9, g: 0xc3, b: 0xb9, a: 255 };
 /// Block cursor fill. Char under it is painted black for contrast.
@@ -70,10 +73,14 @@ const BLOCK_PAD_X: f32 = 14.0;
 const BLOCK_PAD_Y: f32 = 8.0;
 /// Width (px) of the red left stripe on a failed block.
 const STRIPE_W: f32 = 2.0;
-/// Cap on closed blocks rendered per frame (newest-first). Bounds the
-/// retained-tree rebuild cost until M2.4 adds windowed scrollback. Older
-/// history is retained in the model, just not painted past this depth.
-const BLOCK_RENDER_CAP: usize = 24;
+/// How many of the newest closed blocks the scroll-back can page through.
+/// Matches the persistence restore window (`HISTORY_LOAD_WINDOW = 500`), so the
+/// user can scroll through their entire restored history. This is NO LONGER a
+/// performance bound — transcript virtualization makes each frame O(viewport)
+/// regardless of depth, and each block's height is cached (`NativeBlock.height`)
+/// so the per-frame height sweep is O(blocks), not O(rows). Older history beyond
+/// this stays on disk and would need a deeper load window to surface.
+const BLOCK_RENDER_CAP: usize = 500;
 
 /* ------------------------------------------------------------------
    Assets — warpui loads fonts from the OS, so the embedded surface
@@ -103,6 +110,34 @@ struct NativeBlock {
     cwd: Option<String>,
     duration_ms: Option<u64>,
     exit_code: Option<i32>,
+    /// Cached painted height (px), computed ONCE at construction via
+    /// `est_block_height`. A closed block is immutable, so its height never
+    /// changes — caching it keeps the per-frame virtualization Pass-1 O(blocks)
+    /// instead of O(total rows), which matters now that the render cap is deep
+    /// (hundreds of blocks). Exact (see `est_block_height`), so it doubles as the
+    /// off-screen spacer height with zero drift.
+    height: f32,
+}
+
+impl NativeBlock {
+    fn new(
+        command: String,
+        rows: Vec<RowSnapshot>,
+        cwd: Option<String>,
+        duration_ms: Option<u64>,
+        exit_code: Option<i32>,
+    ) -> Self {
+        let mut b = Self {
+            command,
+            rows,
+            cwd,
+            duration_ms,
+            exit_code,
+            height: 0.0,
+        };
+        b.height = est_block_height(&b);
+        b
+    }
 }
 
 struct TermGrid {
@@ -129,6 +164,12 @@ struct TermGrid {
     /// bottom. An upward scroll clears this; scrolling back to the bottom (or the
     /// content shrinking to fit) re-arms it.
     stick_bottom: bool,
+    /// Last observed maximum scroll offset (content_height − viewport), learned
+    /// from the scroll handle while pinned to the bottom (where the clamped
+    /// `scroll_start()` IS the max). Used to decide when a downward scroll has
+    /// actually reached the bottom — so we re-arm stick THERE, not on every
+    /// downward tick (which made scroll-down snap straight to the bottom).
+    known_max: f32,
     /// Frames applied since attach — diagnostic only.
     frames: u64,
 }
@@ -147,6 +188,7 @@ impl TermGrid {
             blocks: Vec::new(),
             scroll_px: 0.0,
             stick_bottom: true,
+            known_max: 0.0,
             frames: 0,
         }
     }
@@ -544,46 +586,83 @@ fn live_row_count(rows: &[RowSnapshot], cursor_on: bool, cursor_row: usize) -> u
     if rows.is_empty() {
         return 0;
     }
-    let mut last = if cursor_on {
-        cursor_row.min(rows.len() - 1)
-    } else {
-        0
-    };
+    // Find the last row with actual glyphs.
+    let mut last_content = 0usize;
+    let mut found = false;
     for (i, row) in rows.iter().enumerate() {
         if row_has_content(row) {
-            last = last.max(i);
+            last_content = i;
+            found = true;
         }
     }
-    last + 1
+    // Trailing blank rows are trimmed so an agent (claude) that paints its UI in
+    // the top N rows of a tall PTY and leaves the rest blank renders as an
+    // N-row block anchored at the bottom of the pane — NOT floating at the top
+    // with black below it. Crucially the cursor only EXTENDS the count when it
+    // sits at (or one row past) the content: a cursor parked deep in the blank
+    // tail — which is what was re-including rows 27..44 and pushing claude's
+    // content up — must not re-pad the grid. (claude's own input cursor lives
+    // inside its content, so this keeps the input row visible.)
+    let mut end = if found { last_content } else { 0 };
+    if cursor_on && cursor_row <= end + 1 {
+        end = end.max(cursor_row.min(rows.len() - 1));
+    }
+    end + 1
 }
 
-/// Estimated painted height (px) of one closed block — for the scroll-back top
-/// spacer + fit decision only, NOT layout. Counts the meta line, command line,
-/// and visible output rows at `LINE_PX` plus the block's vertical padding, but
-/// deliberately omits the 1px divider and 2px inter-row spacing so the estimate
-/// runs slightly UNDER the true height (a safe bias: the spacer can only leave a
-/// little blank scroll-space above old content, never a gap below the newest).
+/// A fixed-height transparent box — the stand-in for content the virtualizer
+/// skips (off-screen blocks, or off-screen rows inside a tall block). Holding
+/// the skipped height keeps the scroll geometry identical to building it all.
+fn spacer_box(h: f32) -> Box<dyn Element> {
+    Box::new(ConstrainedBox::new(Rect::new().finish()).with_height(h))
+}
+
+/// Painted height (px) of one closed block — EXACT, matching what `build_block`
+/// lays out, so it doubles as the off-screen spacer height with ZERO drift at any
+/// scroll depth (this is what lets the render cap go deep). warpui line boxes are
+/// `font_size * line_height_ratio` with no rounding (`text.rs::line_height`), and
+/// `Container::layout` adds padding + border to the child size, so the height is
+/// fully determined:
+///   - gray meta line (cwd/duration), if present: `META_LINE_PX` — it renders at
+///     a 1px-smaller font, the ONE term that used to be approximated
+///   - bold command line, if present: `LINE_PX`
+///   - each visible output row (zsh EOL marker stripped): `LINE_PX`
+///   - the block's vertical padding (`2 * BLOCK_PAD_Y`) + the 1px bottom divider
 fn est_block_height(block: &NativeBlock) -> f32 {
-    let mut lines = 0usize;
+    let mut h = 2.0 * BLOCK_PAD_Y + 1.0;
     if block.cwd.is_some() || block.duration_ms.is_some() {
-        lines += 1;
+        h += META_LINE_PX;
     }
     if !block.command.is_empty() {
-        lines += 1;
+        h += LINE_PX;
     }
-    lines += block.rows.iter().filter(|r| !is_zsh_eol_marker(r)).count();
-    lines as f32 * LINE_PX + 2.0 * BLOCK_PAD_Y
+    h += block.rows.iter().filter(|r| !is_zsh_eol_marker(r)).count() as f32 * LINE_PX;
+    h
 }
 
 /// Build one closed block, Warp-style: a gray meta line (`cwd (duration)`) on
 /// top, then the command in bold white (no prompt glyph), then the output rows,
 /// with a hairline divider beneath. A failed command gets a dark maroon fill and
 /// a red left stripe — its only status accents (no "exit N" text).
-fn build_block(block: &NativeBlock, mono: FamilyId) -> Box<dyn Element> {
+///
+/// `win = Some((block_top_y, build_top, build_bot))` (all content-px) enables
+/// ROW-LEVEL virtualization: only output rows intersecting `[build_top,
+/// build_bot]` are built; the rest collapse into exact-height spacer rects
+/// above/below. This bounds the cost of a single block TALLER than the viewport
+/// (a long `cat`, a deep agent session — `block_rows` is uncapped) to one screen
+/// of rows. It degrades to "build every row" automatically when the block fits
+/// inside the window, so the caller passes it unconditionally; `None` (the
+/// height-unknown fallback path) also builds everything.
+fn build_block(
+    block: &NativeBlock,
+    mono: FamilyId,
+    win: Option<(f32, f32, f32)>,
+) -> Box<dyn Element> {
     let failed = matches!(block.exit_code, Some(c) if c != 0);
-    let mut children: Vec<Box<dyn Element>> = Vec::new();
 
-    // Meta line FIRST (above the command): "{cwd} ({duration})", gray.
+    // Header: gray meta line ("{cwd} ({duration})") then the bold command line.
+    // Always built — two lines at most.
+    let mut header: Vec<Box<dyn Element>> = Vec::new();
     let mut meta = String::new();
     if let Some(cwd) = &block.cwd {
         meta.push_str(&collapse_home(cwd));
@@ -594,8 +673,9 @@ fn build_block(block: &NativeBlock, mono: FamilyId) -> Box<dyn Element> {
         }
         meta.push_str(&format!("({})", format_duration(d)));
     }
-    if !meta.is_empty() {
-        children.push(
+    let has_meta = !meta.is_empty();
+    if has_meta {
+        header.push(
             Text::new(meta, mono, FONT_SIZE - 1.0)
                 .with_color(META_FG)
                 .with_line_height_ratio(LINE_HEIGHT_RATIO)
@@ -603,10 +683,9 @@ fn build_block(block: &NativeBlock, mono: FamilyId) -> Box<dyn Element> {
                 .finish(),
         );
     }
-
-    // Command line: bright white, bold, no prompt glyph.
-    if !block.command.is_empty() {
-        children.push(
+    let has_command = !block.command.is_empty();
+    if has_command {
+        header.push(
             Text::new(block.command.clone(), mono, FONT_SIZE)
                 .with_color(COMMAND_FG)
                 .with_style(text_props(true, false))
@@ -615,17 +694,57 @@ fn build_block(block: &NativeBlock, mono: FamilyId) -> Box<dyn Element> {
                 .finish(),
         );
     }
+    // Exact header height — the meta line renders at a smaller font than the
+    // command — so the row window below lands on the correct output rows.
+    let header_h = (if has_meta { META_LINE_PX } else { 0.0 })
+        + (if has_command { LINE_PX } else { 0.0 });
 
-    // Output rows (strip zsh's stray reverse-video EOL marker).
-    for row in &block.rows {
-        if is_zsh_eol_marker(row) {
-            continue;
+    // Output rows (zsh's stray reverse-video EOL marker stripped).
+    let out_rows: Vec<&RowSnapshot> =
+        block.rows.iter().filter(|r| !is_zsh_eol_marker(r)).collect();
+    let n = out_rows.len();
+
+    // The window of output rows to actually build. Rows are a contiguous run of
+    // `LINE_PX`-tall boxes starting at `block_top + padding + header`, so the
+    // first/last visible indices fall straight out of the build region. Clamped
+    // to [0, n]; an empty or fully-in-window block yields (0, n) → build all.
+    let (i0, i1) = match win {
+        Some((block_top, build_top, build_bot)) => {
+            let rows_top = block_top + BLOCK_PAD_Y + header_h;
+            let lo = ((((build_top - rows_top) / LINE_PX).floor()) as isize).max(0) as usize;
+            let lo = lo.min(n);
+            let hi = ((((build_bot - rows_top) / LINE_PX).ceil()) as isize).max(0) as usize;
+            (lo, hi.clamp(lo, n))
         }
-        children.push(build_row(&row.spans, None, mono));
+        None => (0, n),
+    };
+
+    // Output rows in their own zero-spacing column; off-screen runs become
+    // spacer rects so the block's height is identical to building every row.
+    let mut rows_col: Vec<Box<dyn Element>> = Vec::with_capacity(i1 - i0 + 2);
+    if i0 > 0 {
+        rows_col.push(spacer_box(i0 as f32 * LINE_PX));
+    }
+    for row in &out_rows[i0..i1] {
+        rows_col.push(build_row(&row.spans, None, mono));
+    }
+    if i1 < n {
+        rows_col.push(spacer_box((n - i1) as f32 * LINE_PX));
     }
 
+    let mut children = header;
+    children.push(
+        Flex::column()
+            .with_spacing(0.0)
+            .with_children(rows_col)
+            .finish(),
+    );
+
+    // Zero inter-line spacing: terminal output is contiguous, and it keeps every
+    // row exactly `LINE_PX` tall — which `est_block_height` and the row windowing
+    // above both rely on.
     let content = Flex::column()
-        .with_spacing(2.0)
+        .with_spacing(0.0)
         .with_children(children)
         .finish();
 
@@ -730,49 +849,49 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             .with_spacing(0.0)
             .with_children(row_els)
             .finish()
-    } else if agent_on {
-        // Agent owns the pane: live grid only, bottom-anchored, NO scroll-back.
-        let row_count = live_row_count(&g.rows, cursor_on, cursor_row);
-        let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(row_count);
-        for (r, row) in g.rows.iter().take(row_count).enumerate() {
-            let cur = if cursor_on && r == cursor_row {
-                Some(cursor_col)
-            } else {
-                None
-            };
-            row_els.push(build_row(&row.spans, cur, mono));
-        }
-        let grid = Flex::column()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_main_axis_alignment(MainAxisAlignment::End)
-            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_spacing(0.0)
-            .with_children(row_els)
-            .finish();
-        // Pin below the AgentChrome strip when React has reported the content
-        // region; otherwise fill the pane (prior behavior).
-        let top = *p.viewport_top.lock().unwrap_or_else(|e| e.into_inner());
-        let h = *p.viewport_h.lock().unwrap_or_else(|e| e.into_inner());
-        if h > 1.0 {
-            pin_region(grid, top, h)
-        } else {
-            grid
-        }
     } else {
-        // Shell transcript: closed blocks (oldest first, capped) + the running
-        // command's live grid, top→bottom, wrapped for scroll-back.
-        let mut children: Vec<Box<dyn Element>> = Vec::new();
-        let mut content_est = 0.0f32;
+        // Shell transcript AND inline agents (claude/codex): closed blocks
+        // (oldest first, capped) + the live grid, top→bottom, wrapped for
+        // scroll-back — one continuous scroll flow, exactly like Warp. The
+        // agent is just the newest content in the stream (NOT a separate
+        // live-grid-only mode), so the user can scroll the whole terminal up
+        // through history while an agent is foregrounded. The live grid is
+        // rendered while a command runs OR an agent owns the pane (`agent_on`),
+        // so claude stays visible across the command_running flicker between
+        // its turns.
+        // VIRTUALIZED. `ClippedScrollable` lays out AND paints its entire child
+        // every frame and only THEN clips (see its own doc comment — "by its
+        // nature slow"), so building every block made scroll-back O(transcript)
+        // per frame and janky on deep history. We instead build only the blocks
+        // intersecting the visible window (± one viewport of overscan) and stand
+        // in a single fixed-height spacer rect for each off-screen run. Total
+        // content height, scroll offset, and clamping stay byte-identical to
+        // building everything (each spacer == `est_block_height`, which now
+        // matches a block's true laid-out height) — but layout + paint drop to
+        // O(viewport).
         let start = n_blocks.saturating_sub(BLOCK_RENDER_CAP);
+        let mut heights: Vec<f32> = Vec::with_capacity(g.blocks.len() - start);
+        let mut content_est = 0.0f32;
         for block in &g.blocks[start..] {
-            content_est += est_block_height(block);
-            children.push(build_block(block, mono));
+            content_est += block.height;
+            heights.push(block.height);
         }
-        if g.command_running {
-            let row_count = live_row_count(&g.rows, cursor_on, cursor_row);
-            content_est += row_count as f32 * LINE_PX;
-            let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(row_count);
-            for (r, row) in g.rows.iter().take(row_count).enumerate() {
+        // The live grid (running command / foregrounded agent) is the active
+        // tail — always built (one screen of rows at most, the same cheap cost
+        // as the smooth alt-screen path) and stacked last; its height feeds the
+        // total so the scroll range stays right while it's pinned to the bottom.
+        // Takes `&TermGrid` as an arg (captures nothing of `g`) so it can be
+        // called after the `stick_bottom`/`known_max` mutations below.
+        let live_on = g.command_running || agent_on;
+        let live_count = if live_on {
+            live_row_count(&g.rows, cursor_on, cursor_row)
+        } else {
+            0
+        };
+        content_est += live_count as f32 * LINE_PX;
+        let build_live = |g: &TermGrid| -> Box<dyn Element> {
+            let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(live_count);
+            for (r, row) in g.rows.iter().take(live_count).enumerate() {
                 let cur = if cursor_on && r == cursor_row {
                     Some(cursor_col)
                 } else {
@@ -780,17 +899,23 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
                 };
                 row_els.push(build_row(&row.spans, cur, mono));
             }
-            children.push(
-                Flex::column()
-                    .with_spacing(0.0)
-                    .with_children(row_els)
-                    .finish(),
-            );
-        }
+            Flex::column()
+                .with_spacing(0.0)
+                .with_children(row_els)
+                .finish()
+        };
 
         let viewport = pane_h;
         if viewport <= 1.0 {
-            // Pane height not reported yet — bottom-anchored fallback.
+            // Pane height not reported yet — bottom-anchored fallback, build all
+            // (only the first frame or two, before React reports the rect).
+            let mut children: Vec<Box<dyn Element>> = Vec::with_capacity(heights.len() + 1);
+            for block in &g.blocks[start..] {
+                children.push(build_block(block, mono, None));
+            }
+            if live_on {
+                children.push(build_live(&g));
+            }
             Flex::column()
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_main_axis_alignment(MainAxisAlignment::End)
@@ -807,9 +932,22 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
                     viewport
                 }
             };
+            // The clamped offset reported by the handle. While pinned to the
+            // bottom (stick), `scroll_to(1e9)` was clamped by `after_layout` to
+            // the true maximum, so this value IS the max scroll — learn it so we
+            // know where "the bottom" actually is.
+            let clamped_now = p.scroll.scroll_start().as_f32();
+            if g.stick_bottom {
+                g.known_max = clamped_now;
+            }
             if content_est < content_vp {
+                // Everything fits — nothing to scroll, pin to bottom.
                 g.stick_bottom = true;
-            } else if !g.stick_bottom && g.scroll_px > p.scroll.scroll_start().as_f32() + 1.0 {
+            } else if !g.stick_bottom && g.scroll_px >= g.known_max - 4.0 {
+                // The user scrolled DOWN all the way to the bottom — only NOW
+                // re-arm auto-follow. (The old check re-armed whenever scroll_px
+                // exceeded the *current* position, so every downward tick snapped
+                // straight to the bottom instead of scrolling.)
                 g.stick_bottom = true;
             }
             if g.stick_bottom {
@@ -817,14 +955,53 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             } else {
                 p.scroll.scroll_to(Pixels::new(g.scroll_px));
             }
-            let spacer = (content_vp - content_est).max(0.0);
+
+            // The visible window in content coordinates. `fit_spacer`
+            // bottom-anchors a transcript shorter than the viewport (content
+            // begins that far down); when it overflows, fit_spacer == 0 and the
+            // blocks start at the top. The offset is the bottom-clamped max while
+            // sticking, else the user's scroll_px.
+            let fit_spacer = (content_vp - content_est).max(0.0);
+            let max_scroll = (content_est - content_vp).max(0.0);
+            let win_top = if g.stick_bottom {
+                max_scroll
+            } else {
+                g.scroll_px.clamp(0.0, max_scroll)
+            };
+            let overscan = content_vp;
+            let build_top = (win_top - overscan).max(0.0);
+            let build_bot = win_top + content_vp + overscan;
+
             let mut col_children: Vec<Box<dyn Element>> = Vec::new();
-            if spacer > 0.5 {
-                col_children.push(Box::new(
-                    ConstrainedBox::new(Rect::new().finish()).with_height(spacer),
-                ));
+            if fit_spacer > 0.5 {
+                col_children.push(spacer_box(fit_spacer));
             }
-            col_children.extend(children);
+            // Walk blocks top→bottom; build those intersecting the window,
+            // coalescing each off-screen run into one spacer of its summed height.
+            let mut y = fit_spacer;
+            let mut skipped = 0.0f32;
+            for (block, &h) in g.blocks[start..].iter().zip(heights.iter()) {
+                let on = (y + h) > build_top && y < build_bot;
+                if on {
+                    if skipped > 0.5 {
+                        col_children.push(spacer_box(skipped));
+                        skipped = 0.0;
+                    }
+                    // Pass the window so a block taller than the viewport only
+                    // builds its on-screen rows (row-level virtualization).
+                    col_children.push(build_block(block, mono, Some((y, build_top, build_bot))));
+                } else {
+                    skipped += h;
+                }
+                y += h;
+            }
+            if skipped > 0.5 {
+                col_children.push(spacer_box(skipped));
+            }
+            if live_on {
+                col_children.push(build_live(&g));
+            }
+
             let content = Flex::column()
                 .with_main_axis_size(MainAxisSize::Min)
                 .with_main_axis_alignment(MainAxisAlignment::Start)
@@ -873,7 +1050,6 @@ impl View for TerminalRootView {
     }
 
     fn render(&self, _: &AppContext) -> Box<dyn Element> {
-        let t0 = Instant::now();
         let ps = panes();
         let main = &ps[0];
         let side = &ps[1];
@@ -906,22 +1082,10 @@ impl View for TerminalRootView {
             main_col
         };
 
-        let root = Stack::new()
+        Stack::new()
             .with_child(Rect::new().with_background_color(ColorU::black()).finish())
             .with_child(column)
-            .finish();
-
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static RENDERS: AtomicU64 = AtomicU64::new(0);
-        let n = RENDERS.fetch_add(1, Ordering::Relaxed);
-        if n < 5 || n % 120 == 0 {
-            eprintln!(
-                "[warpui] render #{n}: side={side_on} build={:.2}ms",
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-
-        root
+            .finish()
     }
 }
 
@@ -988,13 +1152,13 @@ pub fn attach(app: &tauri::AppHandle) {
     crate::term::set_native_block_sink(Box::new(move |pty_id: &str, block: &ClosedBlock| {
         if let Some(p) = pane_for_pty(pty_id) {
             let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
-            g.blocks.push(NativeBlock {
-                command: block.input.clone(),
-                rows: block.block_rows.clone(),
-                cwd: block.cwd.clone(),
-                duration_ms: block.duration_ms,
-                exit_code: block.exit_code,
-            });
+            g.blocks.push(NativeBlock::new(
+                block.input.clone(),
+                block.block_rows.clone(),
+                block.cwd.clone(),
+                block.duration_ms,
+                block.exit_code,
+            ));
         }
         let _ = app_for_block.run_on_main_thread(|| {
             warpui::platform::poke_embedded_redraw();
@@ -1103,37 +1267,31 @@ pub fn attach(app: &tauri::AppHandle) {
             });
             std::thread::sleep(Duration::from_millis(300));
 
-            // Two-pane layout check: shrink main and place a (content-less) side
-            // pane to its right, reposition the surface to the combined box, and
-            // capture — verifies the Flex::row side-by-side render + combined
-            // surface geometry that real multi-pane (right panel open) exercises.
+            // Agent-mode capture: flip the main pane into agent mode and snapshot
+            // so the agent grid's bottom-anchor + viewport pinning can be
+            // inspected off-screen (the "claude spawns half above the viewport"
+            // report). Uses the real shell grid content already loaded above.
             {
                 let mp = pane("main");
-                if let Ok(mut r) = mp.rect.lock() {
-                    *r = (0.0, 0.0, 500.0, 800.0);
-                }
-                let sp = pane("side");
-                if let Ok(mut g) = sp.pty.lock() {
-                    g.clear();
-                    g.push_str("selftest-side");
-                }
-                if let Ok(mut r) = sp.rect.lock() {
-                    *r = (508.0, 0.0, 300.0, 800.0);
-                }
-                reposition_surface();
+                mp.agent_mode
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ =
                     app_for_test.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
-                std::thread::sleep(Duration::from_millis(400));
-                eprintln!("[selftest] two-pane: main(0,0,500,800) + side(508,0,300,800)");
+                std::thread::sleep(Duration::from_millis(300));
+                let vt = *mp.viewport_top.lock().unwrap_or_else(|e| e.into_inner());
+                let vh = *mp.viewport_h.lock().unwrap_or_else(|e| e.into_inner());
+                eprintln!("[selftest] agent-mode capture: viewport_top={vt} viewport_h={vh}");
                 if let Some(wid) = CAPTURE_WID.lock().ok().and_then(|g| *g) {
                     let _ = app_for_test.run_on_main_thread(move || {
                         warpui::platform::capture_embedded(
                             wid,
-                            Box::new(|frame| save_capture_png(&frame, "/tmp/warpui_twopane.png")),
+                            Box::new(|frame| save_capture_png(&frame, "/tmp/warpui_agent.png")),
                         );
                     });
                 }
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(500));
+                mp.agent_mode
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
         });
     }
@@ -1165,7 +1323,6 @@ pub fn term_native_attach(
     state: tauri::State<crate::term::TerminalState>,
 ) {
     use tauri::Manager as _;
-    eprintln!("[warpui] term_native_attach: pane={pane_key} id={id}");
     let p = pane(&pane_key);
     // Stop mirroring this pane's previous pty, then mirror the new one.
     let prev = p.pty_id();
@@ -1192,13 +1349,14 @@ pub fn term_native_attach(
                     let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
                     g.blocks = saved
                         .into_iter()
-                        .map(|sb| NativeBlock {
-                            command: sb.input,
-                            rows: serde_json::from_value(sb.block_rows_json)
-                                .unwrap_or_default(),
-                            cwd: sb.cwd,
-                            duration_ms: sb.duration_ms.map(|d| d.max(0) as u64),
-                            exit_code: sb.exit_code,
+                        .map(|sb| {
+                            NativeBlock::new(
+                                sb.input,
+                                serde_json::from_value(sb.block_rows_json).unwrap_or_default(),
+                                sb.cwd,
+                                sb.duration_ms.map(|d| d.max(0) as u64),
+                                sb.exit_code,
+                            )
                         })
                         .collect();
                 }

@@ -654,25 +654,10 @@ pub fn clear_native_pty(id: &str) {
 /// Hand a freshly-built frame to the native sink iff `id` is a mirrored pty.
 #[inline]
 fn emit_native_frame(id: &str, frame: &RenderFrame) {
-    let sink_present = NATIVE_SINK.get().is_some();
     let is_target = NATIVE_PTYS
         .lock()
         .map(|g| g.iter().any(|p| p == id))
         .unwrap_or(false);
-    // Diagnostic (logged BEFORE the sink/match gate so it fires even when the
-    // sink is missing or the pty doesn't match): surfaces exactly why a frame
-    // did or didn't reach the native grid.
-    {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        if n < 30 {
-            eprintln!(
-                "[warpui] emit_native_frame#{n}: pty={id} match={is_target} sink={sink_present} grid={}x{} dirty={}",
-                frame.cols, frame.rows, frame.dirty.len()
-            );
-        }
-    }
     if is_target {
         if let Some(sink) = NATIVE_SINK.get() {
             sink(id, frame);
@@ -2158,7 +2143,6 @@ pub fn term_start(
     // struct. The frontend invokes with `{ args: {...}, frameChannel }`.
     frame_channel: Channel<RenderFrame>,
 ) -> Result<(), String> {
-    eprintln!("[warpui] term_start: id={}", args.id);
     // Idempotent path: if a PTY with this id is already alive, reuse
     // it and re-emit the full grid as a single "all rows dirty" frame
     // so the freshly-mounted React component can hydrate without ever
@@ -2563,6 +2547,70 @@ pub fn term_input(
     Ok(())
 }
 
+/// Forward a mouse-wheel scroll to the PTY for an alt-screen / mouse-mode app
+/// (vim, htop, claude's TUI) so the APP scrolls its own view — exactly what a
+/// real terminal does. The normal-screen shell scrolls the native transcript
+/// instead (via `term_native_scroll`); this is the alt-screen path. Encoding
+/// follows the pty's current mode:
+///   - mouse reporting on  → mouse-wheel buttons (SGR `\e[<64/65;c;rM`, else X10)
+///   - else alternate-scroll (DECSET 1007, alacritty's alt-screen default)
+///     → arrow keys (cursor-app-mode aware)
+/// `delta_lines` is signed wheel notches: negative = up/older, positive =
+/// down/newer. No-op when the app wants neither (nothing to scroll).
+#[tauri::command]
+pub fn term_native_wheel(
+    state: State<TerminalState>,
+    id: String,
+    delta_lines: i32,
+    col: u16,
+    row: u16,
+) -> Result<(), String> {
+    let arc = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.get(&id).cloned().ok_or("unknown term session")?
+    };
+    let mut s = arc.lock().map_err(|e| e.to_string())?;
+    let mode = s.term.mode();
+    let notches = (delta_lines.unsigned_abs() as usize).clamp(1, 8);
+    let up = delta_lines < 0;
+    let c = col.clamp(1, s.cols.max(1));
+    let r = row.clamp(1, s.rows.max(1));
+    let mut out: Vec<u8> = Vec::new();
+    // Send mouse-wheel events — a smooth, app-native scroll — to any TUI that is
+    // mouse/SGR aware (claude sets SGR mode 1006). We do NOT fall back to arrow
+    // keys: `ALTERNATE_SCROLL` is alacritty's *default*, not something the app
+    // opted into, so translating the wheel to arrows fires for every alt-screen
+    // app and an app like claude reads those arrows as input-cursor movement,
+    // not scroll — which is the "scroll sends arrows / doesn't scroll" report.
+    // An app that ignores mouse reports simply discards the CSI sequence (no
+    // stray characters), so this is safe even when only the SGR encoding is set.
+    if mode.contains(TermMode::MOUSE_MODE) || mode.contains(TermMode::SGR_MOUSE) {
+        // Wheel button codes: 64 = up, 65 = down.
+        let btn: u32 = if up { 64 } else { 65 };
+        for _ in 0..notches {
+            if mode.contains(TermMode::SGR_MOUSE) {
+                out.extend_from_slice(format!("\x1b[<{btn};{c};{r}M").as_bytes());
+            } else {
+                out.extend_from_slice(&[
+                    0x1b,
+                    b'[',
+                    b'M',
+                    (32 + btn) as u8,
+                    32u8.saturating_add(c.min(223) as u8),
+                    32u8.saturating_add(r.min(223) as u8),
+                ]);
+            }
+        }
+    } else {
+        // App isn't mouse-aware — forwarding anything (arrows included) would
+        // mis-drive it. No-op; a future enhancement can scroll native scrollback.
+        return Ok(());
+    }
+    s.pty_writer.write_all(&out).map_err(|e| e.to_string())?;
+    s.pty_writer.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn term_resize(
     state: State<TerminalState>,
@@ -2739,6 +2787,16 @@ pub(crate) enum KillDecision {
     RefuseSuspiciousPgrp,
 }
 
+/// Terminal cleanup a force-killed full-screen app never got to send itself:
+/// leave the alternate screen (1049/1047/47), disable every mouse-reporting +
+/// extended-encoding mode, turn off bracketed paste, and show the cursor.
+/// Without this, SIGKILLing an alt-screen TUI (claude, vim, htop) leaves the
+/// emulator pinned in alt-screen — and since the UI treats alt-screen as "an
+/// agent owns the pane", the shell prompt/input never returns ("Ctrl+C doesn't
+/// bring the input box back").
+#[cfg(unix)]
+const KILL_TERM_RESET: &[u8] = b"\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?25h";
+
 /// SIGKILL the PTY's foreground process group. The escape hatch when
 /// a single Ctrl+C didn't take — bun's run wrapper, some node/python
 /// dev servers, and certain build watchers trap SIGINT and refuse to
@@ -2761,7 +2819,7 @@ pub fn term_kill_foreground(
         let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
         sessions.get(&id).cloned().ok_or("unknown term session")?
     };
-    let s = arc.lock().map_err(|e| e.to_string())?;
+    let mut s = arc.lock().map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         // process_group_leader() returns the foreground pgrp's pid via
@@ -2792,12 +2850,24 @@ pub fn term_kill_foreground(
             let err = std::io::Error::last_os_error();
             // ESRCH = the pgrp already exited between the tcgetpgrp
             // read and the kill call — a benign race, the user got
-            // what they wanted.
+            // what they wanted. Still reset: it may have died dirty.
             if err.raw_os_error() == Some(libc::ESRCH) {
+                s.last_snapshot.clear();
+                let Session { parser, term, .. } = &mut *s;
+                parser.advance(term, KILL_TERM_RESET);
                 return Ok(());
             }
             return Err(format!("kill(-{pgrp}, SIGKILL) failed: {err}"));
         }
+        // A SIGKILLed full-screen TUI (claude, vim) never got to leave the
+        // alternate screen or disable mouse reporting — so the emulator stays
+        // stuck in alt-screen. The UI gates "agent mode" on alt-screen, so the
+        // shell PromptInput would never come back. Feed alacritty the cleanup
+        // the dead app owed us (clearing last_snapshot forces a full re-emit of
+        // the now normal-screen grid).
+        s.last_snapshot.clear();
+        let Session { parser, term, .. } = &mut *s;
+        parser.advance(term, KILL_TERM_RESET);
         Ok(())
     }
     #[cfg(not(unix))]
@@ -2812,14 +2882,6 @@ pub fn term_kill_foreground(
    ------------------------------------------------------------------ */
 
 fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
-    {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        if n < 20 {
-            eprintln!("[warpui] maybe_flush#{n}: pty={id}");
-        }
-    }
     let cmd_running = s.segmenter.command_running();
     let cmd_running_changed = cmd_running != s.last_command_running;
     let throttle = session_frame_throttle(s.visible);
