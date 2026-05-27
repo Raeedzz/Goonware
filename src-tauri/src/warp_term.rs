@@ -107,6 +107,12 @@ impl warpui::AssetProvider for TermAssets {
 struct NativeBlock {
     command: String,
     rows: Vec<RowSnapshot>,
+    /// The block's raw output transcript (bytes, with ANSI + hard newlines).
+    /// Kept so the block can RE-WRAP on a column change, Warp-style: replaying
+    /// it through the VT at the new width re-soft-wraps the text while the hard
+    /// newlines (real line breaks) stay put. `rows` above is just the cached
+    /// wrap at the current width; this is the source of truth for reflow.
+    transcript: String,
     cwd: Option<String>,
     duration_ms: Option<u64>,
     exit_code: Option<i32>,
@@ -123,6 +129,7 @@ impl NativeBlock {
     fn new(
         command: String,
         rows: Vec<RowSnapshot>,
+        transcript: String,
         cwd: Option<String>,
         duration_ms: Option<u64>,
         exit_code: Option<i32>,
@@ -130,6 +137,7 @@ impl NativeBlock {
         let mut b = Self {
             command,
             rows,
+            transcript,
             cwd,
             duration_ms,
             exit_code,
@@ -164,12 +172,6 @@ struct TermGrid {
     /// bottom. An upward scroll clears this; scrolling back to the bottom (or the
     /// content shrinking to fit) re-arms it.
     stick_bottom: bool,
-    /// Last observed maximum scroll offset (content_height − viewport), learned
-    /// from the scroll handle while pinned to the bottom (where the clamped
-    /// `scroll_start()` IS the max). Used to decide when a downward scroll has
-    /// actually reached the bottom — so we re-arm stick THERE, not on every
-    /// downward tick (which made scroll-down snap straight to the bottom).
-    known_max: f32,
     /// Frames applied since attach — diagnostic only.
     frames: u64,
 }
@@ -188,7 +190,6 @@ impl TermGrid {
             blocks: Vec::new(),
             scroll_px: 0.0,
             stick_bottom: true,
-            known_max: 0.0,
             frames: 0,
         }
     }
@@ -201,6 +202,13 @@ impl TermGrid {
             self.rows
                 .resize(f.rows as usize, RowSnapshot { spans: Vec::new() });
             self.n_rows = f.rows;
+        }
+        // Reflow stored closed blocks when the column count changes (a pane /
+        // window resize), Warp-style — see `rewrap_blocks`. Skip the first frame
+        // (n_cols == 0: nothing stored yet) and alt-screen (the app owns the
+        // grid; blocks aren't painted there).
+        if self.n_cols != 0 && f.cols != self.n_cols && !f.alt_screen {
+            self.rewrap_blocks(f.cols);
         }
         self.n_cols = f.cols;
         for d in &f.dirty {
@@ -215,6 +223,30 @@ impl TermGrid {
         self.command_running = f.command_running;
         self.alt_screen = f.alt_screen;
         self.frames = self.frames.wrapping_add(1);
+    }
+
+    /// Re-wrap every stored closed block to `cols`, recomputing each cached
+    /// height. This is the Warp reflow: a block keeps its raw `transcript`
+    /// (bytes + hard newlines), so replaying it through the VT at the new width
+    /// re-soft-wraps the text while real line breaks stay put — identical in
+    /// effect to Warp rebuilding its soft-wrap index. Bounded to the most-recent
+    /// `BLOCK_RENDER_CAP` (only those can be painted) and only invoked when the
+    /// width actually changes (the React resize is debounced), so it costs a
+    /// handful of replays per drag, not one per frame. Runs on the pty reader
+    /// thread (the frame sink), off the render thread.
+    fn rewrap_blocks(&mut self, cols: u16) {
+        if cols == 0 {
+            return;
+        }
+        let rows = self.n_rows.max(1);
+        let start = self.blocks.len().saturating_sub(BLOCK_RENDER_CAP);
+        for b in &mut self.blocks[start..] {
+            if b.transcript.is_empty() {
+                continue;
+            }
+            b.rows = crate::term::snapshot_transcript(&b.transcript, cols, rows);
+            b.height = est_block_height(b);
+        }
     }
 }
 
@@ -231,6 +263,11 @@ struct Pane {
     /// per-frame element rebuild; render mirrors scroll_px/stick_bottom in,
     /// `term_native_scroll` reads the clamped offset back out).
     scroll: ClippedScrollStateHandle,
+    /// Horizontal scroll-back handle for the panes whose PTY grid is wider than
+    /// their on-screen width (the narrow right-panel side terminal pins a wide
+    /// PTY so `ls` lays out in columns; the user pans to the off-screen columns).
+    /// `term_native_hscroll` writes it; render clamps to the real range.
+    hscroll: ClippedScrollStateHandle,
     /// Selection handle for this pane's `SelectableArea` (driven by injected mouse).
     sel: SelectionHandle,
     /// Latest selected text in this pane (read by `term_native_selection_text`).
@@ -256,6 +293,7 @@ impl Pane {
             pty: Mutex::new(String::new()),
             grid: Arc::new(Mutex::new(TermGrid::empty())),
             scroll: ClippedScrollStateHandle::new(),
+            hscroll: ClippedScrollStateHandle::new(),
             sel: SelectionHandle::default(),
             selection: Mutex::new(None),
             agent_mode: std::sync::atomic::AtomicBool::new(false),
@@ -823,7 +861,17 @@ fn pin_region(content: Box<dyn Element>, top: f32, height: f32) -> Box<dyn Eleme
 /// into `p.selection`.
 fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
     let agent_on = p.agent_mode.load(std::sync::atomic::Ordering::Relaxed);
-    let (_, _, _, pane_h) = p.rect();
+    let (_, pane_top, pane_w, pane_h) = p.rect();
+    // Vertical offset of THIS pane inside the combined surface. The surface
+    // covers the bounding box of all placed panes, and `render` lays them out
+    // side-by-side as equal-height columns from the surface top. When two panes
+    // have DIFFERENT tops — the right-panel terminal sits below that panel's
+    // upper section, so its top is lower than the main column's — the lower pane
+    // must be pushed down by (its top − the combined-box top) or its content
+    // paints at the surface top, behind the panel's opaque chrome (the "side
+    // panel renders nothing" bug). Zero for a single pane and for the topmost.
+    let combined_top = COMBINED.lock().map(|c| c.1).unwrap_or(0.0);
+    let surface_offset_y = (pane_top - combined_top).max(0.0);
     let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
     let alt_mode = g.alt_screen;
     let cursor_on = g.cursor_visible && g.cursor_row >= 0;
@@ -832,7 +880,8 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
     let n_blocks = g.blocks.len();
 
     if alt_mode {
-        // Alt-screen: the app owns a fixed full grid, painted top-down.
+        // Alt-screen: the app owns a fixed full grid, painted top-down, pushed
+        // down by the pane's offset within the combined surface.
         let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(g.rows.len());
         for (r, row) in g.rows.iter().enumerate() {
             let cur = if cursor_on && r == cursor_row {
@@ -842,13 +891,25 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             };
             row_els.push(build_row(&row.spans, cur, mono));
         }
-        Flex::column()
+        let grid = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
             .with_main_axis_alignment(MainAxisAlignment::Start)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
             .with_spacing(0.0)
             .with_children(row_els)
-            .finish()
+            .finish();
+        // Bound the full grid to the pane's height at its surface offset.
+        // `pin_region`'s ConstrainedBox gives this MainAxisSize::Max grid a FINITE
+        // height; nesting it raw under the side pane's column instead left it in
+        // an infinite max constraint and warpui ABORTED (the "claude in the side
+        // panel crashes everything" panic at flex/mod.rs:206). `pane_h <= 1`
+        // (rect not reported yet — only the topmost pane, briefly) returns the raw
+        // grid, which the Stack bounds.
+        if pane_h > 1.0 {
+            pin_region(grid, surface_offset_y, pane_h)
+        } else {
+            grid
+        }
     } else {
         // Shell transcript AND inline agents (claude/codex): closed blocks
         // (oldest first, capped) + the live grid, top→bottom, wrapped for
@@ -881,7 +942,7 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
         // as the smooth alt-screen path) and stacked last; its height feeds the
         // total so the scroll range stays right while it's pinned to the bottom.
         // Takes `&TermGrid` as an arg (captures nothing of `g`) so it can be
-        // called after the `stick_bottom`/`known_max` mutations below.
+        // called after the `stick_bottom` mutation below.
         let live_on = g.command_running || agent_on;
         let live_count = if live_on {
             live_row_count(&g.rows, cursor_on, cursor_row)
@@ -932,42 +993,31 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
                     viewport
                 }
             };
-            // The clamped offset reported by the handle. While pinned to the
-            // bottom (stick), `scroll_to(1e9)` was clamped by `after_layout` to
-            // the true maximum, so this value IS the max scroll — learn it so we
-            // know where "the bottom" actually is.
-            let clamped_now = p.scroll.scroll_start().as_f32();
-            if g.stick_bottom {
-                g.known_max = clamped_now;
-            }
-            if content_est < content_vp {
+            // The TRUE maximum scroll offset. `est_block_height` is exact, so
+            // `content_est - content_vp` IS the bottom — we no longer LEARN it
+            // from the scroll handle. That learning raced the user's scroll
+            // clearing `stick_bottom`, so on the side pane the learned max never
+            // moved off 0 and the bottom re-arm was always satisfied, snapping
+            // every scroll straight back to the bottom ("can't scroll").
+            let fit_spacer = (content_vp - content_est).max(0.0);
+            let max_scroll = (content_est - content_vp).max(0.0);
+            if content_est <= content_vp {
                 // Everything fits — nothing to scroll, pin to bottom.
                 g.stick_bottom = true;
-            } else if !g.stick_bottom && g.scroll_px >= g.known_max - 4.0 {
-                // The user scrolled DOWN all the way to the bottom — only NOW
-                // re-arm auto-follow. (The old check re-armed whenever scroll_px
-                // exceeded the *current* position, so every downward tick snapped
-                // straight to the bottom instead of scrolling.)
+            } else if !g.stick_bottom && g.scroll_px >= max_scroll - 4.0 {
+                // Scrolled all the way back down to the bottom — re-arm follow.
                 g.stick_bottom = true;
             }
+            // Clamp to the real range so a scroll past the end can't satisfy the
+            // re-arm above and snap, and a scroll-up can't run negative.
+            g.scroll_px = g.scroll_px.clamp(0.0, max_scroll);
             if g.stick_bottom {
                 p.scroll.scroll_to(Pixels::new(1.0e9));
             } else {
                 p.scroll.scroll_to(Pixels::new(g.scroll_px));
             }
 
-            // The visible window in content coordinates. `fit_spacer`
-            // bottom-anchors a transcript shorter than the viewport (content
-            // begins that far down); when it overflows, fit_spacer == 0 and the
-            // blocks start at the top. The offset is the bottom-clamped max while
-            // sticking, else the user's scroll_px.
-            let fit_spacer = (content_vp - content_est).max(0.0);
-            let max_scroll = (content_est - content_vp).max(0.0);
-            let win_top = if g.stick_bottom {
-                max_scroll
-            } else {
-                g.scroll_px.clamp(0.0, max_scroll)
-            };
+            let win_top = if g.stick_bottom { max_scroll } else { g.scroll_px };
             let overscan = content_vp;
             let build_top = (win_top - overscan).max(0.0);
             let build_bot = win_top + content_vp + overscan;
@@ -1016,9 +1066,47 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
                 },
                 content,
             );
+            // Horizontal scroll. When the PTY grid is wider than the pane — the
+            // narrow right-panel side terminal pins a wide PTY (PAN_MIN_COLS) so
+            // `ls` lays out in columns instead of one-per-line — wrap the content
+            // in a horizontal ClippedScrollable so the user can pan to the
+            // off-screen columns (`term_native_hscroll` feeds the offset). Gated
+            // on real overflow: the main pane is sized to fit, so it skips this
+            // and keeps the plain vertical path (and full-width row backgrounds
+            // via the column's Stretch).
+            //
+            // The content is bounded to the EXACT grid width with a ConstrainedBox
+            // before the horizontal scroll. Without it the wide rows would lay out
+            // under the horizontal scrollable's free (infinite) main-axis width
+            // constraint and panic warpui's flex; the bound also fixes the scroll
+            // range to (grid_px − pane_w).
+            const CELL_ADVANCE: f32 = FONT_SIZE * 0.6; // SF Mono advance (measured exact)
+            let grid_px = g.n_cols as f32 * CELL_ADVANCE;
+            let h_overflow = pane_w > 1.0 && grid_px > pane_w + 2.0;
+            let scroll_child: Box<dyn Element> = if h_overflow {
+                // Clamp the offset to the real range and mirror it into the handle
+                // (the same render-time clamp the vertical axis does for scroll_px).
+                let max_hscroll = (grid_px - pane_w).max(0.0);
+                let hx = p.hscroll.scroll_start().as_f32().clamp(0.0, max_hscroll);
+                p.hscroll.scroll_to(Pixels::new(hx));
+                let bounded = ConstrainedBox::new(Box::new(selectable)).with_width(grid_px);
+                Box::new(
+                    ClippedScrollable::horizontal(
+                        p.hscroll.clone(),
+                        Box::new(bounded),
+                        ScrollbarWidth::None,
+                        Fill::None,
+                        Fill::None,
+                        Fill::None,
+                    )
+                    .with_overlayed_scrollbar(),
+                )
+            } else {
+                Box::new(selectable)
+            };
             let scrollable = ClippedScrollable::vertical(
                 p.scroll.clone(),
-                Box::new(selectable),
+                scroll_child,
                 ScrollbarWidth::None,
                 Fill::None,
                 Fill::None,
@@ -1026,7 +1114,10 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             )
             .with_overlayed_scrollbar();
             let viewport_top = *p.viewport_top.lock().unwrap_or_else(|e| e.into_inner());
-            pin_region(Box::new(scrollable), viewport_top, content_vp)
+            // `surface_offset_y` pushes a lower-topped pane (the right-panel
+            // terminal) down to its real region within the combined surface;
+            // `viewport_top` is the chrome offset within the pane itself.
+            pin_region(Box::new(scrollable), viewport_top + surface_offset_y, content_vp)
         }
     }
 }
@@ -1061,18 +1152,34 @@ impl View for TerminalRootView {
             // covers the combined bounding box; lay the panes side-by-side by
             // width (they share the AppShell row's top + height), with the gap
             // between them (the React divider) left black.
-            let (mx, _my, mw, _mh) = main.rect();
-            let (sx, _sy, sw, _sh) = side.rect();
+            let (mx, my, mw, mh) = main.rect();
+            let (sx, sy, sw, sh) = side.rect();
             let gap = (sx - (mx + mw)).max(0.0);
+            // Combined surface height. BOTH columns must be height-bounded to it:
+            // each pane's column is a MainAxisSize::Max flex (it fills the surface,
+            // with a lower pane's content pushed down by surface_offset_y), and a
+            // Max flex PANICS under an unbounded/infinite max constraint — which
+            // is what a width-only ConstrainedBox left the side column with, so a
+            // claude/alt-screen full grid in the side pane aborted the app
+            // (flex/mod.rs "can't be rendered in an infinite max constraint").
+            let ch = ((my + mh).max(sy + sh) - my.min(sy)).max(1.0);
             let side_col = build_pane_column(side, self.mono);
             let mut kids: Vec<Box<dyn Element>> = Vec::new();
-            kids.push(Box::new(ConstrainedBox::new(main_col).with_width(mw.max(1.0))));
+            kids.push(Box::new(
+                ConstrainedBox::new(main_col)
+                    .with_width(mw.max(1.0))
+                    .with_height(ch),
+            ));
             if gap > 0.5 {
                 kids.push(Box::new(
                     ConstrainedBox::new(Rect::new().finish()).with_width(gap),
                 ));
             }
-            kids.push(Box::new(ConstrainedBox::new(side_col).with_width(sw.max(1.0))));
+            kids.push(Box::new(
+                ConstrainedBox::new(side_col)
+                    .with_width(sw.max(1.0))
+                    .with_height(ch),
+            ));
             Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
@@ -1155,6 +1262,7 @@ pub fn attach(app: &tauri::AppHandle) {
             g.blocks.push(NativeBlock::new(
                 block.input.clone(),
                 block.block_rows.clone(),
+                block.transcript.clone(),
                 block.cwd.clone(),
                 block.duration_ms,
                 block.exit_code,
@@ -1353,6 +1461,7 @@ pub fn term_native_attach(
                             NativeBlock::new(
                                 sb.input,
                                 serde_json::from_value(sb.block_rows_json).unwrap_or_default(),
+                                sb.transcript,
                                 sb.cwd,
                                 sb.duration_ms.map(|d| d.max(0) as u64),
                                 sb.exit_code,
@@ -1426,6 +1535,23 @@ pub fn term_native_scroll(pane_key: String, delta_px: f64) {
         g.scroll_px = (cur + delta_px as f32).max(0.0);
         g.stick_bottom = false;
     }
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
+    }
+}
+
+/// Tauri command: pan the native shell transcript horizontally. Only meaningful
+/// for a pane whose PTY grid is wider than its on-screen width (the narrow
+/// right-panel side terminal); render bounds the offset to the real range and is
+/// a no-op when the content fits (no horizontal ClippedScrollable is built).
+/// Mirrors `term_native_scroll` on the X axis — accumulate, clamp ≥ 0 here, and
+/// the render-time clamp caps it at (grid width − pane width).
+#[tauri::command]
+pub fn term_native_hscroll(pane_key: String, delta_px: f64) {
+    let p = pane(&pane_key);
+    let cur = p.hscroll.scroll_start().as_f32();
+    p.hscroll
+        .scroll_to(Pixels::new((cur + delta_px as f32).max(0.0)));
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
     }

@@ -1652,7 +1652,7 @@ impl EventListener for NullEventProxy {
 /// to actual content; otherwise short commands would render with
 /// dozens of blank rows below them (one for each unused row of the
 /// scratch Term's screen).
-fn snapshot_transcript(transcript: &str, cols: u16, rows: u16) -> Vec<RowSnapshot> {
+pub(crate) fn snapshot_transcript(transcript: &str, cols: u16, rows: u16) -> Vec<RowSnapshot> {
     if transcript.is_empty() {
         return Vec::new();
     }
@@ -2647,6 +2647,16 @@ pub fn term_resize(
         })
         .map_err(|e| e.to_string())?;
     s.last_snapshot.clear();
+    // Release the session lock before `reemit_native` re-acquires it.
+    drop(s);
+    // Push the freshly reflowed grid to the native renderer NOW. `term.resize`
+    // above reflowed alacritty's grid to the new width, but the native surface
+    // only repaints on the pty's next frame — and an idle shell prompt emits
+    // nothing on SIGWINCH, so without this the embedded main pane keeps showing
+    // stale-width text after a sidebar / right-panel drag (the "main shell
+    // doesn't re-wrap on resize" report). Re-emitting snapshots the reflowed
+    // grid and feeds it straight to the surface. No-op for non-mirrored ptys.
+    reemit_native(&state, &id);
     Ok(())
 }
 

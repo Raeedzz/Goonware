@@ -24,6 +24,7 @@ import { git, type StatusEntry } from "@/lib/git";
 import { FileTree } from "@/files/FileTree";
 import { paneSlotStyle } from "./paneSlotLayout";
 import { BlockTerminal } from "@/terminal/BlockTerminal";
+import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
 import { useToast } from "@/primitives/Toast";
 import { Loader } from "@/primitives/Loader";
 import { BrowserPane } from "@/browser/BrowserPane";
@@ -1462,7 +1463,11 @@ function SecondaryPanel({
         gridTemplateRows: "auto 1fr",
         minHeight: 0,
         borderTop: "var(--border-1)",
-        backgroundColor: "var(--surface-1)",
+        // No root background: the secondary terminal renders on the native warpui
+        // surface (BELOW the webview), so its content region must be a transparent
+        // hole. The header paints its own --surface-1, and the content row paints
+        // --surface-1 except when it's showing the native terminal. Mirrors
+        // MainColumn's transparent-hole approach.
       }}
     >
       <div
@@ -1473,6 +1478,7 @@ function SecondaryPanel({
           padding: "0 var(--space-2)",
           gap: 4,
           borderBottom: "var(--border-1)",
+          backgroundColor: "var(--surface-1)",
         }}
       >
         <CollapseToggle
@@ -1534,28 +1540,52 @@ function SecondaryPanel({
         <span style={{ flex: 1 }} />
         <PreviewUrlButton worktree={worktree} />
       </div>
-      <AnimatePresence initial={false}>
-        {!collapsed && (
-          <motion.div
-            key="secondary-content"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.18, ease: [0.25, 1, 0.5, 1] }}
-            style={{
-              minHeight: 0,
-              overflow: "hidden",
-              position: "relative",
-            }}
-          >
-            {worktree.secondaryTab === "terminal" ? (
-              <SecondaryTerminals worktree={worktree} />
-            ) : (
-              <ScriptPanel worktree={worktree} kind={worktree.secondaryTab} />
-            )}
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {/* Content row (grid 1fr). Stable position:relative wrapper so the side
+          surface tracker stays MOUNTED across the collapse animation and the
+          terminal<->script switch — the native side pane's show/hide is driven
+          by the tracker's `visible` flag reporting a zero rect, NOT by unmount
+          (an unmounted tracker would leave the surface stuck at its last rect).
+          Transparent only while the native terminal is showing; otherwise paints
+          --surface-1 so the script panel and the collapsed state stay opaque. */}
+      <div
+        style={{
+          position: "relative",
+          minHeight: 0,
+          overflow: "hidden",
+          backgroundColor:
+            !collapsed && worktree.secondaryTab === "terminal"
+              ? "transparent"
+              : "var(--surface-1)",
+        }}
+      >
+        <WarpSurfaceTracker
+          paneKey="side"
+          visible={!collapsed && worktree.secondaryTab === "terminal"}
+        />
+        <AnimatePresence initial={false}>
+          {!collapsed && (
+            <motion.div
+              key="secondary-content"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.18, ease: [0.25, 1, 0.5, 1] }}
+              style={{
+                position: "absolute",
+                inset: 0,
+                overflow: "hidden",
+                minHeight: 0,
+              }}
+            >
+              {worktree.secondaryTab === "terminal" ? (
+                <SecondaryTerminals worktree={worktree} />
+              ) : (
+                <ScriptPanel worktree={worktree} kind={worktree.secondaryTab} />
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
     </div>
   );
 }
@@ -1776,14 +1806,16 @@ function SecondaryTerminals({ worktree }: { worktree: Worktree }) {
               cwd={worktree.path}
               projectId={worktree.projectId}
               sessionId={`${worktree.id}:${ptyId}`}
-              // The right-panel terminal renders entirely in the webview (DOM
-              // for the shell, CanvasGrid for agents). It does NOT drive the
-              // native warpui surface: that surface sits BELOW the webview, but
-              // the right panel paints an opaque `--surface-1` background over
-              // this region, which would fully occlude a native side pane (the
-              // user saw "the bottom-right terminal shows nothing I type"). The
-              // native surface is the main column only — a single hole punched
-              // through to Metal — so only that region is transparent.
+              // Render on the native warpui surface's SIDE pane (M6). The
+              // right-panel content region is now a transparent hole (see the
+              // content wrapper above + the side WarpSurfaceTracker), and the
+              // native renderer offsets the side pane to its real (lower) region
+              // within the combined surface. Only the ACTIVE secondary terminal
+              // drives the single side pane — the hidden ones don't attach
+              // (gated on isVisible) but stay `nativeSurface` so they render
+              // transparent (no WebGPU/DOM grid) instead of painting over it.
+              nativeSurface
+              paneKey="side"
               // Forward visibility so only the active side terminal
               // owns its window-level Cmd+C / Ctrl+C / drag-drop
               // listeners. Without this gate, every hidden secondary

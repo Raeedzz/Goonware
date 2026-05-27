@@ -829,13 +829,24 @@ export function BlockTerminal({
     // Accumulate the pixel delta and flush once per rAF (display refresh) so the
     // transcript re-renders at most ~60fps with the summed delta — smooth.
     let accumPx = 0;
+    let accumPxX = 0;
     let raf = 0;
     const flush = () => {
       raf = 0;
-      if (accumPx === 0) return;
-      const px = accumPx;
-      accumPx = 0;
-      invoke("term_native_scroll", { paneKey, deltaPx: px }).catch(() => {});
+      // Vertical pan (always meaningful) and horizontal pan (only when the grid
+      // is wider than the pane — the native renderer builds the horizontal
+      // ClippedScrollable then; a no-op otherwise). Each axis is sent only when
+      // it actually moved, so a pure vertical scroll never fires an hscroll.
+      if (accumPx !== 0) {
+        const px = accumPx;
+        accumPx = 0;
+        invoke("term_native_scroll", { paneKey, deltaPx: px }).catch(() => {});
+      }
+      if (accumPxX !== 0) {
+        const px = accumPxX;
+        accumPxX = 0;
+        invoke("term_native_hscroll", { paneKey, deltaPx: px }).catch(() => {});
+      }
     };
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
@@ -846,6 +857,12 @@ export function BlockTerminal({
           : e.deltaMode === 2
             ? e.deltaY * (el.clientHeight || 400)
             : e.deltaY;
+      accumPxX +=
+        e.deltaMode === 1
+          ? e.deltaX * 16
+          : e.deltaMode === 2
+            ? e.deltaX * (el.clientWidth || 400)
+            : e.deltaX;
       if (!raf) raf = requestAnimationFrame(flush);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
@@ -1207,6 +1224,14 @@ export function BlockTerminal({
       // has a wide terminal; the outer scroll container then handles
       // horizontal panning over the wider rendered grid.
       const PAN_MIN_COLS = 120;
+      // `allowHorizontalScroll` (the narrow right-panel secondary terminal) pins
+      // a wide PTY so the shell lays out as if it had a wide terminal — `ls`
+      // prints columns side-by-side instead of one entry per line — and the user
+      // pans to the off-screen columns. On the DOM/WebGPU path an outer scroll
+      // container does the panning; on a native Metal pane the warpui renderer
+      // does it (a horizontal ClippedScrollable, gated on grid-wider-than-pane,
+      // fed by `term_native_hscroll` — see warp_term.rs). Either way the PTY must
+      // believe it's wide, so size it the same on both paths.
       const cols = allowHorizontalScroll
         ? Math.max(fitCols, PAN_MIN_COLS)
         : fitCols;

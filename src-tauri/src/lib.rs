@@ -267,6 +267,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             warp_term::term_native_scroll,
             #[cfg(target_os = "macos")]
+            warp_term::term_native_hscroll,
+            #[cfg(target_os = "macos")]
             warp_term::term_native_mouse,
             #[cfg(target_os = "macos")]
             warp_term::term_native_selection_text,
