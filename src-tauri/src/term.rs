@@ -3669,7 +3669,10 @@ mod tests {
         // foreground; the " normal" tail must NOT inherit the colour.
         let row = &out[0];
         let red = row.spans.iter().find(|s| s.text.contains("red")).unwrap();
-        assert_eq!(red.fg.as_ref(), ANSI_16[1]); // workshop rust
+        // `&*` pins the Cow<str> to a concrete `&str` so the comparison resolves
+        // to core's PartialEq (a bare `.as_ref()` leaves `&_` ambiguous between
+        // core and muda's `impl PartialEq<&str> for &MenuId`, which fails to infer).
+        assert_eq!(&*red.fg, ANSI_16[1]);
         let after = row
             .spans
             .iter()
@@ -3677,7 +3680,7 @@ mod tests {
             .unwrap();
         // SGR 0 reset means the trailing span's fg goes back to the
         // default ("var(--text-primary)") — anything but the red.
-        assert_ne!(after.fg.as_ref(), ANSI_16[1]);
+        assert_ne!(&*after.fg, ANSI_16[1]);
     }
 
     #[test]

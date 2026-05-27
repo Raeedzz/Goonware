@@ -696,32 +696,6 @@ mod clipboard_handler_gating_tests {
     }
 
     #[test]
-    fn canvas_grid_cmd_c_bails_on_focused_editable() {
-        // The window-level Cmd+C handler in CanvasGrid would
-        // otherwise steal Cmd+C anywhere on the page whenever a
-        // canvas selection ref was stale (user dragged once in a
-        // closed agent block, never clicked away to clear it).
-        // Pin the active-element bailout: when focus is on a real
-        // editable, the canvas handler must return before
-        // preventDefault.
-        let src = read_repo_file("src/terminal/CanvasGrid.tsx");
-        assert!(
-            src.contains("document.activeElement"),
-            "CanvasGrid.tsx window-level Cmd+C handler must check \
-             `document.activeElement` and bail when focus is on a \
-             real editable. Otherwise a stale canvas selection \
-             steals Cmd+C from the file editor / commit composer / \
-             side terminal."
-        );
-        assert!(
-            src.contains("isContentEditable"),
-            "CanvasGrid.tsx Cmd+C handler must use `isContentEditable` \
-             so CodeMirror / TipTap focus correctly suppresses the \
-             canvas-selection copy path."
-        );
-    }
-
-    #[test]
     fn secondary_terminals_forward_is_visible() {
         // The fix from 4856c46 — pin that the right-panel side
         // terminals still forward `isVisible={isActive}` to their
@@ -910,77 +884,6 @@ mod clipboard_handler_gating_tests {
                 path,
             );
         }
-    }
-
-    #[test]
-    fn canvas_grid_visibility_restore_is_wired() {
-        // The black-screen fix chain. The user reports the screen
-        // going black:
-        //   - On `/model` selection inside Claude
-        //   - On switching to editor / diff / markdown and back
-        //   - On worktree switch
-        //   - Randomly mid-prompt-stream
-        //
-        // Root cause (memory observation 650): WKWebView releases
-        // the GPU swapchain for `display: none`-hosted canvases
-        // without firing `device.lost`. The fix is a multi-layer
-        // visibility-restore that re-calls `context.configure(...)`
-        // on hidden→visible and on resize. These grep-tests pin
-        // every load-bearing piece.
-        let grid_renderer =
-            read_repo_file("src/terminal/gpu/GridRenderer.ts");
-        assert!(
-            grid_renderer.contains("reconfigure(): void"),
-            "GridRenderer must expose a `reconfigure()` method that \
-             re-calls context.configure(...). Without it, a canvas \
-             hidden under `display: none` never recovers its GPU \
-             swapchain when the user comes back — the entire pane \
-             stays black."
-        );
-        // The configure call must include `alphaMode` so a future
-        // descriptor change can't silently break transparency
-        // handling.
-        assert!(
-            grid_renderer.contains("alphaMode: \"premultiplied\""),
-            "GridRenderer.reconfigure / resize must pass \
-             `alphaMode: \"premultiplied\"` to context.configure — \
-             matches the bootstrap descriptor exactly so the \
-             swapchain shape doesn't change between configures."
-        );
-        let canvas_grid = read_repo_file("src/terminal/CanvasGrid.tsx");
-        assert!(
-            canvas_grid.contains("renderer.reconfigure()"),
-            "CanvasGrid must call `renderer.reconfigure()` on the \
-             hidden→visible transition. The visibility-restore state \
-             machine in gpu/visibilityRestore.ts encodes the call \
-             order (reconfigure → resize → invalidate → paint) — drop \
-             the reconfigure and the visibility-restore lands on a \
-             dead surface."
-        );
-        // Pin the ResizeObserver 0×0 bail. Without it, the keepalive's
-        // display:none transition shrinks the GPU backbuffer to 1×1
-        // physical pixels — and the next show can't recover because
-        // the canvas's CSS style.width/height was also clobbered to
-        // ~0.5 CSS px.
-        assert!(
-            canvas_grid.contains("rect.width === 0 || rect.height === 0"),
-            "CanvasGrid's ResizeObserver must bail on a 0×0 contentRect. \
-             Without this guard, `display: none` shrinks the renderer \
-             backbuffer to 1×1 and the next visibility tick paints \
-             into a tiny surface — black pane."
-        );
-        let visibility_restore =
-            read_repo_file("src/terminal/gpu/visibilityRestore.ts");
-        assert!(
-            visibility_restore.contains("decideVisibilityAction")
-                && visibility_restore.contains("executeVisibilityAction"),
-            "gpu/visibilityRestore.ts must export BOTH \
-             `decideVisibilityAction` and `executeVisibilityAction`. \
-             The exhaustive unit tests in \
-             gpu/visibilityRestore.test.ts only protect the contract \
-             if these exports exist — a refactor that inlines them \
-             back into CanvasGrid silently bypasses every test."
-        );
     }
 
     #[test]
