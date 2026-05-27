@@ -61,10 +61,6 @@ const useTerminalSessionSrc = readFileSync(
   join(import.meta.dir, "useTerminalSession.ts"),
   "utf-8",
 );
-const canvasGridSrc = readFileSync(
-  join(import.meta.dir, "CanvasGrid.tsx"),
-  "utf-8",
-);
 
 describe("useTerminalSession source pins — visibility flip flushes synchronously", () => {
   test("imports useLayoutEffect from react", () => {
@@ -162,183 +158,12 @@ describe("useTerminalSession source pins — visibility flip flushes synchronous
   });
 });
 
-describe("CanvasGrid source pins — visibility-flip signals to GridRenderer", () => {
-  test("calls renderer.markHidden() on the visible→hidden edge", () => {
-    // Without this signal the GridRenderer's resize() fast path
-    // would skip the configure() call when we come back at the
-    // same dimensions — which IS the common case for a keepalive-
-    // layer tab switch — and the user would land on whatever
-    // surface WKWebView happens to have at that moment (often
-    // dead = black).
-    expect(canvasGridSrc).toContain("renderer.markHidden()");
-  });
-
-  test("markHidden() is gated on the visible→hidden edge", () => {
-    // Marking hidden on a still-visible canvas would erroneously
-    // flag needsReconfigure during a regular size change, doing
-    // unnecessary configure() work on every resize tick.
-    //
-    // The exact line we expect is along the lines of
-    // `wasVisibleRef.current && !isVisible` before the markHidden
-    // call.
-    expect(canvasGridSrc).toMatch(
-      /wasVisibleRef\.current\s*&&\s*!isVisible[\s\S]{0,200}?renderer\.markHidden\(\)/,
-    );
-  });
-
-  test("markHidden() happens inside the existing visibility useEffect", () => {
-    // The signal must fire from the same effect that runs the
-    // visibility-restore state machine, otherwise we'd need
-    // duplicate prop tracking — a code-smell and a chance for the
-    // two effects to disagree about whether we're hidden.
-    const visibilityEffect = canvasGridSrc.match(
-      /useEffect\(\(\)\s*=>\s*\{[\s\S]*?renderer\.markHidden\(\)[\s\S]*?\},\s*\[isVisible\]\)/,
-    );
-    expect(visibilityEffect).not.toBeNull();
-  });
-
-  test("visibility-restore state machine is still invoked from the same effect", () => {
-    // The c7ca66b fix (decideVisibilityAction / executeVisibilityAction)
-    // is the load-bearing GPU-surface recovery. Pin that markHidden
-    // didn't accidentally REPLACE it — both must coexist in the
-    // visibility effect.
-    expect(canvasGridSrc).toContain("decideVisibilityAction");
-    expect(canvasGridSrc).toContain("executeVisibilityAction");
-  });
-});
-
-describe("CanvasGrid source pins — document.visibilitychange recovery (OS-level occlusion)", () => {
-  // The user-reported bug class this guards: "agent was running, I
-  // came back from a Zoom call and the terminal was black."
-  //
-  // WKWebView can release the canvas's GPU surface when the host
-  // window becomes occluded (user switches macOS apps, Goonware
-  // slides behind another window, App Nap kicks in). None of these
-  // fire device.lost, none flip the `isVisible` keepalive-layer
-  // prop — but the swapchain is dead. The next paint after the
-  // window comes back lands on the dead surface.
-  //
-  // The fix this pins: a `visibilitychange` listener on `document`
-  // that reconfigures + paints on transition to "visible", and
-  // signals markHidden on transition away. Same recovery contract
-  // as the keepalive-layer restore, just driven by page-level
-  // visibility.
-
-  test("registers a visibilitychange listener on document", () => {
-    expect(canvasGridSrc).toMatch(
-      /document\.addEventListener\(\s*["']visibilitychange["']/,
-    );
-  });
-
-  test("visibilitychange listener cleans itself up on unmount", () => {
-    // Without removeEventListener, every CanvasGrid remount leaks a
-    // listener; long sessions accumulate dozens that all fire on
-    // every macOS app switch. Cheap to leak per instance, expensive
-    // in aggregate (each listener reaches into renderer state).
-    expect(canvasGridSrc).toMatch(
-      /document\.removeEventListener\(\s*["']visibilitychange["']/,
-    );
-  });
-
-  test("visibilitychange handler reconfigures on transition to visible", () => {
-    // The load-bearing recovery call. Without it, the listener
-    // observes the event but doesn't repair the dead surface.
-    expect(canvasGridSrc).toMatch(
-      /document\.visibilityState\s*===\s*["']visible["'][\s\S]{0,200}?renderer\.reconfigure\(\)/,
-    );
-  });
-
-  test("visibilitychange handler signals markHidden on transition to hidden", () => {
-    // Symmetric to the visible path. On hide, we flag the renderer
-    // so the next show-side resize still takes the full configure
-    // path even at unchanged dimensions — mirrors the keepalive-layer
-    // markHidden contract. Without it a subsequent resize after the
-    // hide might take the fast path and skip the recovery configure.
-    expect(canvasGridSrc).toMatch(
-      /document\.visibilityState[\s\S]{0,200}?renderer\.markHidden\(\)/,
-    );
-  });
-});
-
-describe("CanvasGrid source pins — IntersectionObserver (upstream layout hide/show)", () => {
-  // The user-reported bug class this guards: a parent panel collapses
-  // / expands, a modal opens, the canvas scrolls out of an overflow
-  // container — anything that hides the canvas WITHOUT flipping the
-  // `isVisible` prop driven by the keepalive layer. WebKit may
-  // release the GPU surface during the hide and the next paint after
-  // re-entry lands on a dead swapchain.
-
-  test("constructs an IntersectionObserver to watch the wrapper", () => {
-    expect(canvasGridSrc).toMatch(/new\s+IntersectionObserver\(/);
-  });
-
-  test("IntersectionObserver is environment-guarded (jsdom / test-safe)", () => {
-    // bun's test environment doesn't ship IntersectionObserver. The
-    // gate avoids a ReferenceError on import in test runs.
-    expect(canvasGridSrc).toMatch(
-      /typeof\s+IntersectionObserver\s*===?\s*["']undefined["']/,
-    );
-  });
-
-  test("IntersectionObserver triggers reconfigure on re-entry", () => {
-    // The load-bearing call. Without it the observer fires but
-    // doesn't repair the dead surface. We pin the
-    // `isIntersecting && !wasVisible` edge → reconfigure chain.
-    expect(canvasGridSrc).toContain("entry.isIntersecting");
-    // Must call reconfigure in the same block as the intersection
-    // re-entry.
-    const intersectionBlock = canvasGridSrc.match(
-      /new\s+IntersectionObserver\([\s\S]*?\}\);/,
-    );
-    expect(intersectionBlock).not.toBeNull();
-    expect(intersectionBlock![0]).toContain("renderer.reconfigure()");
-  });
-
-  test("IntersectionObserver signals markHidden on leave", () => {
-    // Symmetric to the entry path — flag the renderer so the next
-    // entry's reconfigure path is unconditional.
-    const intersectionBlock = canvasGridSrc.match(
-      /new\s+IntersectionObserver\([\s\S]*?\}\);/,
-    );
-    expect(intersectionBlock).not.toBeNull();
-    expect(intersectionBlock![0]).toContain("renderer.markHidden()");
-  });
-
-  test("IntersectionObserver disconnects on unmount", () => {
-    // Same memory hygiene as the visibilitychange listener. Per-mount
-    // observers are cheap; leaked-across-remounts observers accumulate
-    // GPU-state pokes on every layout shift.
-    expect(canvasGridSrc).toMatch(/observer\.disconnect\(\)/);
-  });
-
-  test("IntersectionObserver tracks edge transitions via a wrapperVisibleRef", () => {
-    // Without an edge tracker the handler would reconfigure on
-    // EVERY observation tick (which fires repeatedly while the
-    // canvas scrolls past the viewport edge). The ref-based edge
-    // detect keeps reconfigure cost at O(transition), not O(tick).
-    expect(canvasGridSrc).toMatch(/wrapperVisibleRef\s*=\s*useRef\(true\)/);
-  });
-});
-
 describe("isVisible prop propagation — the cross-file contract", () => {
-  // Pins the prop name `isVisible` flowing from useTerminalSession
-  // through LiveBlock to CanvasGrid. If anyone renames this prop in
-  // ONE place, the chain breaks silently — no compile error because
-  // the default value (true) takes over and everything appears to
+  // Pins the prop name `isVisible` flowing into useTerminalSession.
+  // If anyone renames this prop in the hook, the hidden-cadence
+  // optimisation breaks silently — no compile error because the
+  // default value (true) takes over and everything appears to
   // work… until a tab switch reveals the regression.
-  const liveBlockSrc = readFileSync(
-    join(import.meta.dir, "LiveBlock.tsx"),
-    "utf-8",
-  );
-
-  test("LiveBlock forwards isVisible to CanvasGrid in agent mode", () => {
-    // The exact prop hand-off that drives the visibility-restore
-    // path on the agent CanvasGrid (LiveBlock renders read-only
-    // CanvasGrid when preserveGrid is set).
-    expect(liveBlockSrc).toMatch(
-      /<CanvasGrid[\s\S]*?isVisible=\{isVisible\}/,
-    );
-  });
 
   test("useTerminalSession reads isVisible from opts", () => {
     expect(useTerminalSessionSrc).toMatch(

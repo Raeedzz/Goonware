@@ -12,7 +12,6 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { joinShellPaths } from "@/lib/shellQuote";
 import { BlockList } from "./BlockList";
 import { AgentChrome, AGENT_CHROME_HEIGHT_PX } from "./AgentChrome";
-import { CanvasGrid, type CanvasGridHandle } from "./CanvasGrid";
 import { CellRow } from "./CellRow";
 import { LiveBlock } from "./LiveBlock";
 import { PromptInput, type PromptInputHandle } from "./PromptInput";
@@ -229,12 +228,6 @@ export function BlockTerminal({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const promptRef = useRef<PromptInputHandle>(null);
   const passthroughRef = useRef<PtyPassthroughHandle>(null);
-  // Alt-screen CanvasGrid handle. Used by the soft-reset path to
-  // poke the renderer when a sleep/wake leaves the canvas stuck on
-  // its last frame (alive surface, no new frames arriving). Only
-  // the alt-screen grid gets a ref because the inline agent grid
-  // unmounts as soon as resetPane() flips foregroundIsAgent off.
-  const canvasGridRef = useRef<CanvasGridHandle>(null);
   // Generation counter — bumped when the user clicks "restart" on the
   // session-ended banner. Suffixed onto the session id so the underlying
   // useTerminalSession effect tears down the dead PTY and spawns a fresh
@@ -1079,21 +1072,6 @@ export function BlockTerminal({
     return () => window.clearTimeout(t);
   }, [bellTick]);
 
-  // DOM-fallback latch for the alt-screen CanvasGrid. When the
-  // canvas's recovery ladder gives up (WKWebView surface dead and
-  // no rebuild ever painted), this flips and the alt-screen path
-  // renders alacritty rows through DOM CellRow rows instead. Reset
-  // whenever `altScreen` itself flips off-then-on so a NEW alt-screen
-  // entry attempts the canvas path fresh — the GPU may be healthy
-  // again on the next agent invocation.
-  const [altScreenCanvasFailed, setAltScreenCanvasFailed] = useState(false);
-  useEffect(() => {
-    if (!altScreen) setAltScreenCanvasFailed(false);
-  }, [altScreen]);
-  const handleAltScreenCanvasUnrecoverable = useCallback(() => {
-    setAltScreenCanvasFailed(true);
-  }, []);
-
   // Re-fit on container resize OR when we toggle agent mode (since
   // hiding the PromptInput frees ~80px of vertical real estate that
   // the alacritty grid can claim). Translate pixel size → cell grid
@@ -1870,11 +1848,9 @@ export function BlockTerminal({
     const path = cwdRef.current;
     if (path) forceIdleForCwd(path);
     setTimeout(() => promptRef.current?.focus(), 0);
-    canvasGridRef.current?.invalidate();
-    // Also force the React-side frame pipeline to flush any pending
-    // ref state into committed liveFrame. The canvas invalidate above
-    // re-paints the renderer's current input; forceResync makes sure
-    // that input is the latest cached frame, not whatever React last
+    // Force the React-side frame pipeline to flush any pending ref
+    // state into committed liveFrame, so the native surface repaints
+    // from the latest cached frame rather than whatever React last
     // committed before the pipeline got stuck.
     forceResync();
   }, [onForceKill, forceResync]);
@@ -2087,80 +2063,20 @@ export function BlockTerminal({
           banner sniffer). The strip is driven by hook events, so it
           stays accurate without polling the PTY. */}
       {!exited && foregroundIsAgent && <AgentChrome cwd={liveCwd ?? cwd} />}
-      {!exited && altScreen && !nativeActive && (
-        // Non-native (right-panel) alt-screen TUI (vim, htop, claude-in-alt-
-        // screen) renders through the WebGPU CanvasGrid. Native panes render
-        // alt-screen on the Metal surface instead (nativeActive), so this is
-        // skipped there. The previous
-        // DOM-backed FullGrid is retired — CanvasGrid handles
-        // selection, cursor, and the full feature set, and keeping
-        // two paths invited drift bugs. The `autoFocus` prop isn't
-        // forwarded because CanvasGrid manages its own focus through
-        // the hidden textarea overlay.
-        //
-        // `isVisible` IS forwarded — when this terminal is hidden by
-        // the keepalive layer (display: none), the canvas needs to
-        // skip ResizeObserver-driven 0×0 resizes and force a fresh
-        // paint when it comes back, or the alt-screen picker /
-        // model selector lands on a black surface.
-        //
-        // DOM fallback: when CanvasGrid's recovery ladder gives up
-        // (WKWebView returned a persistently-dead GPU surface, no
-        // rebuild ever painted), we render alacritty rows through
-        // CellRow rows instead. No interactive input encoding (the
-        // alt-screen path needs onSendBytes for keystrokes), but at
-        // least the user sees the agent's UI text — and they can
-        // Ctrl+C / kill the agent to start a fresh attempt at the
-        // canvas path.
-        <div
-          style={{
-            flex: 1,
-            minHeight: 0,
-            display: "flex",
-            flexDirection: "column",
-            // Alt-screen is an agent/TUI mode, so the native surface does NOT
-            // drive it (nativeActive is false): the WebGPU CanvasGrid renders
-            // and takes input as usual, painted opaquely over the surface.
-            opacity: nativeActive ? 0 : undefined,
-          }}
-        >
-          {altScreenCanvasFailed ? (
-            <div
-              style={{
-                flex: 1,
-                minHeight: 0,
-                overflowY: "auto",
-                fontFamily: "var(--font-mono)",
-                fontSize: 13,
-                fontVariantLigatures: "none",
-                color: "var(--text-primary)",
-                backgroundColor: "var(--surface-0)",
-                padding: "var(--space-2) var(--space-3)",
-              }}
-            >
-              {(liveFrame?.dirty ?? []).map((row) => (
-                <CellRow key={row.row} spans={row.spans} wrap={false} />
-              ))}
-            </div>
-          ) : (
-            <CanvasGrid
-              ref={canvasGridRef}
-              frame={liveFrame}
-              onSendBytes={sendBytes}
-              isVisible={isVisible}
-              onCanvasUnrecoverable={handleAltScreenCanvasUnrecoverable}
-            />
-          )}
-        </div>
-      )}
+
+      {/* Alt-screen TUIs (vim, htop, claude-in-alt-screen) render on the
+          native Metal surface. The previous React WebGPU CanvasGrid
+          alt-screen path has been retired now that the native surface
+          drives all modes. */}
 
       {/* Unified Warp-style scroll: closed blocks + the live block
           (shell command output OR the agent's TUI) flow together in
           one scroll container. The agent is just another block in the
           stream — the whole pane scrolls as one continuous history.
-          `preserveGrid` switches the LiveBlock body between DOM CellRow
-          rendering (shell output, soft-wrap) and the WebGPU CanvasGrid
-          (agent TUI, fixed grid). */}
+          The LiveBlock body renders DOM CellRow rows; `preserveGrid`
+          only switches wrapping (shell output soft-wraps, agent TUI
+          stays fixed-grid). The agent surface itself is drawn natively
+          (Rust/Metal). */}
       {!altScreen && (
         <div
           ref={scrollContainerRef}
@@ -2240,11 +2156,6 @@ export function BlockTerminal({
                 // first row at the visible top edge — what users mean
                 // by "I want to see what I'm picking."
                 fill={foregroundIsAgent}
-                // Forwarded so the embedded CanvasGrid can rebuild /
-                // repaint on tab-switch (display: none → display:
-                // flex). See CanvasGrid.Props.isVisible for the
-                // WKWebView GPU-surface-release dance this guards.
-                isVisible={isVisible}
               />
             )}
           </div>

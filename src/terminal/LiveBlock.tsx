@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CanvasGrid } from "./CanvasGrid";
+import { useEffect, useMemo, useRef } from "react";
 import { CellRow } from "./CellRow";
 import { formatCwd, formatDuration } from "./formatBlockMeta";
 import { liveBlockOuterStyle } from "./agentScrollLayout";
@@ -34,13 +33,6 @@ interface Props {
    * (`preserveGrid`/`fill`), which already runs grid-mode no-wrap.
    */
   noWrap?: boolean;
-  /**
-   * Forwarded to the embedded CanvasGrid so it can rebuild / repaint
-   * on the keepalive layer's `display: none → flex` transition. See
-   * the doc on `CanvasGrid.Props.isVisible` for the WKWebView surface-
-   * release dance this works around. Defaults to true.
-   */
-  isVisible?: boolean;
 }
 
 /**
@@ -65,20 +57,7 @@ export function LiveBlock({
   cwd,
   preserveGrid = false,
   noWrap = false,
-  isVisible = true,
 }: Props) {
-  // DOM-fallback latch. When the embedded CanvasGrid signals that
-  // its recovery ladder has exhausted (WKWebView handed back a
-  // persistently-dead GPU surface and no rebuild ever produced a
-  // successful paint), flip this to true. From that point on the
-  // agent block renders through DOM CellRow rows for the rest of
-  // its lifetime — slower than the canvas but unbreakable. When the
-  // user kills the agent and starts a fresh one the LiveBlock
-  // unmounts; the next instance attempts the canvas path again.
-  const [canvasFailed, setCanvasFailed] = useState(false);
-  const handleCanvasUnrecoverable = useCallback(() => {
-    setCanvasFailed(true);
-  }, []);
   const visibleRows = useMemo(() => {
     if (!frame) return [];
     // Tight trim of leading + trailing blanks. For agents, keep
@@ -164,17 +143,6 @@ export function LiveBlock({
   }
   const displayedRows =
     combinedRows.length > 0 ? combinedRows : lastGoodRowsRef.current;
-
-  // Original-grid row index of `displayedRows[0]`. Used by the canvas
-  // path to translate `frame.cursor_row` (in visible-grid coords) into
-  // a window-relative row. When scrollback is non-empty this is
-  // negative (extends the visible-grid coord space upward into
-  // scrollback); without it the cursor would paint several rows above
-  // where it should be the moment scrollback grew beyond zero rows.
-  const firstRowOffset = useMemo(() => {
-    if (!frame || displayedRows.length === 0) return 0;
-    return displayedRows[0].row;
-  }, [frame, displayedRows]);
 
   // Dev-only blanking detector. Logs whenever the agent pane ends up
   // with nothing to paint despite a live frame + running command —
@@ -356,39 +324,19 @@ export function LiveBlock({
             overflowX: noWrap && !preserveGrid && !fill ? "visible" : "hidden",
           }}
         >
-          {/* Agent TUI blocks (preserveGrid) normally render through
-              the WebGPU CanvasGrid — it owns its own selection +
-              cursor painting, so no browser-selection-eats-cursor
-              issue and the cursor draws on top of any selection
-              overlay. Shell command output stays on the DOM CellRow
-              path because canvas doesn't soft-wrap yet.
-
-              When the canvas's recovery ladder gives up (WKWebView
-              handed back a persistently-dead GPU surface, no rebuild
-              recovered), `canvasFailed` flips and the agent block
-              renders DOM CellRow rows instead. Slower than canvas,
-              less polished (no shader-driven selection accent, no
-              GPU cursor compositing), but guarantees the user sees
-              text rather than the indefinite black pane this commit
-              exists to defeat. */}
-          {preserveGrid && frame && !canvasFailed ? (
-            <CanvasGrid
-              frame={frame}
-              rows={displayedRows}
-              mode="auto"
-              firstRowOffset={firstRowOffset}
-              isVisible={isVisible}
-              onCanvasUnrecoverable={handleCanvasUnrecoverable}
+          {/* Rows render through the DOM CellRow path. Agent TUIs
+              (preserveGrid) used to paint through a WebGPU canvas, but
+              the agent surface is now drawn natively (Rust/Metal) — the
+              React side just keeps the transcript rows in the DOM.
+              Agent rows render no-wrap (fixed grid); shell command
+              output soft-wraps unless the side terminal disables it. */}
+          {displayedRows.map((row) => (
+            <CellRow
+              key={row.row}
+              spans={row.spans}
+              wrap={!preserveGrid && !fill && !noWrap}
             />
-          ) : (
-            displayedRows.map((row) => (
-              <CellRow
-                key={row.row}
-                spans={row.spans}
-                wrap={!preserveGrid && !fill && !noWrap}
-              />
-            ))
-          )}
+          ))}
         </div>
       ) : (
         // Empty-body state. In agent mode (fill=true) this is the gap

@@ -179,55 +179,6 @@ describe("Rust clipboard commands exist in src-tauri", () => {
   });
 });
 
-describe("CanvasGrid visibility-restore is wired up in production", () => {
-  const src = readRepoFile("src/terminal/CanvasGrid.tsx");
-
-  test("imports the visibility-restore state machine", () => {
-    expect(src).toContain('from "./gpu/visibilityRestore"');
-    expect(src).toContain("decideVisibilityAction");
-    expect(src).toContain("executeVisibilityAction");
-  });
-
-  test("the visibility-restore effect is a useLayoutEffect (not useEffect)", () => {
-    // useEffect fires AFTER paint, so the browser has already
-    // painted into the (possibly dead) GPU surface before the
-    // reconfigure runs — one frame of black sneaks through.
-    // useLayoutEffect runs during the commit, BEFORE paint.
-    expect(src).toContain("useLayoutEffect");
-    // The hook signature must include the markHidden line so we
-    // know it's the visibility-restore one, not some other layout
-    // effect.
-    expect(src).toMatch(
-      /useLayoutEffect\([\s\S]*?renderer\.markHidden\(\)[\s\S]*?\},\s*\[isVisible\]\)/,
-    );
-  });
-
-  test("CanvasGrid accepts an isVisible prop with default true", () => {
-    expect(src).toMatch(/isVisible\?:\s*boolean/);
-    expect(src).toMatch(/isVisible\s*=\s*true/);
-  });
-
-  test("ResizeObserver bails on a 0×0 contentRect", () => {
-    expect(src).toMatch(
-      /rect\.width\s*===\s*0\s*\|\|\s*rect\.height\s*===\s*0/,
-    );
-  });
-
-  test("hidden→visible effect calls renderer.reconfigure()", () => {
-    expect(src).toContain("renderer.reconfigure()");
-  });
-
-  test("declares a watchdog interval that reconfigures while visible", () => {
-    // The third safety net for WKWebView surface-loss bugs that
-    // don't fire any signal we can hook. setInterval re-fires the
-    // reconfigure every second while visible, so even a totally-
-    // silent surface release recovers within ≤1 s perceptually.
-    expect(src).toMatch(
-      /window\.setInterval\([\s\S]*?renderer\.reconfigure\(\)/,
-    );
-  });
-});
-
 describe("Terminal keepalive layers preserve the GPU surface", () => {
   // The fundamental fix for "switching tabs makes the agent pane
   // go black." WKWebView releases a canvas's WebGPU swapchain
@@ -248,31 +199,3 @@ describe("Terminal keepalive layers preserve the GPU surface", () => {
   }
 });
 
-describe("BlockTerminal + LiveBlock forward isVisible to CanvasGrid", () => {
-  test("BlockTerminal alt-screen branch forwards isVisible to CanvasGrid", () => {
-    const src = readRepoFile("src/terminal/BlockTerminal.tsx");
-    const altIdx = src.indexOf("altScreen && (");
-    expect(altIdx).toBeGreaterThan(-1);
-    const canvasIdx = src.indexOf("<CanvasGrid", altIdx);
-    expect(canvasIdx).toBeGreaterThan(altIdx);
-    const propsWindow = src.slice(canvasIdx, canvasIdx + 800);
-    expect(propsWindow).toMatch(/isVisible\s*=\s*\{isVisible\}/);
-  });
-
-  test("BlockTerminal LiveBlock forwards isVisible", () => {
-    const src = readRepoFile("src/terminal/BlockTerminal.tsx");
-    const liveIdx = src.indexOf("<LiveBlock");
-    expect(liveIdx).toBeGreaterThan(-1);
-    const liveWindow = src.slice(liveIdx, liveIdx + 1200);
-    expect(liveWindow).toMatch(/isVisible\s*=\s*\{isVisible\}/);
-  });
-
-  test("LiveBlock forwards isVisible to its embedded CanvasGrid", () => {
-    const src = readRepoFile("src/terminal/LiveBlock.tsx");
-    expect(src).toMatch(/isVisible\?:\s*boolean/);
-    const canvasIdx = src.indexOf("<CanvasGrid");
-    expect(canvasIdx).toBeGreaterThan(-1);
-    const canvasWindow = src.slice(canvasIdx, canvasIdx + 600);
-    expect(canvasWindow).toMatch(/isVisible\s*=\s*\{isVisible\}/);
-  });
-});
