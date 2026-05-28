@@ -15,8 +15,8 @@ pub mod utils;
 mod window;
 
 pub use app::{
-    capture_embedded, dispatch_embedded_mouse, poke_embedded_redraw, reposition_embedded_surface,
-    App, AppExt, EmbeddedMouseKind,
+    capture_embedded, configure_host_fullscreen, dispatch_embedded_mouse, poke_embedded_redraw,
+    reposition_embedded_surface, App, AppExt, EmbeddedMouseKind,
 };
 use clipboard::*;
 use cocoa::base::{id, nil};

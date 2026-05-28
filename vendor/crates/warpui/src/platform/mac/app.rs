@@ -120,12 +120,32 @@ pub fn reposition_embedded_surface(
     if parent_nswindow.is_null() {
         return;
     }
-    let child = EMBEDDED_CHILD.with(|c| c.get());
-    if child.is_null() {
-        return;
-    }
     unsafe {
         let parent = parent_nswindow as id;
+        // Fullscreen-reparented mode: surface is a subview of parent.contentView.
+        // Position it in the contentView's local coord space (NSView default =
+        // bottom-left origin, Y-up). CSS rect is top-left origin, Y-down.
+        if FULLSCREEN_REPARENTED.load(AtomicOrdering::Relaxed) {
+            let view_ptr = SAVED_SURFACE_VIEW.load(AtomicOrdering::Relaxed);
+            if view_ptr == 0 {
+                return;
+            }
+            let view = view_ptr as id;
+            let parent_content: id = msg_send![parent, contentView];
+            let bounds: cocoa::foundation::NSRect = msg_send![parent_content, bounds];
+            let view_y = bounds.size.height - css_y - css_h;
+            let frame = cocoa::foundation::NSRect::new(
+                cocoa::foundation::NSPoint::new(css_x, view_y),
+                cocoa::foundation::NSSize::new(css_w, css_h),
+            );
+            let _: () = msg_send![view, setFrame: frame];
+            return;
+        }
+
+        let child = EMBEDDED_CHILD.with(|c| c.get());
+        if child.is_null() {
+            return;
+        }
         let parent_frame: cocoa::foundation::NSRect = msg_send![parent, frame];
         let content: cocoa::foundation::NSRect =
             msg_send![parent, contentRectForFrameRect: parent_frame];
@@ -151,6 +171,399 @@ pub fn reposition_embedded_surface(
         }
         let _: () = msg_send![child, setFrame: frame display: YES];
     }
+}
+
+/* ------------------------------------------------------------------
+   Native macOS fullscreen for the HOST window — green button gets its own
+   Space and a Mission Control entry, just like Warp.
+
+   Architectural challenge: our Metal terminal surface is a *child NSWindow*
+   ordered below the host's transparent webview. macOS forces any child window
+   ABOVE the fullscreen primary (FullScreenAuxiliary semantics), so naïve
+   native FS hides the React chrome.
+
+   Solution: at FS willEnter, we re-parent the surface view OUT of the child
+   NSWindow and INTO the host's contentView as a subview, positioned BELOW
+   the webview NSView sibling. The child window gets a placeholder contentView
+   so its `contentView.frame()` query (used by warpui's renderer for drawable
+   sizing) still returns a sensible NSRect. We also point warpui's
+   `native_view()` lookup at the moved surface view via
+   `window::set_embedded_surface_view_override` so the renderer reads the
+   right CAMetalLayer. On didExit we reverse the move.
+
+   We hook the fullscreen lifecycle via `NSWindow{Will,Did}{Enter,Exit}-
+   FullScreenNotification` on the host window — a tiny `WarpUIFSObserver`
+   class registered at runtime.
+   ------------------------------------------------------------------ */
+
+use objc::declare::ClassDecl;
+use objc::runtime::Class;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::OnceLock;
+
+/// Host NSWindow pointer the observer routes to (others ignored).
+static HOST_WINDOW_PTR: AtomicUsize = AtomicUsize::new(0);
+/// Whether we currently have the surface re-parented as a subview (native FS on).
+static FULLSCREEN_REPARENTED: AtomicBool = AtomicBool::new(false);
+/// Retained pointer to the surface NSView while re-parented.
+static SAVED_SURFACE_VIEW: AtomicUsize = AtomicUsize::new(0);
+/// Retained pointer to the original CAMetalLayer.
+static SAVED_METAL_LAYER: AtomicUsize = AtomicUsize::new(0);
+static OBSERVER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Install fullscreen lifecycle observers on the host window so native FS
+/// transitions re-parent the embedded surface (subview during FS, child window
+/// otherwise). Call once on the main thread after `attach_embedded`.
+pub fn configure_host_fullscreen(parent_nswindow: *mut c_void) {
+    if parent_nswindow.is_null() {
+        return;
+    }
+    HOST_WINDOW_PTR.store(parent_nswindow as usize, AtomicOrdering::Relaxed);
+    if OBSERVER_INSTALLED.swap(true, AtomicOrdering::Relaxed) {
+        return;
+    }
+    let observer_class = fs_observer_class();
+    unsafe {
+        let observer: id = msg_send![observer_class, alloc];
+        let observer: id = msg_send![observer, init];
+        let nc: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let parent = parent_nswindow as id;
+        let will_enter = make_nsstring("NSWindowWillEnterFullScreenNotification");
+        let did_exit = make_nsstring("NSWindowDidExitFullScreenNotification");
+        let did_enter = make_nsstring("NSWindowDidEnterFullScreenNotification");
+        let _: () = msg_send![
+            nc,
+            addObserver: observer
+            selector: sel!(windowWillEnterFullScreen:)
+            name: will_enter
+            object: parent
+        ];
+        let _: () = msg_send![
+            nc,
+            addObserver: observer
+            selector: sel!(windowDidEnterFullScreen:)
+            name: did_enter
+            object: parent
+        ];
+        let _: () = msg_send![
+            nc,
+            addObserver: observer
+            selector: sel!(windowDidExitFullScreen:)
+            name: did_exit
+            object: parent
+        ];
+        eprintln!(
+            "[warpui] fullscreen: observer installed (host={:p}, class={})",
+            parent_nswindow,
+            (*parent).class().name()
+        );
+    }
+}
+
+/// Lazily-registered NSObject subclass that catches the host window's
+/// fullscreen transition notifications.
+fn fs_observer_class() -> &'static Class {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    let raw = *CLASS.get_or_init(|| {
+        let superclass = class!(NSObject);
+        let mut decl = ClassDecl::new("WarpUIFSObserver", superclass)
+            .expect("WarpUIFSObserver class declaration");
+        unsafe {
+            decl.add_method(
+                sel!(windowWillEnterFullScreen:),
+                fs_will_enter as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(windowDidEnterFullScreen:),
+                fs_did_enter as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
+                sel!(windowDidExitFullScreen:),
+                fs_did_exit as extern "C" fn(&Object, Sel, id),
+            );
+        }
+        let cls = decl.register();
+        cls as *const Class as usize
+    });
+    unsafe { &*(raw as *const Class) }
+}
+
+extern "C" fn fs_will_enter(_this: &Object, _sel: Sel, _notif: id) {
+    let host = HOST_WINDOW_PTR.load(AtomicOrdering::Relaxed);
+    if host == 0 {
+        return;
+    }
+    eprintln!("[warpui] fullscreen: willEnter → reparent surface as subview");
+    unsafe { reparent_surface_into_subview(host as id) };
+}
+
+extern "C" fn fs_did_enter(_this: &Object, _sel: Sel, _notif: id) {
+    let host = HOST_WINDOW_PTR.load(AtomicOrdering::Relaxed);
+    if host == 0 {
+        return;
+    }
+    // Re-route keyboard to the webview now that AppKit's transition is done.
+    // willEnter's restore can get clobbered mid-animation; this is the
+    // authoritative moment.
+    unsafe {
+        let parent = host as id;
+        let target = find_webview_subview(parent);
+        if target != nil {
+            let ok: BOOL = msg_send![parent, makeFirstResponder: target];
+            eprintln!(
+                "[warpui] fullscreen: didEnter → makeFirstResponder webview={:p} ok={}",
+                target,
+                ok != NO
+            );
+        } else {
+            eprintln!("[warpui] fullscreen: didEnter — could not find webview subview");
+        }
+    }
+}
+
+extern "C" fn fs_did_exit(_this: &Object, _sel: Sel, _notif: id) {
+    let host = HOST_WINDOW_PTR.load(AtomicOrdering::Relaxed);
+    if host == 0 {
+        return;
+    }
+    eprintln!("[warpui] fullscreen: didExit → restore surface as child window");
+    unsafe { reparent_surface_back_to_child(host as id) };
+}
+
+/// Walk the host's contentView subviews and return a sub-subview likely to be
+/// the actual WKWebView (the WebKit one that the JS document actually focuses
+/// into). Tauri/wry typically nests the WKWebView inside an outer container,
+/// so we recursively prefer a WKWebView descendant; falling back to any
+/// non-surface sibling. Returns `nil` if nothing usable was found.
+unsafe fn find_webview_subview(parent: id) -> id {
+    let parent_content: id = msg_send![parent, contentView];
+    if parent_content == nil {
+        return nil;
+    }
+    let surface = SAVED_SURFACE_VIEW.load(AtomicOrdering::Relaxed) as id;
+    let mut best: id = nil;
+    let subs: id = msg_send![parent_content, subviews];
+    let count: NSUInteger = msg_send![subs, count];
+    let mut i: NSUInteger = 0;
+    while i < count {
+        let v: id = msg_send![subs, objectAtIndex: i];
+        if v != surface && v != nil {
+            // Look for an actual WKWebView descendant — that's what should be
+            // the first responder for typing to reach the page's input.
+            let wk = find_wkwebview_descendant(v);
+            if wk != nil {
+                eprintln!(
+                    "[warpui] fullscreen: picked WKWebView descendant {:p} class={}",
+                    wk,
+                    (*wk).class().name()
+                );
+                return wk;
+            }
+            if best == nil {
+                best = v;
+            }
+        }
+        i += 1;
+    }
+    if best != nil {
+        eprintln!(
+            "[warpui] fullscreen: fallback first responder candidate {:p} class={}",
+            best,
+            (*best).class().name()
+        );
+    }
+    best
+}
+
+/// Recursively search `view` for a descendant whose class name contains
+/// "WKWebView" (Apple's webview NSView). Returns nil if none found.
+unsafe fn find_wkwebview_descendant(view: id) -> id {
+    if view == nil {
+        return nil;
+    }
+    let cls_name: &str = (*view).class().name();
+    if cls_name.contains("WKWebView") {
+        return view;
+    }
+    let subs: id = msg_send![view, subviews];
+    let count: NSUInteger = msg_send![subs, count];
+    let mut i: NSUInteger = 0;
+    while i < count {
+        let child: id = msg_send![subs, objectAtIndex: i];
+        let found = find_wkwebview_descendant(child);
+        if found != nil {
+            return found;
+        }
+        i += 1;
+    }
+    nil
+}
+
+/// Re-parent the surface NSView out of its child NSWindow into the host
+/// window's contentView, positioned BELOW the webview NSView sibling.
+///
+/// Three coordinated moves to avoid the prior crash modes:
+/// 1. Replace the child NSWindow's contentView with a placeholder (sized like
+///    the parent contentView) so `child.contentView.frame` keeps returning a
+///    sensible NSRect for warpui callers that read it.
+/// 2. AddSubview the surface view into `parent.contentView` and pin it via
+///    autoresizing.
+/// 3. Set the `embedded_surface_view_override` in window.rs so warpui's
+///    `native_view()` / `logical_size()` / `size()` look at the moved view
+///    (whose CAMetalLayer is the real one the renderer must use) — instead
+///    of the placeholder.
+unsafe fn reparent_surface_into_subview(parent: id) {
+    if FULLSCREEN_REPARENTED.load(AtomicOrdering::Relaxed) {
+        return;
+    }
+    let child = EMBEDDED_CHILD.with(|c| c.get());
+    if child.is_null() {
+        return;
+    }
+    let surface_view: id = msg_send![child, contentView];
+    if surface_view == nil {
+        return;
+    }
+    let metal_layer: id = msg_send![surface_view, layer];
+    if metal_layer == nil {
+        return;
+    }
+    let _: id = msg_send![surface_view, retain];
+    let _: id = msg_send![metal_layer, retain];
+    SAVED_SURFACE_VIEW.store(surface_view as usize, AtomicOrdering::Relaxed);
+    SAVED_METAL_LAYER.store(metal_layer as usize, AtomicOrdering::Relaxed);
+
+    // Save the parent window's first responder — the WKWebView the user is
+    // typing into. Adding WarpHostView as a subview re-runs the responder
+    // chain and AppKit may make WarpHostView (which conforms to
+    // NSTextInputClient + acceptsFirstResponder=YES) the new first responder,
+    // so keystrokes would no longer reach the webview.
+    let saved_first_responder: id = msg_send![parent, firstResponder];
+
+    let _: () = msg_send![parent, removeChildWindow: child];
+    let parent_content: id = msg_send![parent, contentView];
+    if parent_content == nil {
+        return;
+    }
+
+    // Clear windowState so the AppKit callback cascade during the view move
+    // (setFrameSize:, viewDidChangeBackingProperties:) finds
+    // `readyForWarp == NO` and short-circuits before touching the Rust
+    // WindowState (whose native_window is being detached).
+    let surface_obj_mut: &mut Object = &mut *(surface_view as *mut Object);
+    let saved_window_state: *mut c_void = *surface_obj_mut.get_ivar("windowState");
+    surface_obj_mut.set_ivar("windowState", std::ptr::null::<c_void>() as *mut c_void);
+
+    // Install a placeholder as the child's contentView (sized to match the
+    // parent content so child.contentView.frame() returns sensible numbers).
+    let parent_bounds: cocoa::foundation::NSRect = msg_send![parent_content, bounds];
+    let placeholder: id = msg_send![class!(NSView), alloc];
+    let placeholder: id = msg_send![placeholder, initWithFrame: parent_bounds];
+    let _: () = msg_send![child, setContentView: placeholder];
+
+    // Move the surface view into parent.contentView, BELOW the webview sibling.
+    let _: () = msg_send![
+        parent_content,
+        addSubview: surface_view
+        positioned: cocoa::appkit::NSWindowOrderingMode::NSWindowBelow
+        relativeTo: nil
+    ];
+
+    // Restore windowState — the renderer + callbacks should be live again now.
+    let surface_obj_mut: &mut Object = &mut *(surface_view as *mut Object);
+    surface_obj_mut.set_ivar("windowState", saved_window_state);
+
+    let _: () = msg_send![child, orderOut: nil];
+
+    // If AppKit replaced the layer during the move, force it back.
+    let current_layer: id = msg_send![surface_view, layer];
+    if current_layer != metal_layer {
+        let _: () = msg_send![surface_view, setLayer: metal_layer];
+        let _: () = msg_send![surface_view, setWantsLayer: YES];
+    }
+
+    // NSViewWidthSizable (1<<1) | NSViewHeightSizable (1<<4).
+    let mask: NSUInteger = (1 << 1) | (1 << 4);
+    let _: () = msg_send![surface_view, setAutoresizingMask: mask];
+    let _: () = msg_send![surface_view, setFrame: parent_bounds];
+
+    // KEY: redirect warpui's view lookup to the moved view. Without this,
+    // the renderer reads `native_window.contentView.layer` (= placeholder's
+    // NSViewBackingLayer) and panics on `presentsWithTransaction`.
+    crate::platform::mac::window::set_embedded_surface_view_override(surface_view);
+
+    // Restore the first responder — typing should still reach the webview.
+    if saved_first_responder != nil {
+        let _: BOOL = msg_send![parent, makeFirstResponder: saved_first_responder];
+    }
+
+    FULLSCREEN_REPARENTED.store(true, AtomicOrdering::Relaxed);
+    eprintln!(
+        "[warpui] fullscreen: reparented surface={:p} layer={:p} first_responder={:p} (override set)",
+        surface_view, metal_layer, saved_first_responder
+    );
+}
+
+/// Reverse of `reparent_surface_into_subview`: take the surface view back
+/// out of the host contentView, restore it as the child window's contentView,
+/// re-add the child window with NSWindowBelow ordering, and clear the
+/// surface-view override.
+unsafe fn reparent_surface_back_to_child(parent: id) {
+    let saved_view = SAVED_SURFACE_VIEW.swap(0, AtomicOrdering::Relaxed);
+    let saved_layer = SAVED_METAL_LAYER.swap(0, AtomicOrdering::Relaxed);
+    if saved_view == 0 {
+        FULLSCREEN_REPARENTED.store(false, AtomicOrdering::Relaxed);
+        crate::platform::mac::window::set_embedded_surface_view_override(nil);
+        return;
+    }
+    let surface_view = saved_view as id;
+    let child = EMBEDDED_CHILD.with(|c| c.get());
+
+    // Same as enter: stash the parent window's first responder so we can put
+    // the webview back as the input target after the surface leaves.
+    let saved_first_responder: id = msg_send![parent, firstResponder];
+
+    // Clear the override FIRST so any callback during the move falls back to
+    // the (about-to-be-restored) child contentView path.
+    crate::platform::mac::window::set_embedded_surface_view_override(nil);
+
+    let surface_obj_mut: &mut Object = &mut *(surface_view as *mut Object);
+    let saved_window_state: *mut c_void = *surface_obj_mut.get_ivar("windowState");
+    surface_obj_mut.set_ivar("windowState", std::ptr::null::<c_void>() as *mut c_void);
+
+    let _: () = msg_send![surface_view, setAutoresizingMask: 0u64];
+    let _: () = msg_send![surface_view, removeFromSuperview];
+
+    if !child.is_null() {
+        let _: () = msg_send![child, setContentView: surface_view];
+        let _: () = msg_send![surface_view, release];
+
+        if saved_layer != 0 {
+            let metal_layer = saved_layer as id;
+            let current_layer: id = msg_send![surface_view, layer];
+            if current_layer != metal_layer {
+                let _: () = msg_send![surface_view, setLayer: metal_layer];
+                let _: () = msg_send![surface_view, setWantsLayer: YES];
+            }
+            let _: () = msg_send![metal_layer, release];
+        }
+
+        let _: () = msg_send![
+            parent,
+            addChildWindow: child
+            ordered: cocoa::appkit::NSWindowOrderingMode::NSWindowBelow
+        ];
+    }
+
+    let surface_obj_mut: &mut Object = &mut *(surface_view as *mut Object);
+    surface_obj_mut.set_ivar("windowState", saved_window_state);
+
+    if saved_first_responder != nil {
+        let _: BOOL = msg_send![parent, makeFirstResponder: saved_first_responder];
+    }
+
+    FULLSCREEN_REPARENTED.store(false, AtomicOrdering::Relaxed);
+    eprintln!("[warpui] fullscreen: surface restored to child window (override cleared)");
 }
 
 /// Force a repaint of the embedded warpui surface. Host apps call this from
