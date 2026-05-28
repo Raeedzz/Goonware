@@ -63,10 +63,23 @@ void warp_marked_text_cleared(WarpHostView *);
     // new in-progress text) in the same keystroke. Without this, the trailing
     // unmarkText in keyDownImpl would clobber that new marked text.
     BOOL imeTouchedMarkedTextDuringInterpret;
+
+    // When YES, `hitTest:` returns nil so AppKit routes mouse events to the
+    // sibling view above us (the embedded host's webview). Set during native
+    // fullscreen on macOS, when the surface NSView is reparented out of its
+    // child NSWindow (which had `ignoresMouseEvents:YES`) and into the host
+    // contentView — without this flag, AppKit would deliver mouseDown:/
+    // mouseDragged: to us directly, racing with the React handler's
+    // injected events and breaking click-drag selection.
+    BOOL mouseTransparent;
 }
 
 - (BOOL)acceptsFirstResponder {
-    return YES;
+    // In click-through mode (reparented into the host's contentView during
+    // native fullscreen) we also refuse to be first responder, so AppKit
+    // doesn't pull keyboard focus away from the webview when our subview is
+    // inserted into the host's view tree.
+    return !mouseTransparent;
 }
 
 - (BOOL)mouseDownCanMoveWindow {
@@ -75,6 +88,15 @@ void warp_marked_text_cleared(WarpHostView *);
 
 - (BOOL)readyForWarp {
     return windowState != NULL;
+}
+
+- (void)setMouseTransparent:(BOOL)transparent {
+    mouseTransparent = transparent;
+}
+
+- (NSView *)hitTest:(NSPoint)point {
+    if (mouseTransparent) return nil;
+    return [super hitTest:point];
 }
 
 /// Returns the height of the titlebar.

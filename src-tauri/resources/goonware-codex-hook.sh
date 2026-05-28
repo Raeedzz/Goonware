@@ -82,6 +82,10 @@ out = {
 
 pid = codex_pid()
 if pid is not None:
+    # Shared with claude / gemini hooks. The legacy 'codex_process_id'
+    # is parsed by older Rust builds during a Goonware upgrade window;
+    # newer ones read 'agent_process_id'.
+    out['agent_process_id'] = pid
     out['codex_process_id'] = pid
 
 try:

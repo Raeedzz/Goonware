@@ -31,13 +31,62 @@ GOONWARE_SID="${GOONWARE_SESSION_ID:-${GLI_SESSION_ID:-$RLI_SESSION_ID}}"
 # stdin with the heredoc body, leaving NO stdin for the actual hook
 # payload, so `json.load(sys.stdin)` reads empty and the script no-ops.
 # Notchi uses the same `-c` form; we match it.
+#
+# We also walk up the parent process tree looking for `claude` and
+# stash that PID on the envelope. The Rust side runs a 2-second
+# liveness watchdog that synthesizes SessionEnd when the agent PID
+# vanishes — without this, a hard-killed Claude (Ctrl+C double-tap,
+# terminal crash, OOM kill) leaves its SessionRecord stuck at
+# `working` forever, and the worktree spinner keeps spinning even
+# though the agent is gone.
 /usr/bin/python3 -c "
-import json, socket, sys
+import json, os, socket, subprocess, sys
 
 try:
     payload = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+
+def process_table():
+    try:
+        ps_output = subprocess.check_output(
+            ['/bin/ps', '-axo', 'pid=,ppid=,comm='],
+            text=True,
+            timeout=0.5,
+        )
+    except Exception:
+        return {}
+    table = {}
+    for line in ps_output.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        table[int(parts[0])] = {
+            'ppid': int(parts[1]),
+            'command': os.path.basename(parts[2]).lower(),
+        }
+    return table
+
+def agent_pid():
+    # Walk up from our parent. The shell hook runs as a child of the
+    # claude process, so the nearest ancestor whose comm contains
+    # 'claude' is what we want to watch for liveness.
+    processes = process_table()
+    pid = os.getppid()
+    visited = set()
+    for _ in range(8):
+        if pid in visited:
+            break
+        visited.add(pid)
+        info = processes.get(pid)
+        if info is None:
+            break
+        if 'claude' in info['command']:
+            return pid
+        if info['ppid'] <= 1 or info['ppid'] == pid:
+            break
+        pid = info['ppid']
+    return None
 
 # Forward a flat envelope. The 'aux' field carries the event's
 # sub-classifier — today only Notification needs one (its
@@ -64,6 +113,13 @@ out = {
     'prompt': payload.get('prompt', '') or '',
     'goonware_session_id': '$GOONWARE_SID',
 }
+
+pid = agent_pid()
+if pid is not None:
+    # Generic wire name shared with codex / gemini hooks. The Rust
+    # side feeds every session that carries this field into a single
+    # 2-second liveness watchdog.
+    out['agent_process_id'] = pid
 
 try:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

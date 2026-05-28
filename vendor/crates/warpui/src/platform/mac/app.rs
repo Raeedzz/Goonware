@@ -492,6 +492,18 @@ unsafe fn reparent_surface_into_subview(parent: id) {
     // NSViewBackingLayer) and panics on `presentsWithTransaction`.
     crate::platform::mac::window::set_embedded_surface_view_override(surface_view);
 
+    // Make the reparented surface click-through at the AppKit level. While
+    // it lived in the child NSWindow with `ignoresMouseEvents:YES`, AppKit
+    // never delivered mouse events to it; events flowed to the webview, and
+    // the React handler forwarded them into warpui via
+    // `dispatch_embedded_mouse`. As a host-contentView subview, AppKit can
+    // (and does, for points inside the surface frame) deliver mouseDown:/
+    // mouseDragged: straight to WarpHostView's responder methods — which
+    // race the React-injected path and break click-drag selection. Returning
+    // nil from `hitTest:` puts us back on the single (React) input path,
+    // matching windowed behavior.
+    let _: () = msg_send![surface_view, setMouseTransparent: YES];
+
     // Restore the first responder — typing should still reach the webview.
     if saved_first_responder != nil {
         let _: BOOL = msg_send![parent, makeFirstResponder: saved_first_responder];
@@ -557,6 +569,13 @@ unsafe fn reparent_surface_back_to_child(parent: id) {
 
     let surface_obj_mut: &mut Object = &mut *(surface_view as *mut Object);
     surface_obj_mut.set_ivar("windowState", saved_window_state);
+
+    // Restore normal AppKit hit-testing now that the surface is back inside
+    // the `ignoresMouseEvents:YES` child window (matching windowed mode,
+    // where AppKit never delivers mouse events to the surface view anyway —
+    // the flag is just defensive in case the view is read in some other
+    // host context).
+    let _: () = msg_send![surface_view, setMouseTransparent: NO];
 
     if saved_first_responder != nil {
         let _: BOOL = msg_send![parent, makeFirstResponder: saved_first_responder];

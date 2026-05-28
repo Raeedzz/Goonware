@@ -113,18 +113,26 @@ pub struct SessionRecord {
     pub status: SessionStatus,
     pub last_event: String,
     pub last_tool: String,
-    /// Codex-only — the CLI's process id, captured so the PID monitor
-    /// can detect exits that Codex itself doesn't notify us about.
-    pub codex_process_id: Option<i32>,
+    /// The agent CLI's PID, captured by walking up the hook script's
+    /// parent process tree. Used by the unified liveness watchdog to
+    /// detect process exits that the CLI's own at-exit hook misses
+    /// (SIGKILL, OOM, terminal crash, etc.). Originally Codex-only —
+    /// kept on the wire as `codex_process_id` for back-compat — but
+    /// claude / gemini hooks populate it too now, so the watchdog
+    /// can park their spinners on a hard-kill instead of leaving the
+    /// SessionRecord stuck at `working` forever.
+    #[serde(rename = "agent_process_id")]
+    pub agent_process_id: Option<i32>,
     pub updated_at_ms: u64,
 }
 
 #[derive(Default)]
 pub struct AgentHookState {
     sessions: Mutex<std::collections::HashMap<SessionKey, SessionRecord>>,
-    /// Per-session consecutive PID-miss count for Codex liveness
-    /// monitoring. Reset to zero on a successful liveness check.
-    codex_miss_counts: Mutex<std::collections::HashMap<SessionKey, u32>>,
+    /// Per-session consecutive PID-miss count for liveness monitoring.
+    /// Reset to zero on a successful liveness check. Covers every
+    /// provider whose hook envelope carries an agent_process_id.
+    pid_miss_counts: Mutex<std::collections::HashMap<SessionKey, u32>>,
     /// Per-session "is the agent currently inside a user-initiated
     /// turn?" flag. Set by turn-start events (UserPromptSubmit /
     /// BeforeAgent), cleared by turn-end events (Stop / AfterAgent /
@@ -161,9 +169,13 @@ struct HookEnvelope {
     /// payload field (today: Claude's Notification → notification_type).
     #[serde(default)]
     aux: String,
-    /// Codex-only. The CLI process id we should watch for liveness.
-    #[serde(default)]
-    codex_process_id: Option<i32>,
+    /// The CLI process id we should watch for liveness. All three
+    /// providers populate this now (Claude/Gemini for parity with
+    /// Codex's PID watchdog). `alias = "codex_process_id"` keeps a
+    /// stale hook script (left on disk from a prior Goonware build)
+    /// parseable during the upgrade window.
+    #[serde(default, alias = "codex_process_id")]
+    agent_process_id: Option<i32>,
     /// True iff this envelope is from a Goonware helper-agent invocation
     /// (commit-message draft, PR description, etc.). Belt-and-braces:
     /// the hook script already exits early when `GOONWARE_HELPER_AGENT` is
@@ -425,25 +437,26 @@ pub fn start_socket_server(app: AppHandle<Wry>) {
         }
     });
 
-    // Codex PID watchdog. Wakes every 2s, checks `kill(pid, 0)` on
-    // every Codex session we know about, and synthesizes a SessionEnd
-    // after two consecutive misses (matches notchi's 2-miss debounce
-    // — guards against a transient ps glitch falsely killing a live
-    // session). Codex has no SessionEnd hook of its own, so liveness
-    // checking is the only way we learn it exited.
+    // Unified PID liveness watchdog. Wakes every 2s, checks
+    // `kill(pid, 0)` on every session that has an agent_process_id,
+    // and synthesizes a SessionEnd after two consecutive misses
+    // (matches notchi's 2-miss debounce — guards against a transient
+    // ps glitch falsely killing a live session).
     //
-    // Claude and Gemini deliberately have NO watchdog: they emit
-    // reliable Stop / AfterAgent / SessionEnd events at end-of-turn,
-    // and any time-based "force idle" we used to run would lie about
-    // agent state during normal long turns (extended thinking blocks,
-    // multi-minute tool calls). The cost of the missing watchdog is
-    // that a hard-killed Claude / Gemini CLI leaves the spinner on
-    // until the next real event — strictly preferable to falsely
-    // claiming idle while the agent is actively working.
+    // Originally Codex-only because Codex has no SessionEnd hook of
+    // its own. Claude and Gemini DO fire reliable Stop / AfterAgent /
+    // SessionEnd events, but only when the at-exit hook runs — a
+    // hard-killed CLI (Ctrl+C double-tap, OOM, terminal crash) leaves
+    // its SessionRecord stuck at `working` forever, so the worktree
+    // spinner keeps spinning. Covering every provider with the same
+    // 2-miss watchdog parks the spinner deterministically when the
+    // agent is genuinely gone, without lying about long thinking
+    // blocks (the process is alive during those; the PID check
+    // passes).
     let watchdog_app = app;
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(2));
-        reconcile_codex_liveness(&watchdog_app);
+        reconcile_agent_liveness(&watchdog_app);
     });
 }
 
@@ -549,6 +562,10 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
         }
     }
 
+    // Collected here so we can emit Ended events for evicted stale
+    // sessions AFTER releasing the sessions lock.
+    let mut stale_evicted: Vec<SessionRecord> = Vec::new();
+
     let record = {
         let mut sessions = match state.sessions.lock() {
             Ok(g) => g,
@@ -556,7 +573,7 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
         };
         if status == SessionStatus::Ended {
             sessions.remove(&key);
-            if let Ok(mut misses) = state.codex_miss_counts.lock() {
+            if let Ok(mut misses) = state.pid_miss_counts.lock() {
                 misses.remove(&key);
             }
             SessionRecord {
@@ -566,10 +583,39 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
                 status,
                 last_event: envelope.event.clone(),
                 last_tool: envelope.tool.clone(),
-                codex_process_id: envelope.codex_process_id,
+                agent_process_id: envelope.agent_process_id,
                 updated_at_ms: now_ms(),
             }
         } else {
+            // Was this session_id already in the map? Detect BEFORE
+            // entry().or_insert so we can distinguish "new agent
+            // process" from "continuing turn." On the new-process
+            // edge we evict any other sessions for the same
+            // (provider, cwd) — see stale_evicted handling below.
+            let is_new_session = !sessions.contains_key(&key);
+            if is_new_session {
+                let mut to_remove: Vec<SessionKey> = Vec::new();
+                for (other_key, rec) in sessions.iter() {
+                    if rec.provider != provider {
+                        continue;
+                    }
+                    if rec.session_id == envelope.session_id {
+                        continue;
+                    }
+                    if !cwds_overlap(&rec.cwd, &envelope.cwd) {
+                        continue;
+                    }
+                    to_remove.push(other_key.clone());
+                }
+                for other_key in to_remove {
+                    if let Some(mut stale) = sessions.remove(&other_key) {
+                        stale.status = SessionStatus::Ended;
+                        stale.last_event = "evicted_stale".to_string();
+                        stale.updated_at_ms = now_ms();
+                        stale_evicted.push(stale);
+                    }
+                }
+            }
             let entry = sessions
                 .entry(key.clone())
                 .or_insert(SessionRecord {
@@ -579,7 +625,7 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
                     status,
                     last_event: envelope.event.clone(),
                     last_tool: envelope.tool.clone(),
-                    codex_process_id: envelope.codex_process_id,
+                    agent_process_id: envelope.agent_process_id,
                     updated_at_ms: now_ms(),
                 });
             entry.cwd = envelope.cwd.clone();
@@ -588,24 +634,72 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
             if !envelope.tool.is_empty() {
                 entry.last_tool = envelope.tool.clone();
             }
-            // Keep the most recent non-None pid. Codex hook fires
-            // include the PID on every event; this is just defensive
-            // in case some event omits it.
-            if envelope.codex_process_id.is_some() {
-                entry.codex_process_id = envelope.codex_process_id;
+            // Keep the most recent non-None pid. Each hook fire
+            // includes the PID; this is just defensive in case some
+            // event omits it.
+            if envelope.agent_process_id.is_some() {
+                entry.agent_process_id = envelope.agent_process_id;
             }
             entry.updated_at_ms = now_ms();
-            // Successful event for this session resets its miss count.
-            if provider == Provider::Codex {
-                if let Ok(mut misses) = state.codex_miss_counts.lock() {
-                    misses.remove(&key);
-                }
+            // Any successful event proves the agent is alive — drop
+            // its accumulated miss count so the watchdog starts over
+            // from zero. (Without this, a session that's been mostly
+            // quiet for a while could be one ps blip away from
+            // eviction even though it just emitted a real event.)
+            if let Ok(mut misses) = state.pid_miss_counts.lock() {
+                misses.remove(&key);
             }
             entry.clone()
         }
     };
 
+    // Drop the evicted-session miss counts and turn flags too, so a
+    // re-using of the same session_id later (extremely rare) doesn't
+    // resurrect stale liveness state.
+    if !stale_evicted.is_empty() {
+        if let Ok(mut misses) = state.pid_miss_counts.lock() {
+            for sess in &stale_evicted {
+                misses.remove(&make_key(sess.provider, &sess.session_id));
+            }
+        }
+        if let Ok(mut turns) = state.in_user_turn.lock() {
+            for sess in &stale_evicted {
+                turns.remove(&make_key(sess.provider, &sess.session_id));
+            }
+        }
+        for sess in &stale_evicted {
+            eprintln!(
+                "[goonware-hooks] evicting stale {} session {} (replaced by {} at cwd={})",
+                sess.provider.as_str(),
+                sess.session_id,
+                envelope.session_id,
+                envelope.cwd,
+            );
+            let _ = app.emit(SESSION_STATE_EVENT, sess);
+        }
+    }
+
     let _ = app.emit(SESSION_STATE_EVENT, &record);
+}
+
+/// True iff one cwd is at or below the other. Symmetric so we catch
+/// both "old session at /repo, new at /repo/src" (user cd'd into a
+/// subdir before relaunching) and "old session at /repo/src, new at
+/// /repo" (relaunched from the worktree root). The frontend's
+/// AgentChrome / spinner picker treats matches as the same worktree,
+/// so the eviction has to match the same shape.
+fn cwds_overlap(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let a_trim = a.strip_suffix('/').unwrap_or(a);
+    let b_trim = b.strip_suffix('/').unwrap_or(b);
+    if a_trim == b_trim {
+        return true;
+    }
+    let a_prefix = format!("{}/", a_trim);
+    let b_prefix = format!("{}/", b_trim);
+    b_trim.starts_with(&a_prefix) || a_trim.starts_with(&b_prefix)
 }
 
 /// True iff a process with this PID is currently in the kernel's
@@ -628,64 +722,71 @@ fn pid_alive(pid: i32) -> bool {
     err == libc::EPERM
 }
 
-const CODEX_MISS_LIMIT: u32 = 2;
+const PID_MISS_LIMIT: u32 = 2;
 
-/// Walk every Codex session, check liveness, evict on second miss.
-/// Synthesizes a SessionEnd record and emits it so the frontend store
-/// drops the session — same wire format as a real Ended event.
-fn reconcile_codex_liveness(app: &AppHandle<Wry>) {
+/// Walk every session that has an agent PID, check liveness, evict on
+/// second consecutive miss. Synthesizes a SessionEnd record and emits
+/// it so the frontend store drops the session — same wire format as a
+/// real Ended event.
+///
+/// Two-miss debounce guards against transient ps glitches (the
+/// process table can momentarily report a live agent as missing when
+/// ps races with a fork/exec inside the agent's own subprocess
+/// management). One miss is noise; two is gone.
+fn reconcile_agent_liveness(app: &AppHandle<Wry>) {
     let state = match app.try_state::<AgentHookState>() {
         Some(s) => s,
         None => return,
     };
 
-    // Snapshot the Codex sessions first; don't hold the lock across
-    // the eviction emit.
-    let codex_sessions: Vec<SessionRecord> = match state.sessions.lock() {
+    // Snapshot the sessions with a PID first; don't hold the lock
+    // across the eviction emit.
+    let tracked_sessions: Vec<SessionRecord> = match state.sessions.lock() {
         Ok(g) => g
             .values()
-            .filter(|r| r.provider == Provider::Codex && r.codex_process_id.is_some())
+            .filter(|r| r.agent_process_id.is_some())
             .cloned()
             .collect(),
         Err(_) => return,
     };
 
     let mut to_evict: Vec<SessionRecord> = Vec::new();
-    for sess in codex_sessions {
-        let pid = match sess.codex_process_id {
+    for sess in tracked_sessions {
+        let pid = match sess.agent_process_id {
             Some(p) => p,
             None => continue,
         };
         let key = make_key(sess.provider, &sess.session_id);
         if pid_alive(pid) {
-            if let Ok(mut misses) = state.codex_miss_counts.lock() {
+            if let Ok(mut misses) = state.pid_miss_counts.lock() {
                 misses.remove(&key);
             }
             continue;
         }
-        let new_miss_count = if let Ok(mut misses) = state.codex_miss_counts.lock() {
+        let new_miss_count = if let Ok(mut misses) = state.pid_miss_counts.lock() {
             let entry = misses.entry(key.clone()).or_insert(0);
             *entry += 1;
             *entry
         } else {
             0
         };
-        if new_miss_count >= CODEX_MISS_LIMIT {
+        if new_miss_count >= PID_MISS_LIMIT {
             to_evict.push(sess);
         }
     }
 
     for mut sess in to_evict {
         eprintln!(
-            "[goonware-hooks] codex pid {} exited; ending session {}",
-            sess.codex_process_id.unwrap_or(-1),
+            "[goonware-hooks] {} pid {} exited; ending session {}",
+            sess.provider.as_str(),
+            sess.agent_process_id.unwrap_or(-1),
             sess.session_id
         );
         let key = make_key(sess.provider, &sess.session_id);
         if let Ok(mut sessions) = state.sessions.lock() {
             sessions.remove(&key);
         }
-        if let Ok(mut misses) = state.codex_miss_counts.lock() {
+        if let Ok(mut misses) = state.pid_miss_counts.lock() {
             misses.remove(&key);
         }
         if let Ok(mut turns) = state.in_user_turn.lock() {
@@ -1764,5 +1865,48 @@ mod tests {
                 name
             );
         }
+    }
+
+    /* ---------- cwd overlap ---------- */
+
+    /// The eviction-on-new-session path uses `cwds_overlap` to decide
+    /// whether a stale session belongs to the same "logical worktree"
+    /// as a fresh hook envelope. The match must be symmetric so we
+    /// catch both directions ("old at /repo, new at /repo/src" and
+    /// "old at /repo/src, new at /repo"), and tolerant of a single
+    /// trailing slash mismatch.
+    #[test]
+    fn cwds_overlap_exact_match() {
+        assert!(cwds_overlap("/Users/me/proj", "/Users/me/proj"));
+    }
+
+    #[test]
+    fn cwds_overlap_trailing_slash_either_side() {
+        assert!(cwds_overlap("/Users/me/proj/", "/Users/me/proj"));
+        assert!(cwds_overlap("/Users/me/proj", "/Users/me/proj/"));
+    }
+
+    #[test]
+    fn cwds_overlap_descendant_either_direction() {
+        // New cwd is a descendant of the stale one.
+        assert!(cwds_overlap("/Users/me/proj", "/Users/me/proj/src"));
+        // Stale cwd is a descendant of the new one.
+        assert!(cwds_overlap("/Users/me/proj/src", "/Users/me/proj"));
+    }
+
+    #[test]
+    fn cwds_overlap_rejects_unrelated_paths() {
+        assert!(!cwds_overlap("/Users/me/proj-a", "/Users/me/proj-b"));
+        // Prefix collision must NOT match — /Users/me/proj-a doesn't
+        // contain /Users/me/proj as a path component.
+        assert!(!cwds_overlap("/Users/me/proj", "/Users/me/proj-other"));
+        assert!(!cwds_overlap("/Users/me/proj-other", "/Users/me/proj"));
+    }
+
+    #[test]
+    fn cwds_overlap_rejects_empty() {
+        assert!(!cwds_overlap("", "/Users/me/proj"));
+        assert!(!cwds_overlap("/Users/me/proj", ""));
+        assert!(!cwds_overlap("", ""));
     }
 }

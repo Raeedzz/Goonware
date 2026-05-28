@@ -32,7 +32,7 @@ import { detectClaude } from "@/lib/claudeUsage";
 import { termKillForeground, termResetGrid } from "@/lib/tauri/term";
 import { writeClipboardTextWithFallback } from "./clipboardWrite";
 import { decideSoftResetAction } from "./softReset";
-import { forceIdleForCwd } from "@/state/agentActivityStore";
+import { forceEvictForCwd, forceIdleForCwd } from "@/state/agentActivityStore";
 import {
   agentScrollContainerStyle,
   shouldRenderBlockList,
@@ -1493,13 +1493,20 @@ export function BlockTerminal({
   // foreground process group via tcgetpgrp(master_fd) and SIGKILLs
   // it, bypassing whatever signal trap the running process installed.
   //
-  // Always force-idle here. A double-tap escalation means the user
-  // really wants the agent dead — even if it traps SIGINT, the
-  // foreground process group is about to receive SIGKILL. The
-  // spinner must reflect that intent immediately.
+  // Always force-EVICT here (not just force-idle). A double-tap
+  // escalation means the user really wants the agent dead — even if
+  // it traps SIGINT, the foreground process group is about to receive
+  // SIGKILL. The SessionEnd hook will never fire (the agent process
+  // is killed before it can run its at-exit handler), so the only way
+  // to keep the session map from accumulating a stuck "working"
+  // record is to drop it locally right here. Without this, the next
+  // time the user runs `claude` in this pane the stale record is
+  // still there: the sidebar spinner stays on (any working session
+  // counts) and the per-pane chrome can briefly show the killed
+  // agent's last status before the new SessionStart record arrives.
   const onForceKill = useCallback(() => {
     const path = cwdRef.current;
-    if (path) forceIdleForCwd(path);
+    if (path) forceEvictForCwd(path);
     void termKillForeground(ptyId).catch(() => {
       // Backend may have torn the session down between the read and
       // the kill (rare race on tab close). Nothing useful to do; the
