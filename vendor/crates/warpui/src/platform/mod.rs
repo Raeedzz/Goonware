@@ -29,8 +29,8 @@ pub mod current {
 pub use app::AppBuilder;
 #[cfg(target_os = "macos")]
 pub use mac::{
-    capture_embedded, dispatch_embedded_mouse, poke_embedded_redraw, reposition_embedded_surface,
-    EmbeddedMouseKind,
+    capture_embedded, configure_host_fullscreen, dispatch_embedded_mouse, poke_embedded_redraw,
+    reposition_embedded_surface, EmbeddedMouseKind,
 };
 pub use warpui_core::platform::*;
 

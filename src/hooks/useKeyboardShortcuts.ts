@@ -61,6 +61,13 @@ export function useKeyboardShortcuts() {
       const cmd = e.metaKey || e.ctrlKey;
       const shift = e.shiftKey;
 
+      // ⌃⌘F is macOS fullscreen (handled natively by the window / View menu).
+      // Bail so the ⌘F search check below doesn't also fire on it (our `cmd`
+      // is meta-OR-ctrl, so ⌃⌘F would otherwise open search too).
+      if (e.metaKey && e.ctrlKey && !shift && !e.altKey && e.key.toLowerCase() === "f") {
+        return;
+      }
+
       if (cmd && !shift && !e.altKey && (e.key.toLowerCase() === "k" || e.key.toLowerCase() === "f")) {
         e.preventDefault();
         dispatch({ type: "set-search", open: true });

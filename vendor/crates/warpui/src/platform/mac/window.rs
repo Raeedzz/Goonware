@@ -45,6 +45,34 @@ extern "C" {
 }
 
 pub const WINDOW_STATE_IVAR: &str = "windowState";
+
+// In embedded mode we sometimes need to RE-PARENT the surface view out of its
+// child NSWindow into the host (Tauri) window's contentView — specifically
+// during native macOS fullscreen, where macOS forces child windows ABOVE the
+// primary, hiding our React chrome. While re-parented, `native_window.content
+// View()` returns a placeholder (the child window keeps a stand-in so its
+// `contentView.frame` query doesn't crash). The renderer and size queries
+// should instead look at the *moved* surface view. This override stores that
+// surface view and, when non-nil, is used in place of
+// `native_window.contentView()`. `app.rs::reparent_surface_into_subview` /
+// `..._back_to_child` set and clear it. nil = use the default (windowed mode).
+thread_local! {
+    static EMBEDDED_SURFACE_VIEW_OVERRIDE: std::cell::Cell<id> =
+        const { std::cell::Cell::new(0 as id) };
+}
+
+/// Set the override surface view (called from `app.rs` on FS enter). Pass
+/// `nil` to clear (on FS exit).
+pub fn set_embedded_surface_view_override(view: id) {
+    EMBEDDED_SURFACE_VIEW_OVERRIDE.with(|c| c.set(view));
+}
+
+/// Read the override surface view, if any. Returns `nil` when not in
+/// re-parented mode.
+fn embedded_surface_view_override() -> id {
+    EMBEDDED_SURFACE_VIEW_OVERRIDE.with(|c| c.get())
+}
+
 const INITIAL_WINDOW_WIDTH: f32 = 1280.;
 const INITIAL_WINDOW_HEIGHT: f32 = 800.;
 const DEFAULT_WINDOW_BACKGROUND_BLUR_RADIUS: u8 = 1;
@@ -1023,7 +1051,13 @@ impl WindowState {
 
     /// Returns the logical (resolution-agnostic) size of the current window.
     pub fn logical_size(&self) -> Vector2F {
-        let view_frame = unsafe { NSView::frame(self.native_window.contentView()) };
+        // In re-parented mode (native FS), the surface view lives in the host
+        // contentView, not the child window. Read its frame directly.
+        let view_frame = unsafe {
+            let v = embedded_surface_view_override();
+            let view = if v != nil { v } else { self.native_window.contentView() };
+            NSView::frame(view)
+        };
         vec2f(view_frame.size.width as f32, view_frame.size.height as f32)
     }
 
@@ -1054,8 +1088,15 @@ impl WindowState {
         }
     }
 
-    /// Returns an `id` to the current `NSView` of the window.
+    /// Returns an `id` to the current `NSView` of the window. Honors the
+    /// re-parent override so the renderer reads the actual surface view's
+    /// CAMetalLayer during native FS (when the view lives in the host
+    /// contentView, not the child window).
     pub(super) fn native_view(&self) -> id {
+        let v = embedded_surface_view_override();
+        if v != nil {
+            return v;
+        }
         unsafe { msg_send![self.native_window, contentView] }
     }
 
@@ -1107,7 +1148,11 @@ impl WindowState {
 
 impl platform::WindowContext for WindowState {
     fn size(&self) -> Vector2F {
-        let view_frame = unsafe { NSView::frame(self.native_window.contentView()) };
+        let view_frame = unsafe {
+            let v = embedded_surface_view_override();
+            let view = if v != nil { v } else { self.native_window.contentView() };
+            NSView::frame(view)
+        };
         vec2f(view_frame.size.width as f32, view_frame.size.height as f32)
     }
 
@@ -1130,16 +1175,12 @@ impl platform::WindowContext for WindowState {
 
     fn render_scene(&self, scene: Rc<Scene>) {
         *self.next_scene.borrow_mut() = Some(scene);
-        unsafe {
-            let _: () = msg_send![self.native_window, setNeedsDisplayAsync];
-        }
+        unsafe { poke_native_surface_redraw(self.native_window) };
     }
 
     fn request_redraw(&self) {
         let _ = self.next_scene.borrow_mut().take();
-        unsafe {
-            let _: () = msg_send![self.native_window, setNeedsDisplayAsync];
-        }
+        unsafe { poke_native_surface_redraw(self.native_window) };
     }
 
     fn request_frame_capture(
@@ -1147,10 +1188,31 @@ impl platform::WindowContext for WindowState {
         callback: Box<dyn FnOnce(platform::CapturedFrame) + Send + 'static>,
     ) {
         *self.capture_callback.borrow_mut() = Some(callback);
-        unsafe {
-            let _: () = msg_send![self.native_window, setNeedsDisplayAsync];
-        }
+        unsafe { poke_native_surface_redraw(self.native_window) };
     }
+}
+
+/// Mark the surface view as needing redraw, accounting for the embedded-mode
+/// re-parenting (host fullscreen). In windowed embedded mode the surface IS
+/// the child window's contentView, so we go through the warpui NSWindow's
+/// `setNeedsDisplayAsync` (existing behavior). In native fullscreen we
+/// re-parented the surface NSView out of the child window into the host
+/// window's contentView; the child's contentView is now a placeholder. Poking
+/// the child window would mark the (hidden) placeholder dirty and the real
+/// surface never repaints, so we mark the moved view directly instead. The
+/// override is set/cleared by `app::reparent_surface_into_subview` /
+/// `..._back_to_child`.
+unsafe fn poke_native_surface_redraw(native_window: id) {
+    let v = embedded_surface_view_override();
+    if v != nil {
+        // NSView's setNeedsDisplay: is thread-safe per Apple docs, so the PTY
+        // reader thread can call it directly. AppKit will pick up the dirty
+        // mark on the next display pass and call displayLayer: → our
+        // warp_update_layer → renders into the CAMetalLayer.
+        let _: () = msg_send![v, setNeedsDisplay: YES];
+        return;
+    }
+    let _: () = msg_send![native_window, setNeedsDisplayAsync];
 }
 
 /// An extension trait defining additional window-management options when running on macOS.

@@ -382,6 +382,15 @@ fn reposition_surface() {
     }
 }
 
+/// Intercept the host window's fullscreen action (green button / ⌃⌘F / View ▸
+/// Enter Full Screen) so it does borderless full-bleed fullscreen in the same
+/// Space — where the native surface keeps compositing below the webview —
+/// instead of native fullscreen (whose separate Space breaks that compositing).
+/// Called once from `lib.rs` setup (main thread) with the host `NSWindow`.
+pub fn configure_fullscreen(parent_nswindow: *mut std::ffi::c_void) {
+    warpui::platform::configure_host_fullscreen(parent_nswindow);
+}
+
 /// Tauri handle, stashed at attach for `run_on_main_thread` (sink redraw poke
 /// + commands that touch AppKit).
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();

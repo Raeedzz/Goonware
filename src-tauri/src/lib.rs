@@ -155,6 +155,16 @@ pub fn run() {
             // frame sink so term.rs frames drive the native grid directly.
             warp_term::attach(app.handle());
 
+            // Make the green button / ⌃⌘F do borderless full-bleed fullscreen in
+            // the SAME Space (native fullscreen's separate Space can't composite
+            // the embedded Metal surface below the webview). Setup runs on the
+            // main thread, so the AppKit calls are safe here.
+            if let Some(win) = app.get_webview_window("main") {
+                if let Ok(parent) = win.ns_window() {
+                    warp_term::configure_fullscreen(parent);
+                }
+            }
+
             Ok(())
         });
 

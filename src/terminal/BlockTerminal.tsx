@@ -629,7 +629,14 @@ export function BlockTerminal({
   // textarea isn't hijacked when the user reaches for it.
   useEffect(() => {
     const el = scrollContainerRef.current;
-    if (!el) return;
+    // Native surface: left-drag is TEXT SELECTION (Warp behavior), driven by the
+    // selection mouse bridge below; scrolling is the wheel/trackpad. The grab-to-
+    // scroll handler must NOT run here — its non-passive `pointermove`
+    // `preventDefault()` suppresses the compatibility `mousemove` events that the
+    // selection bridge relies on, so the selection would start on mousedown and
+    // never extend (the "can't highlight with click-drag" bug). Keep grab-to-
+    // scroll only for the legacy non-native (CanvasGrid) path.
+    if (!el || nativeSurface) return;
     const DRAG_THRESHOLD_PX = 6;
     let activePointerId = -1;
     let startY = 0;
@@ -719,7 +726,7 @@ export function BlockTerminal({
       el.removeEventListener("pointerdown", onPointerDown);
       teardown();
     };
-  }, []);
+  }, [nativeSurface]);
 
   // PTY died (process crashed, backend restarted on a Rust hot-reload,
   // user `exit`-ed the shell, etc.). Drop out of agent mode so the
@@ -939,10 +946,26 @@ export function BlockTerminal({
     const el = scrollContainerRef.current;
     if (!el || !nativeActive || agentMode) return;
     let dragging = false;
-    const send = (kind: string, e: globalThis.MouseEvent) => {
+    // The latest pointer position during a drag, kept so the autoscroll loop
+    // can re-dispatch a drag (extending the selection) when the pointer is held
+    // STILL past an edge and no `mousemove` fires.
+    let lastX = 0;
+    let lastY = 0;
+    let lastMods = { shift: false, cmd: false, alt: false, ctrl: false };
+    let autoRaf = 0;
+    const sendAt = (kind: string, x: number, y: number) => {
       // Window-content coords (clientX/Y); Rust subtracts the combined surface
       // origin so the event lands in this pane's region (warpui hit-tests by
       // position across both panes' SelectableAreas).
+      invoke("term_native_mouse", {
+        kind,
+        x,
+        y,
+        clickCount: 1,
+        ...lastMods,
+      }).catch(() => {});
+    };
+    const send = (kind: string, e: globalThis.MouseEvent) => {
       invoke("term_native_mouse", {
         kind,
         x: e.clientX,
@@ -954,12 +977,58 @@ export function BlockTerminal({
         ctrl: e.ctrlKey,
       }).catch(() => {});
     };
+    // Warp-style edge autoscroll: while the drag pointer sits beyond the top or
+    // bottom of the transcript viewport, scroll the native transcript and keep
+    // re-dispatching a drag pinned to the edge so warpui extends the selection
+    // into the freshly revealed lines. Runs on its own rAF so it continues even
+    // when the pointer is motionless (no `mousemove`). Speed scales with how far
+    // past the edge the pointer is. `deltaPx > 0` advances toward newer output
+    // (down); `< 0` toward older (up) — same convention as the wheel bridge.
+    // Autoscroll engages within EDGE px of the top/bottom (and of course past
+    // it) — you don't have to drag exactly off the surface, just toward the edge,
+    // like Warp / a native text view. Speed ramps with how deep into the zone the
+    // pointer is.
+    const EDGE = 40;
+    const tick = () => {
+      autoRaf = 0;
+      if (!dragging) return;
+      const r = el.getBoundingClientRect();
+      let delta = 0;
+      let edgeY = lastY;
+      if (lastY < r.top + EDGE) {
+        const dist = r.top + EDGE - lastY; // grows as you near / pass the top
+        delta = -Math.min(64, 4 + dist * 0.6);
+        edgeY = r.top + 1;
+      } else if (lastY > r.bottom - EDGE) {
+        const dist = lastY - (r.bottom - EDGE);
+        delta = Math.min(64, 4 + dist * 0.6);
+        edgeY = r.bottom - 1;
+      }
+      if (delta === 0) return; // back inside the safe zone — stop the loop
+      invoke("term_native_scroll", { paneKey, deltaPx: delta }).catch(() => {});
+      // Re-extend the selection to the edge after the scroll lands.
+      sendAt("drag", lastX, edgeY);
+      autoRaf = requestAnimationFrame(tick);
+    };
+    const maybeAutoscroll = () => {
+      if (autoRaf) return; // already looping
+      const r = el.getBoundingClientRect();
+      if (lastY < r.top + EDGE || lastY > r.bottom - EDGE)
+        autoRaf = requestAnimationFrame(tick);
+    };
     const onMove = (e: globalThis.MouseEvent) => {
-      if (dragging) send("drag", e);
+      if (!dragging) return;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      lastMods = { shift: e.shiftKey, cmd: e.metaKey, alt: e.altKey, ctrl: e.ctrlKey };
+      send("drag", e);
+      maybeAutoscroll();
     };
     const onUp = (e: globalThis.MouseEvent) => {
       if (!dragging) return;
       dragging = false;
+      if (autoRaf) cancelAnimationFrame(autoRaf);
+      autoRaf = 0;
       send("up", e);
       window.removeEventListener("mousemove", onMove, true);
       window.removeEventListener("mouseup", onUp, true);
@@ -968,6 +1037,9 @@ export function BlockTerminal({
       if (e.button !== 0) return;
       e.preventDefault();
       dragging = true;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      lastMods = { shift: e.shiftKey, cmd: e.metaKey, alt: e.altKey, ctrl: e.ctrlKey };
       send("down", e);
       window.addEventListener("mousemove", onMove, true);
       window.addEventListener("mouseup", onUp, true);
@@ -977,8 +1049,9 @@ export function BlockTerminal({
       el.removeEventListener("mousedown", onDown, true);
       window.removeEventListener("mousemove", onMove, true);
       window.removeEventListener("mouseup", onUp, true);
+      if (autoRaf) cancelAnimationFrame(autoRaf);
     };
-  }, [nativeActive, agentMode]);
+  }, [nativeActive, agentMode, paneKey]);
 
   // Cmd+C copies the native transcript selection (kept by warpui's
   // SelectableArea, exposed via term_native_selection_text) through the existing
