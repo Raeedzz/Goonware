@@ -268,7 +268,7 @@ function SegmentButton({
           ? "var(--weight-semibold)"
           : "var(--weight-medium)",
         border: "none",
-        cursor: "default",
+        cursor: "pointer",
         transition:
           "background-color var(--motion-instant) var(--ease-out-quart), color var(--motion-instant) var(--ease-out-quart)",
       }}

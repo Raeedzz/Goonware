@@ -256,7 +256,7 @@ function PanelTab({
         display: "inline-flex",
         alignItems: "center",
         gap: 4,
-        cursor: "default",
+        cursor: "pointer",
         transition: "color var(--motion-fast) var(--ease-out-quart)",
       }}
     >

@@ -52,9 +52,30 @@ const CLAUDE_HOOK_SCRIPT: &str = include_str!("../resources/goonware-claude-hook
 const CODEX_HOOK_SCRIPT: &str = include_str!("../resources/goonware-codex-hook.sh");
 const GEMINI_HOOK_SCRIPT: &str = include_str!("../resources/goonware-gemini-hook.sh");
 
-/// Shared Unix socket. All three providers' scripts forward to the
-/// same path; the envelope's `provider` field disambiguates.
-const SOCKET_PATH: &str = "/tmp/goonware-agent.sock";
+/// Per-instance Unix socket directory prefix. Each running Goonware binds its
+/// OWN socket at `/tmp/goonware-agent-<instance>.sock`; the hook scripts fan a
+/// single event out to EVERY `/tmp/goonware-agent-*.sock`, and each instance
+/// keeps only the events tagged with its own `instance_id` (see
+/// `should_drop_envelope`). A single shared `/tmp/goonware-agent.sock` meant the
+/// instance that started last stole the socket and received every agent's
+/// events — so running `tauri dev` next to the installed app left the other
+/// instance's worktree spinner permanently dark.
+const SOCKET_PREFIX: &str = "/tmp/goonware-agent-";
+const SOCKET_SUFFIX: &str = ".sock";
+
+/// Stable per-process instance id (the OS PID as a string). Unique across every
+/// concurrently-running Goonware, so it disambiguates which instance owns an
+/// agent: it's injected into each PTY's env (`GOONWARE_INSTANCE_ID`), echoed
+/// back by the hook script on every envelope, and matched here.
+pub fn instance_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| std::process::id().to_string())
+}
+
+/// This instance's socket path: `/tmp/goonware-agent-<pid>.sock`.
+fn socket_path() -> String {
+    format!("{SOCKET_PREFIX}{}{SOCKET_SUFFIX}", instance_id())
+}
 
 /// Event name emitted on every state change. Frontend listens once at
 /// app boot and updates a singleton store.
@@ -201,6 +222,15 @@ struct HookEnvelope {
     /// from the prior GLI name still parse during the upgrade window.
     #[serde(default, alias = "gli_session_id")]
     goonware_session_id: Option<String>,
+    /// The id of the Goonware INSTANCE that spawned the agent's PTY
+    /// (`GOONWARE_INSTANCE_ID` env var = that process's PID). The hook script
+    /// fans every event out to ALL running instances' sockets, so an event for
+    /// an agent owned by a *different* instance can reach us; we keep only the
+    /// ones tagged with our own `instance_id()`. Absent on legacy scripts left
+    /// on disk during the upgrade window — treated as "ours" so single-instance
+    /// behavior is unchanged until both instances run the new script.
+    #[serde(default)]
+    goonware_instance_id: Option<String>,
     /// User's typed prompt text. Populated for UserPromptSubmit
     /// events; empty for everything else. Fed into the tab-subtitle
     /// summarizer (`claude_activity_summary`) so we can render a
@@ -212,20 +242,35 @@ struct HookEnvelope {
     prompt: String,
 }
 
-/// Drop envelopes that shouldn't move the spinner at all. Two rules:
+/// Drop envelopes that shouldn't move the spinner at all. Three rules:
 ///   1. `goonware_helper=true` — internal helper-agent one-shot, never a
 ///      user-visible turn.
 ///   2. `goonware_session_id` missing/empty — agent isn't running inside a
 ///      Goonware PTY (e.g. user is using Claude in Warp at the same time).
-/// Factored as a pure predicate so the rules are testable without
-/// standing up an AppHandle.
+///   3. `goonware_instance_id` present AND ≠ this instance — the agent belongs
+///      to a DIFFERENT Goonware instance (the hook fans out to every instance's
+///      socket, so we receive its peers' events too). A missing/empty instance
+///      id means a legacy script that doesn't tag instances; accept it so
+///      single-instance behavior is unchanged.
+/// Factored as a pure predicate (instance id threaded in) so the rules are
+/// testable without standing up an AppHandle.
 fn should_drop_envelope(envelope: &HookEnvelope) -> bool {
+    should_drop_envelope_for(envelope, instance_id())
+}
+
+fn should_drop_envelope_for(envelope: &HookEnvelope, this_instance: &str) -> bool {
     if envelope.goonware_helper.unwrap_or(false) {
         return true;
     }
     match envelope.goonware_session_id.as_deref() {
-        None | Some("") => true,
-        Some(_) => false,
+        None | Some("") => return true,
+        Some(_) => {}
+    }
+    match envelope.goonware_instance_id.as_deref() {
+        // Legacy script / untagged — accept (single-instance behavior).
+        None | Some("") => false,
+        // Tagged: keep only our own instance's events.
+        Some(id) => id != this_instance,
     }
 }
 
@@ -408,23 +453,25 @@ pub(crate) fn record_prompt_for_cwd_for_test(cwd: &str, prompt: &str) {
 
 /// Spawn the Unix-socket listener + the Codex liveness watchdog.
 pub fn start_socket_server(app: AppHandle<Wry>) {
-    let _ = fs::remove_file(SOCKET_PATH);
+    let path = socket_path();
+    let _ = fs::remove_file(&path);
 
-    let listener = match UnixListener::bind(SOCKET_PATH) {
+    let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[goonware-hooks] socket bind failed: {e}");
             return;
         }
     };
+    eprintln!("[goonware-hooks] listening on {path}");
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fs::metadata(SOCKET_PATH) {
+        if let Ok(meta) = fs::metadata(&path) {
             let mut perms = meta.permissions();
             perms.set_mode(0o600);
-            let _ = fs::set_permissions(SOCKET_PATH, perms);
+            let _ = fs::set_permissions(&path, perms);
         }
     }
 
@@ -1813,6 +1860,41 @@ mod tests {
         }
     }
 
+    /// Multi-instance routing: the hook fans every event out to ALL running
+    /// Goonware instances' sockets, so an event for a DIFFERENT instance's
+    /// agent can reach us. We keep only envelopes tagged with our own instance
+    /// id; a missing/empty tag is a legacy script and is accepted (preserving
+    /// single-instance behavior). This is what stops `tauri dev` next to the
+    /// installed app from stealing the other instance's spinner.
+    #[test]
+    fn envelope_instance_id_ownership_filter() {
+        let base = serde_json::json!({
+            "provider": "claude",
+            "session_id": "s",
+            "cwd": "/tmp",
+            "event": "UserPromptSubmit",
+            "goonware_session_id": "wt-1",
+        });
+
+        // Tagged with OUR instance → kept.
+        let mut mine = base.clone();
+        mine["goonware_instance_id"] = serde_json::json!("1234");
+        assert!(!should_drop_envelope_for(&envelope_from_json(mine), "1234"));
+
+        // Tagged with a DIFFERENT instance → dropped.
+        let mut theirs = base.clone();
+        theirs["goonware_instance_id"] = serde_json::json!("9999");
+        assert!(should_drop_envelope_for(&envelope_from_json(theirs), "1234"));
+
+        // Untagged (legacy script) → kept regardless of our instance id.
+        assert!(!should_drop_envelope_for(&envelope_from_json(base.clone()), "1234"));
+
+        // Empty tag → treated as untagged, kept.
+        let mut empty = base;
+        empty["goonware_instance_id"] = serde_json::json!("");
+        assert!(!should_drop_envelope_for(&envelope_from_json(empty), "1234"));
+    }
+
     /// Sanity check on the script-level guard: the bundled hook
     /// scripts must exit early when `GOONWARE_HELPER_AGENT` is set. The
     /// script-level skip is the primary defense (no socket write at
@@ -1863,6 +1945,38 @@ mod tests {
                 body.contains("RLI_SESSION_ID"),
                 "{} hook script must fall back to RLI_SESSION_ID",
                 name
+            );
+        }
+    }
+
+    /// Each script must fan out to EVERY instance socket (glob over
+    /// `/tmp/goonware-agent-*.sock`) and tag the envelope with
+    /// `goonware_instance_id` (from the GOONWARE_INSTANCE_ID env var) so the
+    /// Rust side can filter to its own agents. A regression here silently
+    /// reintroduces the "second instance's spinner is dark" bug.
+    #[test]
+    fn hook_scripts_fan_out_and_tag_instance() {
+        for (name, body) in [
+            ("claude", CLAUDE_HOOK_SCRIPT),
+            ("codex", CODEX_HOOK_SCRIPT),
+            ("gemini", GEMINI_HOOK_SCRIPT),
+        ] {
+            assert!(
+                body.contains("/tmp/goonware-agent-*.sock"),
+                "{name} hook script must fan out to all instance sockets"
+            );
+            assert!(
+                body.contains("GOONWARE_INSTANCE_ID"),
+                "{name} hook script must tag envelope with GOONWARE_INSTANCE_ID"
+            );
+            assert!(
+                body.contains("goonware_instance_id"),
+                "{name} hook script must include goonware_instance_id in the envelope"
+            );
+            // The old single-socket connect must be gone.
+            assert!(
+                !body.contains("/tmp/goonware-agent.sock"),
+                "{name} hook script must not reference the old shared socket path"
             );
         }
     }

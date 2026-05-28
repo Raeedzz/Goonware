@@ -914,7 +914,7 @@ function Toggle({
     borderRadius: "var(--radius-pill)",
     backgroundColor: checked ? "var(--accent)" : "var(--surface-3)",
     transition: "background-color var(--motion-fast) var(--ease-out-quart)",
-    cursor: "default",
+    cursor: "pointer",
     flexShrink: 0,
   };
   return (

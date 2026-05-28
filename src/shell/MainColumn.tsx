@@ -371,7 +371,7 @@ function TabButton({
         minWidth: 120,
         maxWidth: 240,
         padding: "0 var(--space-2) 0 10px",
-        cursor: "default",
+        cursor: "pointer",
         backgroundColor: active ? "var(--surface-2)" : "transparent",
         color: active ? "var(--text-primary)" : "var(--text-secondary)",
         borderTopLeftRadius: 6,
@@ -1291,7 +1291,7 @@ function DialogButton({
           ? "1px solid var(--accent)"
           : "1px solid var(--border-default)",
         borderRadius: "var(--radius-sm)",
-        cursor: "default",
+        cursor: "pointer",
         transition:
           "background-color var(--motion-instant) var(--ease-out-quart)," +
           "border-color var(--motion-instant) var(--ease-out-quart)",

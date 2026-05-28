@@ -19,6 +19,37 @@
   opacity: 1;
 }
 
+/* ------------------------------------------------------------------
+   Clickable affordance (single source of truth)
+   ------------------------------------------------------------------
+   Every interactive control shows the pointing-hand cursor so the UI
+   signals what can be clicked — without each component remembering to
+   set `cursor` inline. Browsers default <button> to the arrow cursor,
+   so this rule is what flips them. Disabled controls fall back to the
+   arrow. Components may still set a more specific cursor inline
+   (text inputs, resize handles, the terminal selection crosshair);
+   inline styles win over this baseline, which is intentional.
+
+   Note: inline `cursor` declarations OVERRIDE this rule. Prefer leaving
+   cursor unset on new clickable elements and letting this govern;
+   reach for an inline cursor only for the non-pointer cases above. */
+button:not(:disabled):not([aria-disabled="true"]),
+[role="button"]:not([aria-disabled="true"]),
+[role="tab"]:not([aria-disabled="true"]),
+[role="option"],
+a[href],
+summary,
+label[for],
+select:not(:disabled) {
+  cursor: pointer;
+}
+
+button:disabled,
+[role="button"][aria-disabled="true"],
+[aria-disabled="true"] {
+  cursor: default;
+}
+
 /* Hide scrollbar while preserving scroll behavior. Used on the tab
    strip so horizontal overflow scrolls silently without a visible
    track under the tabs. Overrides the global *::-webkit-scrollbar

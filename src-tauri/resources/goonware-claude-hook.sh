@@ -2,10 +2,13 @@
 # Goonware Hook — forwards Claude Code events to Goonware app via Unix socket.
 # Installed and managed by Goonware; safe to remove (Goonware re-installs on next launch).
 
-SOCKET_PATH="/tmp/goonware-agent.sock"
-
-# Exit silently if socket doesn't exist (Goonware not running).
-[ -S "$SOCKET_PATH" ] || exit 0
+# Exit silently if no Goonware instance is listening. Each running Goonware
+# binds its OWN /tmp/goonware-agent-<pid>.sock; the python block below fans
+# every event out to ALL of them, and each instance keeps only the events
+# tagged with its own GOONWARE_INSTANCE_ID. A single shared socket let the
+# instance that started last steal every agent's events — so the other
+# instance's worktree spinner went dark.
+ls /tmp/goonware-agent-*.sock >/dev/null 2>&1 || exit 0
 
 # Skip helper-agent invocations entirely. Goonware's helper_agent spawns
 # `claude --print` (and the equivalents for codex / gemini) for things
@@ -40,7 +43,7 @@ GOONWARE_SID="${GOONWARE_SESSION_ID:-${GLI_SESSION_ID:-$RLI_SESSION_ID}}"
 # `working` forever, and the worktree spinner keeps spinning even
 # though the agent is gone.
 /usr/bin/python3 -c "
-import json, os, socket, subprocess, sys
+import glob, json, os, socket, subprocess, sys
 
 try:
     payload = json.load(sys.stdin)
@@ -112,6 +115,7 @@ out = {
     'aux': payload.get('notification_type', ''),
     'prompt': payload.get('prompt', '') or '',
     'goonware_session_id': '$GOONWARE_SID',
+    'goonware_instance_id': os.environ.get('GOONWARE_INSTANCE_ID', ''),
 }
 
 pid = agent_pid()
@@ -121,12 +125,18 @@ if pid is not None:
     # 2-second liveness watchdog.
     out['agent_process_id'] = pid
 
-try:
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
-    sock.connect('$SOCKET_PATH')
-    sock.sendall(json.dumps(out).encode())
-    sock.close()
-except Exception:
-    pass
+# Fan the event out to EVERY running Goonware instance's socket. The Rust
+# side keeps only the envelope tagged with its own instance id, so peers
+# harmlessly ignore agents they didn't spawn. A stale socket file with no
+# listener fails connect() fast and is skipped.
+payload_bytes = json.dumps(out).encode()
+for sock_path in glob.glob('/tmp/goonware-agent-*.sock'):
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        sock.connect(sock_path)
+        sock.sendall(payload_bytes)
+        sock.close()
+    except Exception:
+        pass
 "

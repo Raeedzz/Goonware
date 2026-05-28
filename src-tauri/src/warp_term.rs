@@ -24,10 +24,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use warpui::color::ColorU;
 use warpui::elements::{
     Border, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
-    CrossAxisAlignment, Fill, Flex, MainAxisAlignment, MainAxisSize, ParentElement, Rect,
-    ScrollbarWidth, SelectableArea, SelectionHandle, Stack, Text,
+    CrossAxisAlignment, Fill, Flex, Highlight, MainAxisAlignment, MainAxisSize, ParentElement,
+    PartialClickableElement, Rect, ScrollbarWidth, SelectableArea, SelectionHandle, Stack, Text,
 };
 use warpui::fonts::{FamilyId, Properties, Style, Weight};
+use warpui::text_layout::TextStyle;
 use warpui::units::Pixels;
 use warpui::{AppContext, Element, Entity, SingletonEntity as _, TypedActionView, View, ViewContext};
 
@@ -47,6 +48,10 @@ const LINE_HEIGHT_RATIO: f32 = 1.3;
 /// only ever leave a little blank scroll-space ABOVE old content, never a gap
 /// below the newest line.
 const LINE_PX: f32 = FONT_SIZE * LINE_HEIGHT_RATIO;
+/// Monospace cell advance (px) on the native panes — SF Mono / Menlo / Monaco
+/// measure ~0.6 em. Used both for the horizontal-scroll overflow check and for
+/// mapping a mouse x back to a grid column in the link hit-test.
+const CELL_ADVANCE: f32 = FONT_SIZE * 0.6;
 /// Painted height of the gray meta line (cwd + duration). It renders at a
 /// 1px-smaller font than the body, so its line box is shorter than `LINE_PX`;
 /// `est_block_height` + `build_block` use this so block heights are exact.
@@ -68,6 +73,9 @@ const ERROR_FG: ColorU = ColorU { r: 0xff, g: 0x7b, b: 0x72, a: 255 };
 const FAIL_BG: ColorU = ColorU { r: 0x2a, g: 0x15, b: 0x17, a: 255 };
 /// Hairline divider drawn beneath each block (the transcript separator).
 const DIVIDER: ColorU = ColorU { r: 0x28, g: 0x28, b: 0x2d, a: 255 };
+/// Hyperlink color: a soft accent blue, used for both the link text and its
+/// underline so detected URLs read as clickable (Cmd+click opens them).
+const LINK_FG: ColorU = ColorU { r: 0x6c, g: 0xb6, b: 0xff, a: 255 };
 /// Block inner padding (px): horizontal gutter + vertical breathing room.
 const BLOCK_PAD_X: f32 = 14.0;
 const BLOCK_PAD_Y: f32 = 8.0;
@@ -285,6 +293,12 @@ struct Pane {
     /// not reported → fall back to the pane's full height.
     viewport_top: Mutex<f32>,
     viewport_h: Mutex<f32>,
+    /// Detected-hyperlink rectangles in SURFACE coordinates (x0, y0, x1, y1),
+    /// recomputed every render for the agent grid. `term_native_link_at` tests a
+    /// mouse point against these so React can flip the pane cursor to a pointing
+    /// hand while Cmd is held over a link (the embedded surface ignores OS mouse
+    /// events, so the cursor is owned by the DOM and must be driven from there).
+    link_rects: Mutex<Vec<(f32, f32, f32, f32)>>,
 }
 
 impl Pane {
@@ -300,6 +314,7 @@ impl Pane {
             rect: Mutex::new((0.0, 0.0, 0.0, 0.0)),
             viewport_top: Mutex::new(0.0),
             viewport_h: Mutex::new(0.0),
+            link_rects: Mutex::new(Vec::new()),
         }
     }
     fn pty_id(&self) -> String {
@@ -478,6 +493,35 @@ fn text_props(bold: bool, italic: bool) -> Properties {
 
 /// One styled run of a span's text (fg/bold/italic; bg via Container).
 fn styled_run(text: String, span: &Span, mono: FamilyId) -> Box<dyn Element> {
+    // Hyperlink run: accent color + underline + Cmd-click to open. The injected
+    // embedded mouse events (`term_native_mouse`) drive warpui's own hit-testing
+    // here, so a Cmd+left-click landing on this run fires the handler. We gate on
+    // `modifiers.cmd` so a plain click still flows to selection (Warp behavior).
+    if let Some(url) = &span.link {
+        let char_len = text.chars().count();
+        let url = url.to_string();
+        // Underline is applied as a full-run Highlight carrying a TextStyle —
+        // plain `Text` has no direct underline setter; the underline lives on
+        // TextStyle (mirrors warpui's own FormattedText hyperlink path).
+        let link_style = TextStyle::new()
+            .with_foreground_color(LINK_FG)
+            .with_underline_color(LINK_FG);
+        return Text::new(text, mono, FONT_SIZE)
+            .with_color(LINK_FG)
+            .with_style(text_props(span.bold, span.italic))
+            .with_line_height_ratio(LINE_HEIGHT_RATIO)
+            .soft_wrap(false)
+            .with_single_highlight(
+                Highlight::new().with_text_style(link_style),
+                (0..char_len).collect(),
+            )
+            .with_clickable_char_range(0..char_len, move |modifiers, _ctx, _app| {
+                if modifiers.cmd {
+                    open_url(&url);
+                }
+            })
+            .finish();
+    }
     let mut fg = fg_color(&span.fg);
     let mut bg = bg_color(&span.bg);
     if span.inverse {
@@ -524,9 +568,161 @@ fn cursor_cell(ch: &str, mono: FamilyId) -> Box<dyn Element> {
     .finish()
 }
 
+/// Open a detected URL in the user's default browser. macOS-only surface, so
+/// `open` is always available; only http(s) URLs reach here (see
+/// `find_url_ranges`), so handing the string to `open` is safe.
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("/usr/bin/open").arg(url).spawn();
+}
+
+/// Case-insensitive check that `chars[i..]` begins with `pat` (used for the URL
+/// scheme, which is matched case-insensitively).
+fn starts_with_at(chars: &[char], i: usize, pat: &str) -> bool {
+    let mut ci = i;
+    for pc in pat.chars() {
+        match chars.get(ci) {
+            Some(c) if c.eq_ignore_ascii_case(&pc) => ci += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Characters that never appear mid-URL in terminal output — used as hard URL
+/// terminators alongside whitespace.
+fn is_url_stop(c: char) -> bool {
+    c.is_control() || matches!(c, '"' | '\'' | '`' | '<' | '>' | '|')
+}
+
+/// Trailing punctuation that's almost always prose, not part of the URL
+/// (trimmed off the end of a detected run).
+fn is_trailing_punct(c: char) -> bool {
+    matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\'' | '>')
+}
+
+/// Find http(s) URL char-ranges (half-open) in a reconstructed row's chars.
+/// Dependency-free scan: locate a scheme, consume to a terminator, trim
+/// trailing prose punctuation, require at least one char past the scheme.
+fn find_url_ranges(chars: &[char]) -> Vec<(usize, usize)> {
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let scheme_len = if starts_with_at(chars, i, "https://") {
+            8
+        } else if starts_with_at(chars, i, "http://") {
+            7
+        } else {
+            i += 1;
+            continue;
+        };
+        let start = i;
+        let mut end = i;
+        while end < n && !chars[end].is_whitespace() && !is_url_stop(chars[end]) {
+            end += 1;
+        }
+        while end > start + 1 && is_trailing_punct(chars[end - 1]) {
+            end -= 1;
+        }
+        if end > start + scheme_len {
+            out.push((start, end));
+        }
+        i = end.max(start + 1);
+    }
+    out
+}
+
+/// Split a row's spans at URL boundaries, tagging each URL run with `link` and
+/// forcing `underline`. Detection runs over the full reconstructed row text so a
+/// URL crossing multiple style runs is still found; the affected spans are then
+/// re-split so each URL is its own contiguous run. Returns the spans unchanged
+/// (cloned) when no URL is present.
+fn split_links(spans: &[Span]) -> Vec<Span> {
+    let chars: Vec<char> = spans.iter().flat_map(|s| s.text.chars()).collect();
+    let ranges = find_url_ranges(&chars);
+    if ranges.is_empty() {
+        return spans.to_vec();
+    }
+    let url_strings: Vec<String> = ranges
+        .iter()
+        .map(|&(s, e)| chars[s..e].iter().collect())
+        .collect();
+    // Per absolute char index: which URL range (if any) owns it.
+    let mut owner: Vec<Option<usize>> = vec![None; chars.len()];
+    for (ri, &(s, e)) in ranges.iter().enumerate() {
+        for slot in owner.iter_mut().take(e).skip(s) {
+            *slot = Some(ri);
+        }
+    }
+    let mut result: Vec<Span> = Vec::with_capacity(spans.len() + ranges.len());
+    let mut abs = 0usize;
+    for s in spans {
+        let span_chars: Vec<char> = s.text.chars().collect();
+        let mut i = 0;
+        while i < span_chars.len() {
+            let cur = owner[abs + i];
+            let mut j = i + 1;
+            while j < span_chars.len() && owner[abs + j] == cur {
+                j += 1;
+            }
+            let mut ns = s.clone();
+            ns.text = span_chars[i..j].iter().collect();
+            if let Some(ri) = cur {
+                ns.link = Some(Cow::Owned(url_strings[ri].clone()));
+                ns.underline = true;
+            }
+            result.push(ns);
+            i = j;
+        }
+        abs += span_chars.len();
+    }
+    result
+}
+
+/// Detected-URL hit rectangles (surface coords) for a block of consecutive grid
+/// rows whose first row's top edge sits at `top_surface_y`, each `LINE_PX` tall,
+/// left-aligned at `left_surface_x` with `CELL_ADVANCE`-wide cells. Reuses the
+/// renderer's own URL scan so the hit zones line up exactly with the underlined
+/// glyphs. (1 char ≈ 1 column; wide glyphs are rare in agent output and only
+/// nudge the right edge of a hit zone by part of a cell.)
+fn link_rects_for_rows(
+    rows: &[RowSnapshot],
+    left_surface_x: f32,
+    top_surface_y: f32,
+) -> Vec<(f32, f32, f32, f32)> {
+    let mut out = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        let chars: Vec<char> = row.spans.iter().flat_map(|s| s.text.chars()).collect();
+        if !chars.iter().collect::<String>().contains("http") {
+            continue;
+        }
+        let y0 = top_surface_y + r as f32 * LINE_PX;
+        for (c0, c1) in find_url_ranges(&chars) {
+            out.push((
+                left_surface_x + c0 as f32 * CELL_ADVANCE,
+                y0,
+                left_surface_x + c1 as f32 * CELL_ADVANCE,
+                y0 + LINE_PX,
+            ));
+        }
+    }
+    out
+}
+
 /// Build one grid row: per-span runs, splitting the span under the cursor (and
-/// padding/appending a cursor cell at/after the row's end).
+/// padding/appending a cursor cell at/after the row's end). Spans are first
+/// split at URL boundaries so detected links render underlined + Cmd-clickable
+/// (see `split_links` / `styled_run`); the cheap `http` pre-check keeps the
+/// no-link common case allocation-free.
 fn build_row(spans: &[Span], cursor_col: Option<u16>, mono: FamilyId) -> Box<dyn Element> {
+    let split_storage;
+    let spans: &[Span] = if spans.iter().any(|s| s.text.contains("http")) {
+        split_storage = split_links(spans);
+        &split_storage
+    } else {
+        spans
+    };
+
     let mut runs: Vec<Box<dyn Element>> = Vec::new();
     let mut col: u16 = 0;
 
@@ -870,7 +1066,12 @@ fn pin_region(content: Box<dyn Element>, top: f32, height: f32) -> Box<dyn Eleme
 /// into `p.selection`.
 fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
     let agent_on = p.agent_mode.load(std::sync::atomic::Ordering::Relaxed);
-    let (_, pane_top, pane_w, pane_h) = p.rect();
+    let (pane_x, pane_top, pane_w, pane_h) = p.rect();
+    let combined_left = COMBINED.lock().map(|c| c.0).unwrap_or(0.0);
+    // This pane's left edge in surface coords — the origin the link hit-test
+    // maps a mouse column from. Cleared each render below; populated for the
+    // agent grid so `term_native_link_at` can answer Cmd-hover queries.
+    let pane_left_surface = (pane_x - combined_left).max(0.0);
     // Vertical offset of THIS pane inside the combined surface. The surface
     // covers the bounding box of all placed panes, and `render` lays them out
     // side-by-side as equal-height columns from the surface top. When two panes
@@ -887,6 +1088,10 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
     let cursor_row = g.cursor_row.max(0) as usize;
     let cursor_col = g.cursor_col;
     let n_blocks = g.blocks.len();
+    // Reset hyperlink hit-zones each render; the active branch repopulates them
+    // for the agent grid (shell mode leaves them empty — the Cmd-hover cursor is
+    // an agent affordance, and shell links still Cmd-click via warpui).
+    *p.link_rects.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
 
     if alt_mode {
         // Alt-screen: the app owns a fixed full grid, painted top-down, pushed
@@ -900,6 +1105,11 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             };
             row_els.push(build_row(&row.spans, cur, mono));
         }
+        // Hyperlink hit-zones for the Cmd-hover cursor. The alt grid is painted
+        // top-down from `surface_offset_y` (same origin used in `pin_region`
+        // below), so the rects line up with the underlined glyphs.
+        *p.link_rects.lock().unwrap_or_else(|e| e.into_inner()) =
+            link_rects_for_rows(&g.rows, pane_left_surface, surface_offset_y);
         let grid = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
             .with_main_axis_alignment(MainAxisAlignment::Start)
@@ -907,6 +1117,19 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             .with_spacing(0.0)
             .with_children(row_els)
             .finish();
+        // Make the alt-screen agent grid selectable, exactly like the shell
+        // transcript below. Without this an alt-screen agent (claude's TUI,
+        // vim, htop) painted a bare grid the user couldn't drag-select. The
+        // injected mouse events from `term_native_mouse` drive warpui's own
+        // hit-testing here, and the selection text is cached into
+        // `p.selection` so Cmd+C (`term_native_selection_text`) copies it.
+        let selectable = SelectableArea::new(
+            p.sel.clone(),
+            move |args, _ctx, _app| {
+                *p.selection.lock().unwrap_or_else(|e| e.into_inner()) = args.selection;
+            },
+            grid,
+        );
         // Bound the full grid to the pane's height at its surface offset.
         // `pin_region`'s ConstrainedBox gives this MainAxisSize::Max grid a FINITE
         // height; nesting it raw under the side pane's column instead left it in
@@ -915,9 +1138,9 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
         // (rect not reported yet — only the topmost pane, briefly) returns the raw
         // grid, which the Stack bounds.
         if pane_h > 1.0 {
-            pin_region(grid, surface_offset_y, pane_h)
+            pin_region(Box::new(selectable), surface_offset_y, pane_h)
         } else {
-            grid
+            Box::new(selectable)
         }
     } else {
         // Shell transcript AND inline agents (claude/codex): closed blocks
@@ -1031,6 +1254,20 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             let build_top = (win_top - overscan).max(0.0);
             let build_bot = win_top + content_vp + overscan;
 
+            // Hyperlink hit-zones for the inline agent's live grid (claude/codex
+            // rendering in the normal screen). The live grid is the tail of the
+            // content; its top in content space is `content_est - live_height`,
+            // shifted by the scroll window and the pane's chrome offset into
+            // surface coords — the same transform `pin_region` uses below.
+            if agent_on && live_on {
+                let live_top_content = (content_est - live_count as f32 * LINE_PX).max(0.0);
+                let vtop = *p.viewport_top.lock().unwrap_or_else(|e| e.into_inner());
+                let live_top_surface = vtop + surface_offset_y + (live_top_content - win_top);
+                let end = live_count.min(g.rows.len());
+                *p.link_rects.lock().unwrap_or_else(|e| e.into_inner()) =
+                    link_rects_for_rows(&g.rows[..end], pane_left_surface, live_top_surface);
+            }
+
             let mut col_children: Vec<Box<dyn Element>> = Vec::new();
             if fit_spacer > 0.5 {
                 col_children.push(spacer_box(fit_spacer));
@@ -1089,7 +1326,6 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             // under the horizontal scrollable's free (infinite) main-axis width
             // constraint and panic warpui's flex; the bound also fixes the scroll
             // range to (grid_px − pane_w).
-            const CELL_ADVANCE: f32 = FONT_SIZE * 0.6; // SF Mono advance (measured exact)
             let grid_px = g.n_cols as f32 * CELL_ADVANCE;
             let h_overflow = pane_w > 1.0 && grid_px > pane_w + 2.0;
             let scroll_child: Box<dyn Element> = if h_overflow {
@@ -1629,6 +1865,30 @@ pub fn term_native_selection_text(pane_key: String) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Tauri command: is a detected hyperlink under this window-content point?
+/// React polls this (rAF-throttled) while Cmd is held so it can flip the pane
+/// cursor to a pointing hand over a link — the embedded surface has
+/// `ignoresMouseEvents: YES`, so the macOS cursor is owned by the DOM and must
+/// be driven from JS. `(x, y)` are clientX/clientY; we subtract the combined
+/// surface origin to match the render-time rects (surface coords).
+#[tauri::command]
+pub fn term_native_link_at(pane_key: String, x: f64, y: f64) -> bool {
+    let p = pane(&pane_key);
+    let (ox, oy) = COMBINED
+        .lock()
+        .map(|c| (c.0 as f64, c.1 as f64))
+        .unwrap_or((0.0, 0.0));
+    let (sx, sy) = ((x - ox) as f32, (y - oy) as f32);
+    p.link_rects
+        .lock()
+        .map(|rects| {
+            rects
+                .iter()
+                .any(|&(x0, y0, x1, y1)| sx >= x0 && sx < x1 && sy >= y0 && sy < y1)
+        })
+        .unwrap_or(false)
+}
+
 /// Tauri command: report the transcript region height (CSS px) — the React
 /// scroll container that sits above the input bar + status strip. Pins the
 /// native shell transcript to this region so the newest block lands just above
@@ -1644,5 +1904,101 @@ pub fn term_native_set_viewport(pane_key: String, top: f64, height: f64) {
     }
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    fn span(text: &str) -> Span {
+        Span {
+            text: text.to_string(),
+            fg: "var(--text-primary)".into(),
+            bg: "var(--surface-0)".into(),
+            bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+            dim: false,
+            strikeout: false,
+            link: None,
+        }
+    }
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn finds_https_url() {
+        let text = "go to https://example.com/x now";
+        let r = find_url_ranges(&chars(text));
+        assert_eq!(r.len(), 1);
+        let (s, e) = r[0];
+        let got: String = text.chars().collect::<Vec<_>>()[s..e].iter().collect();
+        assert_eq!(got, "https://example.com/x");
+    }
+
+    #[test]
+    fn trims_trailing_prose_punctuation() {
+        // A trailing period / close-paren is prose, not part of the URL.
+        let text = "(see https://example.com).";
+        let r = find_url_ranges(&chars(text));
+        assert_eq!(r.len(), 1);
+        let (s, e) = r[0];
+        let got: String = text.chars().collect::<Vec<_>>()[s..e].iter().collect();
+        assert_eq!(got, "https://example.com");
+    }
+
+    #[test]
+    fn ignores_non_urls_and_bare_http_word() {
+        assert!(find_url_ranges(&chars("just some text, no links")).is_empty());
+        // "http" without "://" is not a URL.
+        assert!(find_url_ranges(&chars("the http protocol")).is_empty());
+    }
+
+    #[test]
+    fn split_links_isolates_url_run() {
+        let spans = vec![span("see "), span("https://a.com"), span(" ok")];
+        let out = split_links(&spans);
+        let linked: Vec<&Span> = out.iter().filter(|s| s.link.is_some()).collect();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].text, "https://a.com");
+        assert!(linked[0].underline, "link run must be underlined");
+        // Non-link text is preserved and unlinked.
+        let joined: String = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, "see https://a.com ok");
+    }
+
+    #[test]
+    fn split_links_handles_url_spanning_multiple_style_runs() {
+        // A URL whose characters are split across two color runs still collapses
+        // into one linked run.
+        let spans = vec![span("https://ex"), span("ample.com")];
+        let out = split_links(&spans);
+        let linked: Vec<&Span> = out.iter().filter(|s| s.link.is_some()).collect();
+        assert_eq!(linked.iter().map(|s| s.text.clone()).collect::<String>(), "https://example.com");
+        assert!(linked.iter().all(|s| s.link.as_deref() == Some("https://example.com")));
+    }
+
+    #[test]
+    fn link_rects_align_to_grid_cells() {
+        // One row, URL at columns [4, 4+len). Rect x spans those columns at the
+        // given origin; y is the row band.
+        let url = "https://a.com";
+        let row = RowSnapshot { spans: vec![span("cmd "), span(url)] };
+        let rects = link_rects_for_rows(std::slice::from_ref(&row), 100.0, 50.0);
+        assert_eq!(rects.len(), 1);
+        let (x0, y0, x1, y1) = rects[0];
+        assert!((x0 - (100.0 + 4.0 * CELL_ADVANCE)).abs() < 0.01, "x0={x0}");
+        assert!((x1 - (100.0 + (4 + url.chars().count()) as f32 * CELL_ADVANCE)).abs() < 0.01, "x1={x1}");
+        assert!((y0 - 50.0).abs() < 0.01);
+        assert!((y1 - (50.0 + LINE_PX)).abs() < 0.01);
+    }
+
+    #[test]
+    fn link_rects_empty_when_no_url() {
+        let row = RowSnapshot { spans: vec![span("no links here")] };
+        assert!(link_rects_for_rows(std::slice::from_ref(&row), 0.0, 0.0).is_empty());
     }
 }

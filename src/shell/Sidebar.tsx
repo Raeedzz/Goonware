@@ -592,7 +592,7 @@ function HistorySection({ records }: { records: ArchiveRecord[] }) {
           borderRadius: 0,
           border: "none",
           textAlign: "left",
-          cursor: "default",
+          cursor: "pointer",
           transition:
             "background-color var(--motion-instant) var(--ease-out-quart)",
         }}
@@ -962,7 +962,7 @@ const WorktreeRow = memo(function WorktreeRowImpl({
     fontSize: "var(--text-sm)",
     textAlign: "left",
     border: "none",
-    cursor: "default",
+    cursor: "pointer",
     transition:
       "background-color var(--motion-instant) var(--ease-out-quart)," +
       "color var(--motion-instant) var(--ease-out-quart)",
@@ -1680,7 +1680,7 @@ function SmallIconButton({
           borderRadius: "var(--radius-xs)",
           color: "var(--text-tertiary)",
           backgroundColor: "transparent",
-          cursor: "default",
+          cursor: "pointer",
           transition:
             "background-color var(--motion-instant) var(--ease-out-quart)," +
             "color var(--motion-instant) var(--ease-out-quart)",

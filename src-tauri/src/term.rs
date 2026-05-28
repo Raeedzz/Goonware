@@ -521,6 +521,14 @@ pub struct Span {
     pub inverse: bool,
     pub dim: bool,
     pub strikeout: bool,
+    /// When set, this span is a hyperlink target (a detected URL). The
+    /// native renderer paints it underlined and makes it Cmd-clickable.
+    /// `#[serde(default)]` keeps the wire contract backward-compatible —
+    /// older frontends just ignore the field. Populated at render time by
+    /// the native renderer's URL detection (see `warp_term::split_links`),
+    /// so the snapshot path leaves it `None`.
+    #[serde(default)]
+    pub link: Option<Cow<'static, str>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1541,6 +1549,7 @@ fn packed_cell_to_span(
         inverse: bs.style.inverse(),
         dim: bs.style.dim(),
         strikeout: bs.style.strikeout(),
+        link: None,
     }
 }
 
@@ -1788,6 +1797,7 @@ fn cell_to_span(cell: &Cell) -> Span {
         inverse: cell.flags.contains(Flags::INVERSE),
         dim: cell.flags.contains(Flags::DIM),
         strikeout: cell.flags.contains(Flags::STRIKEOUT),
+        link: None,
     }
 }
 
@@ -2266,6 +2276,12 @@ pub fn term_start(
         cmd.env("GLI_SESSION_ID", sid);
         cmd.env("RLI_SESSION_ID", sid);
     }
+    // Tag the PTY with THIS Goonware instance's id so the agent hook script can
+    // route its events back to the instance that spawned it. Without this, when
+    // two instances run (e.g. `tauri dev` + the installed app) the hook can't
+    // tell whose agent fired, and the per-instance socket fan-out can't filter
+    // — see `agent_hooks::should_drop_envelope`.
+    cmd.env("GOONWARE_INSTANCE_ID", crate::agent_hooks::instance_id());
 
     // Install shell integration so the BlockSegmenter sees the OSC
     // 133 markers + Warp-style DCS hooks. Behavior differs by shell:
@@ -3911,6 +3927,7 @@ mod tests {
                 inverse: false,
                 dim: false,
                 strikeout: false,
+                link: None,
             }],
         };
         let row_b = RowSnapshot {
@@ -3924,6 +3941,7 @@ mod tests {
                 inverse: false,
                 dim: false,
                 strikeout: false,
+                link: None,
             }],
         };
         let prev = vec![row_a.clone(), row_a.clone(), row_a.clone()];

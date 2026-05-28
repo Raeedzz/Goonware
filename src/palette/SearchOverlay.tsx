@@ -503,7 +503,7 @@ function ModePill({ mode, onCycle }: { mode: Mode; onCycle: () => void }) {
         backgroundColor: "var(--surface-3)",
         border: "var(--border-1)",
         borderRadius: "var(--radius-sm)",
-        cursor: "default",
+        cursor: "pointer",
       }}
     >
       {MODE_LABELS[mode]}
@@ -556,7 +556,7 @@ function ResultRow({
             ? "var(--space-1) var(--space-4)"
             : "var(--space-1-5) var(--space-4)",
         backgroundColor: active ? "var(--surface-3)" : "transparent",
-        cursor: "default",
+        cursor: "pointer",
       }}
     >
       <span
@@ -688,7 +688,7 @@ function SkillResultRow({
         gap: "var(--space-2)",
         padding: "var(--space-1-5) var(--space-4)",
         backgroundColor: active ? "var(--surface-3)" : "transparent",
-        cursor: "default",
+        cursor: "pointer",
       }}
     >
       <span

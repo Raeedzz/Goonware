@@ -267,7 +267,7 @@ function Row({
             : "var(--text-secondary)",
         backgroundColor: active ? "var(--surface-2)" : "transparent",
         textAlign: "left",
-        cursor: "default",
+        cursor: "pointer",
         transition:
           "background-color var(--motion-instant) var(--ease-out-quart)",
       }}
