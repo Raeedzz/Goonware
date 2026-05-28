@@ -106,8 +106,21 @@ function applyRecord(record: SessionRecord) {
     return;
   }
   const prev = sessions.get(key);
+  if (!prev) {
+    // First event for this session_id — a fresh agent process. Evict
+    // any prior sessions for the same (provider, cwd) so a Claude /
+    // Gemini that was hard-killed before its Stop / SessionEnd hook
+    // fired doesn't keep the worktree spinner spinning forever. The
+    // PID-watchdog would also eventually catch this, but acting on
+    // the new-session signal makes the spinner restart deterministic:
+    // by the time the AgentChrome reads the most-recent session, the
+    // stale "working" record is gone.
+    evictStaleForCwd(record.provider, record.cwd, record.session_id);
+    sessions.set(key, record);
+    notifyAll();
+    return;
+  }
   if (
-    prev &&
     prev.status === record.status &&
     prev.cwd === record.cwd &&
     prev.last_event === record.last_event &&
@@ -120,6 +133,32 @@ function applyRecord(record: SessionRecord) {
   }
   sessions.set(key, record);
   notifyAll();
+}
+
+/**
+ * Drop every session for `(provider, cwd)` whose session_id differs
+ * from `keepSessionId`. Used by applyRecord on the new-session edge
+ * and by `forceEvictForCwd` on the SIGKILL path. Returns true iff at
+ * least one session was removed (caller may decide whether to bundle
+ * the notify with its own — applyRecord does, forceEvictForCwd does
+ * its own notify).
+ */
+function evictStaleForCwd(
+  provider: Provider,
+  cwd: string,
+  keepSessionId: string,
+): boolean {
+  let removed = false;
+  for (const [k, rec] of sessions) {
+    if (rec.provider !== provider) continue;
+    if (rec.session_id === keepSessionId) continue;
+    if (!cwdMatchesWorktree(rec.cwd, cwd) && !cwdMatchesWorktree(cwd, rec.cwd)) {
+      continue;
+    }
+    sessions.delete(k);
+    removed = true;
+  }
+  return removed;
 }
 
 async function bootstrap() {
@@ -249,6 +288,34 @@ export function forceIdleForCwd(cwd: string): void {
       last_event: "ctrl_c_local",
       updated_at_ms: Date.now(),
     });
+    changed = true;
+  }
+  if (changed) notifyAll();
+}
+
+/**
+ * Definitive eviction: remove EVERY session whose cwd is at or below
+ * `cwd`, regardless of status. The double-Ctrl+C SIGKILL path in
+ * `BlockTerminal.onForceKill` calls this — the process group has been
+ * killed, so there is genuinely no agent to track and the SessionEnd
+ * hook will never arrive. Without this, the next time the user runs
+ * `claude` in the same pane the old record is still in the map; the
+ * sidebar spinner stays on (any working session counts) and the
+ * per-pane AgentChrome can briefly show the killed agent's last
+ * status before the new SessionStart record overrides it.
+ *
+ * This is intentionally more aggressive than `forceIdleForCwd`. That
+ * helper handles single-Ctrl+C (agent traps SIGINT, process is still
+ * alive, the next UserPromptSubmit will resume the same session); we
+ * only want to stop the spinner. SIGKILL is the irreversible signal
+ * — the session is gone.
+ */
+export function forceEvictForCwd(cwd: string): void {
+  if (!cwd) return;
+  let changed = false;
+  for (const [key, rec] of sessions) {
+    if (!cwdMatchesWorktree(rec.cwd, cwd)) continue;
+    sessions.delete(key);
     changed = true;
   }
   if (changed) notifyAll();
