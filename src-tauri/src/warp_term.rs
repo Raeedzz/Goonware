@@ -170,6 +170,20 @@ struct TermGrid {
     alt_screen: bool,
     /// Closed command blocks (history), oldest first.
     blocks: Vec<NativeBlock>,
+    /// Rows that have scrolled OFF the top of the visible grid during the CURRENT
+    /// in-progress command/agent block (oldest first). For a long-running inline
+    /// agent (claude/codex in the normal screen) the whole conversation lives
+    /// here until the block closes — without it only the last `n_rows` visible
+    /// lines survive and the conversation is "cut from the top" / unscrollable.
+    /// Fed by `RenderFrame::scrollback_appended`. Scoped to the live block via
+    /// `live_block_id`: cleared on a block boundary so it never double-renders
+    /// the content a closed block already carries (a finished command's output
+    /// is re-rendered from its transcript, not from here).
+    scrollback: Vec<RowSnapshot>,
+    /// `block_id` of the frame whose scrolled-off rows currently fill
+    /// `scrollback`. When the next frame reports a different id (a new prompt /
+    /// command, or the block closing to 0) the buffer is dropped.
+    live_block_id: u64,
     /// Scroll-back offset (px from the top of the transcript content), mirrored
     /// into the `ClippedScrollStateHandle` each render. Only meaningful while
     /// `stick_bottom` is false.
@@ -196,6 +210,8 @@ impl TermGrid {
             command_running: false,
             alt_screen: false,
             blocks: Vec::new(),
+            scrollback: Vec::new(),
+            live_block_id: 0,
             scroll_px: 0.0,
             stick_bottom: true,
             frames: 0,
@@ -230,6 +246,30 @@ impl TermGrid {
         self.cursor_visible = f.cursor_visible;
         self.command_running = f.command_running;
         self.alt_screen = f.alt_screen;
+
+        // Mirror the rows that scrolled off the visible grid into PTY scrollback
+        // so the in-progress command/agent's full output stays scrollable (not
+        // just the last screenful). Scope the buffer to the current block:
+        //   - `scrollback_reset` (term_start re-emit / history reflow-evict) →
+        //      drop and re-sync from the appended snapshot,
+        //   - a new `block_id` (new prompt/command, or the block closing to 0) →
+        //      drop, since a closed command's output is rendered from its own
+        //      closed-block transcript and would otherwise appear twice.
+        // We only retain while a block is live (`block_id != 0`); idle-shell
+        // scroll deltas are dropped (closed blocks carry that history).
+        if f.scrollback_reset || f.block_id != self.live_block_id {
+            self.scrollback.clear();
+        }
+        self.live_block_id = f.block_id;
+        if f.block_id != 0 && !f.alt_screen {
+            self.scrollback.reserve(f.scrollback_appended.len());
+            for d in &f.scrollback_appended {
+                self.scrollback.push(RowSnapshot {
+                    spans: d.spans.clone(),
+                });
+            }
+        }
+
         self.frames = self.frames.wrapping_add(1);
     }
 
@@ -1181,7 +1221,12 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
         } else {
             0
         };
-        content_est += live_count as f32 * LINE_PX;
+        // The in-progress block's scrolled-off rows sit BETWEEN the last closed
+        // block and the live grid in the scroll flow (oldest first). Their height
+        // feeds the total so the scroll range covers the whole agent conversation.
+        let sb_count = g.scrollback.len();
+        let sb_height = sb_count as f32 * LINE_PX;
+        content_est += live_count as f32 * LINE_PX + sb_height;
         let build_live = |g: &TermGrid| -> Box<dyn Element> {
             let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(live_count);
             for (r, row) in g.rows.iter().take(live_count).enumerate() {
@@ -1205,6 +1250,9 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             let mut children: Vec<Box<dyn Element>> = Vec::with_capacity(heights.len() + 1);
             for block in &g.blocks[start..] {
                 children.push(build_block(block, mono, None));
+            }
+            for row in &g.scrollback {
+                children.push(build_row(&row.spans, None, mono));
             }
             if live_on {
                 children.push(build_live(&g));
@@ -1293,6 +1341,27 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             }
             if skipped > 0.5 {
                 col_children.push(spacer_box(skipped));
+            }
+            // In-progress command/agent scrolled-off rows (e.g. claude's whole
+            // conversation history) sit here, flush between the closed blocks and
+            // the live grid. Row-level virtualization, same as a tall block: build
+            // only the rows intersecting the window, coalesce the rest into top /
+            // bottom spacers. Uniform LINE_PX rows, so the index math is exact.
+            if sb_count > 0 {
+                let sb_top = y;
+                let first =
+                    (((build_top - sb_top) / LINE_PX).floor()).clamp(0.0, sb_count as f32) as usize;
+                let last =
+                    (((build_bot - sb_top) / LINE_PX).ceil()).clamp(0.0, sb_count as f32) as usize;
+                if first > 0 {
+                    col_children.push(spacer_box(first as f32 * LINE_PX));
+                }
+                for row in &g.scrollback[first..last] {
+                    col_children.push(build_row(&row.spans, None, mono));
+                }
+                if last < sb_count {
+                    col_children.push(spacer_box((sb_count - last) as f32 * LINE_PX));
+                }
             }
             if live_on {
                 col_children.push(build_live(&g));
