@@ -41,8 +41,8 @@ export interface BranchEntry {
 
 export const git = {
   status: (cwd: string) => invoke<StatusResult>("git_status", { cwd }),
-  diff: (cwd: string, path?: string, staged = false) =>
-    invoke<string>("git_diff", { cwd, path, staged }),
+  diff: (cwd: string, path?: string, staged = false, fullFile = false) =>
+    invoke<string>("git_diff", { cwd, path, staged, fullFile }),
   diffAll: (cwd: string) => invoke<string>("git_diff_all", { cwd }),
   diffStat: (cwd: string) => invoke<DiffStat>("git_diff_stat", { cwd }),
   stage: (cwd: string, paths: string[]) =>

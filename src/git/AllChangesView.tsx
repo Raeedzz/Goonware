@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { git } from "@/lib/git";
 import { DiffBody } from "./DiffView";
+import { DiffAskOverlay, reconstructDiffContext } from "./DiffAsk";
 import { parseUnifiedDiff, type DiffLine } from "./diff-parse";
 
 /**
@@ -23,6 +24,7 @@ export function AllChangesView({ projectPath }: { projectPath: string }) {
   const [raw, setRaw] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -137,6 +139,7 @@ export function AllChangesView({ projectPath }: { projectPath: string }) {
       </div>
 
       <div
+        ref={scrollRef}
         style={{
           flex: 1,
           minHeight: 0,
@@ -154,6 +157,28 @@ export function AllChangesView({ projectPath }: { projectPath: string }) {
           <FileSections sections={sections} />
         )}
       </div>
+      {!loading && !error && sections.length > 0 && (
+        <DiffAskOverlay
+          containerRef={scrollRef}
+          resolve={(range) => {
+            // Find which file block the selection landed in, then hand
+            // that file's reconstructed diff to the ask card as context.
+            let node: Node | null = range.commonAncestorContainer;
+            const el =
+              node instanceof HTMLElement ? node : node?.parentElement ?? null;
+            const fileEl = el?.closest<HTMLElement>("[data-diff-file]");
+            const path = fileEl?.dataset.diffFile;
+            const section = path
+              ? sections.find((s) => s.path === path)
+              : undefined;
+            if (!section) return null;
+            return {
+              path: section.path,
+              diff: reconstructDiffContext(section.lines),
+            };
+          }}
+        />
+      )}
     </motion.div>
   );
 }
@@ -183,6 +208,7 @@ function FileBlock({ section }: { section: FileSection }) {
     : "";
   return (
     <section
+      data-diff-file={section.path}
       style={{
         borderBottom: "var(--border-1)",
       }}

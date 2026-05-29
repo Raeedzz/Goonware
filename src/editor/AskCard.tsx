@@ -11,6 +11,14 @@ interface Props {
   pathHint?: string;
   anchor: { top: number; left: number };
   onClose: () => void;
+  /** System prompt override (defaults to the code-explainer prompt). */
+  systemPrompt?: string;
+  /** Trailing "Question: …" line. */
+  question?: string;
+  /** Heading shown above the context block in the prompt. */
+  contextHeading?: string;
+  /** Small uppercase label on the card (defaults to "explain"). */
+  label?: string;
 }
 
 const ASK_SYSTEM =
@@ -19,6 +27,9 @@ const ASK_SYSTEM =
   "If the code uses a non-obvious idiom or has a subtle gotcha, name it. " +
   "Skip the preamble and the recap. No markdown headers, no bullet lists unless genuinely necessary. " +
   "If you don't know, say so plainly.";
+
+const DEFAULT_QUESTION =
+  "explain what the selected code does, why it's there, and any subtle behavior worth knowing.";
 
 const CARD_WIDTH = 320;
 
@@ -37,6 +48,10 @@ export function AskCard({
   pathHint,
   anchor,
   onClose,
+  systemPrompt,
+  question,
+  contextHeading,
+  label = "explain",
 }: Props) {
   const [answer, setAnswer] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +73,12 @@ export function AskCard({
         const preface = extras
           ? `Custom instructions from this repo:\n${extras}\n\n`
           : "";
-        const prompt = `${ASK_SYSTEM}\n\n${preface}${buildPrompt(selection, context, pathHint)}`;
+        const prompt = `${systemPrompt ?? ASK_SYSTEM}\n\n${preface}${buildPrompt(
+          selection,
+          context,
+          pathHint,
+          { question, contextHeading },
+        )}`;
         const cwd = worktree?.path ?? "";
         const cli = worktree?.agentCli ?? settings.helperCliExplain;
         const model =
@@ -81,6 +101,9 @@ export function AskCard({
     selection,
     context,
     pathHint,
+    systemPrompt,
+    question,
+    contextHeading,
     worktree?.path,
     worktree?.agentCli,
     settings.helperCliExplain,
@@ -158,7 +181,7 @@ export function AskCard({
           marginBottom: "var(--space-2)",
         }}
       >
-        explain
+        {label}
       </div>
 
       {loading && <LoadingDots />}
@@ -206,7 +229,10 @@ function buildPrompt(
   selection: string,
   context: string,
   pathHint?: string,
+  opts?: { question?: string; contextHeading?: string },
 ): string {
   const header = pathHint ? `File: ${pathHint}\n\n` : "";
-  return `${header}Selected code (the user is asking about this):\n\`\`\`\n${selection}\n\`\`\`\n\nSurrounding context:\n\`\`\`\n${context}\n\`\`\`\n\nQuestion: explain what the selected code does, why it's there, and any subtle behavior worth knowing.`;
+  const heading = opts?.contextHeading ?? "Surrounding context";
+  const question = opts?.question ?? DEFAULT_QUESTION;
+  return `${header}Selected code (the user is asking about this):\n\`\`\`\n${selection}\n\`\`\`\n\n${heading}:\n\`\`\`\n${context}\n\`\`\`\n\nQuestion: ${question}`;
 }

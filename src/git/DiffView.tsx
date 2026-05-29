@@ -1,7 +1,8 @@
 import { motion } from "motion/react";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { git } from "@/lib/git";
 import { useDiffLineRenderers } from "./diff-highlight";
+import { DiffAskOverlay, reconstructDiffContext } from "./DiffAsk";
 import { parseUnifiedDiff, type DiffLine } from "./diff-parse";
 
 export { parseUnifiedDiff, type DiffLine };
@@ -27,13 +28,14 @@ export function DiffView({ projectPath, filePath, staged, onClose }: Props) {
   const [raw, setRaw] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
     git
-      .diff(projectPath, filePath, staged)
+      .diff(projectPath, filePath, staged, true)
       .then((d) => {
         if (cancelled) return;
         setRaw(d);
@@ -75,6 +77,35 @@ export function DiffView({ projectPath, filePath, staged, onClose }: Props) {
     }
     return { add, rem };
   }, [lines]);
+
+  // Overview-ruler marks: each changed line bucketed into a slot by its
+  // proportional position in the rendered body, so the strip beside the
+  // scrollbar shows green where code was added and red where removed —
+  // mapped onto the same rows the body renders (post header-filter).
+  const marks = useMemo(() => {
+    const rows = visibleDiffLines(lines);
+    const n = rows.length;
+    if (!n) return [];
+    const slots: Array<"add" | "remove" | "both" | undefined> = new Array(
+      RULER_SLOTS,
+    );
+    rows.forEach((l, i) => {
+      if (l.kind !== "add" && l.kind !== "remove") return;
+      const s = Math.min(RULER_SLOTS - 1, Math.floor((i / n) * RULER_SLOTS));
+      const cur = slots[s];
+      if (!cur) slots[s] = l.kind;
+      else if (cur !== l.kind) slots[s] = "both";
+    });
+    const out: Array<{ slot: number; kind: "add" | "remove" | "both" }> = [];
+    slots.forEach((v, idx) => {
+      if (v) out.push({ slot: idx, kind: v });
+    });
+    return out;
+  }, [lines]);
+
+  // Compact unified diff handed to the "ask" card as context. The whole
+  // file is one ask target here, so the selection's range is irrelevant.
+  const diffContext = useMemo(() => reconstructDiffContext(lines), [lines]);
 
   const filename = filePath.split("/").pop() || filePath;
   const dirname = filePath.includes("/")
@@ -209,27 +240,128 @@ export function DiffView({ projectPath, filePath, staged, onClose }: Props) {
 
       <div
         style={{
+          position: "relative",
           flex: 1,
           minHeight: 0,
-          overflow: "auto",
-          fontFamily: "var(--font-mono)",
-          fontSize: "var(--text-xs)",
-          fontVariantLigatures: "none",
-          backgroundColor: "var(--surface-0)",
+          display: "flex",
         }}
-        className="allow-select"
       >
-        {loading && <Empty label="loading diff…" />}
-        {!loading && error && <Empty label={`error: ${error}`} />}
-        {!loading && !error && lines.length === 0 && (
-          <Empty label="no changes" />
-        )}
+        <div
+          ref={scrollRef}
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflow: "auto",
+            fontFamily: "var(--font-mono)",
+            fontSize: "var(--text-xs)",
+            fontVariantLigatures: "none",
+            backgroundColor: "var(--surface-0)",
+          }}
+          className="allow-select"
+        >
+          {loading && <Empty label="loading diff…" />}
+          {!loading && error && <Empty label={`error: ${error}`} />}
+          {!loading && !error && lines.length === 0 && (
+            <Empty label="no changes" />
+          )}
+          {!loading && !error && lines.length > 0 && (
+            <DiffBody lines={lines} filePath={filePath} />
+          )}
+        </div>
+        {!loading && !error && marks.length > 0 && <ChangeRuler marks={marks} />}
         {!loading && !error && lines.length > 0 && (
-          <DiffBody lines={lines} filePath={filePath} />
+          <DiffAskOverlay
+            containerRef={scrollRef}
+            resolve={() => ({ path: filePath, diff: diffContext })}
+          />
         )}
       </div>
     </motion.div>
   );
+}
+
+/** Number of vertical buckets in the overview ruler. Caps the DOM-node
+ *  count regardless of file size; adjacent changed lines that fall in
+ *  the same bucket merge into one mark. */
+const RULER_SLOTS = 160;
+
+/**
+ * Editor-style overview ruler pinned to the right edge of the scroll
+ * viewport (over the scroll track, click-through so it never blocks the
+ * scrollbar). Green marks = added lines, red = removed, split = both in
+ * one bucket — a glance shows where in the file the changes cluster.
+ */
+function ChangeRuler({
+  marks,
+}: {
+  marks: Array<{ slot: number; kind: "add" | "remove" | "both" }>;
+}) {
+  return (
+    <div
+      aria-hidden
+      style={{
+        position: "absolute",
+        top: 0,
+        right: 0,
+        bottom: 0,
+        width: 10,
+        pointerEvents: "none",
+        zIndex: 2,
+      }}
+    >
+      {marks.map((m) => {
+        const top = (m.slot / RULER_SLOTS) * 100;
+        const height = 100 / RULER_SLOTS;
+        const background =
+          m.kind === "add"
+            ? "var(--diff-add-fg)"
+            : m.kind === "remove"
+              ? "var(--diff-remove-fg)"
+              : "linear-gradient(var(--diff-remove-fg) 50%, var(--diff-add-fg) 50%)";
+        return (
+          <div
+            key={m.slot}
+            style={{
+              position: "absolute",
+              top: `${top}%`,
+              right: 3,
+              width: 4,
+              height: `max(3px, ${height}%)`,
+              borderRadius: "var(--radius-pill)",
+              background,
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Header lines that just restate plumbing we already show elsewhere
+ * (the file path lives in the tab title / sticky file header). Dropping
+ * them keeps the body to actual code so it's clear what is what.
+ */
+function isNoiseHeader(text: string): boolean {
+  return (
+    text.startsWith("diff --git") ||
+    text.startsWith("index ") ||
+    text.startsWith("--- ") ||
+    text.startsWith("+++ ")
+  );
+}
+
+/** The lines we actually render — redundant plumbing headers dropped.
+ *  Shared so the overview ruler maps onto the same rows as the body. */
+export function visibleDiffLines(lines: DiffLine[]): DiffLine[] {
+  return lines.filter((l) => !(l.kind === "header" && isNoiseHeader(l.text)));
+}
+
+/** Trailing context git tacks after the second `@@` (usually the
+ *  enclosing function), shown as the only label on a hunk separator. */
+function hunkLabel(text: string): string {
+  const m = /@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(.*)$/.exec(text);
+  return m ? m[1].trim() : "";
 }
 
 export function DiffBody({
@@ -239,7 +371,10 @@ export function DiffBody({
   lines: DiffLine[];
   filePath?: string;
 }) {
-  const rendered = useDiffLineRenderers(lines, filePath);
+  // Drop redundant plumbing headers before highlighting so the renderer
+  // indices line up with what we actually render.
+  const visible = useMemo(() => visibleDiffLines(lines), [lines]);
+  const rendered = useDiffLineRenderers(visible, filePath);
   return (
     <table
       style={{
@@ -249,13 +384,13 @@ export function DiffBody({
       }}
     >
       <colgroup>
-        <col style={{ width: 48 }} />
-        <col style={{ width: 48 }} />
-        <col style={{ width: 14 }} />
+        {/* One line-number gutter, one sigil, then the code. */}
+        <col style={{ width: 52 }} />
+        <col style={{ width: 22 }} />
         <col />
       </colgroup>
       <tbody>
-        {lines.map((l, i) => (
+        {visible.map((l, i) => (
           <DiffRow key={i} line={l} body={rendered[i]} />
         ))}
       </tbody>
@@ -264,30 +399,80 @@ export function DiffBody({
 }
 
 function DiffRow({ line, body }: { line: DiffLine; body: ReactNode }) {
-  const bg =
-    line.kind === "add"
-      ? "var(--diff-add-bg)"
-      : line.kind === "remove"
-        ? "var(--diff-remove-bg)"
-        : line.kind === "hunk"
-          ? "var(--surface-2)"
-          : line.kind === "header"
-            ? "var(--surface-1)"
-            : "transparent";
-  const sigil =
-    line.kind === "add" ? "+" : line.kind === "remove" ? "−" : " ";
-  const sigilColor =
-    line.kind === "add"
-      ? "var(--diff-add-fg)"
-      : line.kind === "remove"
-        ? "var(--diff-remove-fg)"
-        : "var(--text-disabled)";
-  const textColor =
-    line.kind === "header"
-      ? "var(--text-tertiary)"
-      : line.kind === "hunk"
-        ? "var(--accent-bright)"
-        : "var(--text-primary)";
+  // Hunk markers become a single full-width separator rule — the visual
+  // "the diff skips here" cue, with the enclosing-scope label if git gave
+  // one. No raw `@@ -a,b +c,d @@` noise, no per-side numbers to decode.
+  if (line.kind === "hunk") {
+    const label = hunkLabel(line.text);
+    return (
+      <tr>
+        <td
+          colSpan={3}
+          style={{
+            padding: "var(--space-1) var(--space-3)",
+            borderTop: "var(--border-1)",
+            borderBottom: "var(--border-1)",
+            backgroundColor: "var(--surface-1)",
+            color: "var(--text-tertiary)",
+            fontSize: "var(--text-2xs)",
+            fontFamily: "var(--font-sans)",
+            userSelect: "none",
+            whiteSpace: "pre",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {label || "⋯"}
+        </td>
+      </tr>
+    );
+  }
+
+  // Informative headers that survived the noise filter (rename / mode /
+  // binary notes) render as a quiet italic note spanning the row.
+  if (line.kind === "header") {
+    return (
+      <tr>
+        <td
+          colSpan={3}
+          style={{
+            padding: "var(--space-1) var(--space-3)",
+            backgroundColor: "var(--surface-1)",
+            color: "var(--text-tertiary)",
+            fontSize: "var(--text-2xs)",
+            fontStyle: "italic",
+            fontFamily: "var(--font-sans)",
+            userSelect: "none",
+          }}
+        >
+          {line.text}
+        </td>
+      </tr>
+    );
+  }
+
+  const isAdd = line.kind === "add";
+  const isRemove = line.kind === "remove";
+  const bg = isAdd
+    ? "var(--diff-add-bg)"
+    : isRemove
+      ? "var(--diff-remove-bg)"
+      : "transparent";
+  const sigil = isAdd ? "+" : isRemove ? "−" : "";
+  const sigilColor = isAdd
+    ? "var(--diff-add-fg)"
+    : isRemove
+      ? "var(--diff-remove-fg)"
+      : "var(--text-disabled)";
+  // Single gutter: the line's position in the file it belongs to —
+  // removed lines carry their old number, everything else the new one.
+  const lineNo = isRemove ? line.oldLine : line.newLine;
+  // A colored left edge reinforces add/remove without a second column.
+  const edge = isAdd
+    ? "2px solid var(--diff-add-fg)"
+    : isRemove
+      ? "2px solid var(--diff-remove-fg)"
+      : "2px solid transparent";
 
   return (
     <tr style={{ backgroundColor: bg }}>
@@ -299,39 +484,28 @@ function DiffRow({ line, body }: { line: DiffLine; body: ReactNode }) {
           userSelect: "none",
           fontSize: "var(--text-2xs)",
           verticalAlign: "top",
+          borderLeft: edge,
         }}
         className="tabular"
       >
-        {line.oldLine ?? ""}
+        {lineNo ?? ""}
       </td>
       <td
         style={{
-          padding: "0 var(--space-2)",
-          textAlign: "right",
-          color: "var(--text-tertiary)",
-          userSelect: "none",
-          fontSize: "var(--text-2xs)",
-          verticalAlign: "top",
-        }}
-        className="tabular"
-      >
-        {line.newLine ?? ""}
-      </td>
-      <td
-        style={{
-          padding: "0 4px",
+          padding: "0 var(--space-1)",
           color: sigilColor,
           userSelect: "none",
           textAlign: "center",
           verticalAlign: "top",
+          fontWeight: "var(--weight-semibold)",
         }}
       >
         {sigil}
       </td>
       <td
         style={{
-          padding: "0 var(--space-2) 0 0",
-          color: textColor,
+          padding: "0 var(--space-2) 0 var(--space-1)",
+          color: "var(--text-primary)",
           whiteSpace: "pre-wrap",
           wordBreak: "break-word",
         }}

@@ -11,7 +11,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { joinShellPaths } from "@/lib/shellQuote";
 import { BlockList } from "./BlockList";
-import { AgentChrome, AGENT_CHROME_HEIGHT_PX } from "./AgentChrome";
 import { LiveBlock } from "./LiveBlock";
 import { PromptInput, type PromptInputHandle } from "./PromptInput";
 import { PtyPassthrough, type PtyPassthroughHandle } from "./PtyPassthrough";
@@ -1267,16 +1266,10 @@ export function BlockTerminal({
       // the terminal grid (38px + a 6px breathing strip = 44).
       const inputChrome = agentMode ? 44 : 80;
       const liveBlockChrome = 50;
-      // Warp-style status strip rendered above the agent canvas (see
-      // AgentChrome.tsx). Pinned via AGENT_CHROME_HEIGHT_PX — the
-      // chrome itself uses height + boxSizing:border-box with the
-      // same constant, so the PTY reserve here can never drift from
-      // the chrome's measured height. Drift was the root cause of
-      // "agent pane goes blank when Claude asks for permission":
-      // each status flip changed the chrome's content height by a
-      // few px, which fired CanvasGrid's inner ResizeObserver and
-      // reconfigured the WebGPU swapchain mid-frame.
-      const agentChromeHeight = agentMode ? AGENT_CHROME_HEIGHT_PX : 0;
+      // The agent status strip that used to sit above the canvas was
+      // removed, so there's no chrome height to reserve here anymore —
+      // the agent's PTY reclaims that space and fills the pane.
+      const agentChromeHeight = 0;
       // On a NATIVE agent pane the only real chrome is the AgentChrome strip:
       // the input bar is hidden and the live block is opacity:0, so reserving
       // their heights (inputChrome + liveBlockChrome) would shrink Claude's PTY
@@ -2220,13 +2213,9 @@ export function BlockTerminal({
         </div>
       )}
 
-      {/* Warp-style agent status strip. Visible whenever the pane is
-          in agent mode — covers both alt-screen TUIs (claude / codex /
-          gemini in their full-screen editor) AND the non-alt-screen
-          agent case (a print-mode invocation that still trips the
-          banner sniffer). The strip is driven by hook events, so it
-          stays accurate without polling the PTY. */}
-      {!exited && foregroundIsAgent && <AgentChrome cwd={liveCwd ?? cwd} />}
+      {/* The Warp-style agent status strip ("claude is idle ✓") was
+          removed — it restated what the agent's own TUI already shows
+          and just ate vertical space above the pane. */}
 
       {/* Alt-screen TUIs (vim, htop, claude-in-alt-screen) render on the
           native Metal surface. The previous React WebGPU CanvasGrid
