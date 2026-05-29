@@ -955,6 +955,28 @@ export function BlockTerminal({
   useEffect(() => {
     const el = agentMode ? containerRef.current : scrollContainerRef.current;
     if (!el || !nativeActive) return;
+
+    // Agent alt-screen (the claude/codex TUI): a left-drag SCROLLS the agent's
+    // pager instead of selecting. The surface is keyboard-driven and warpui
+    // selection just clamps to the visible grid there, so grab-to-scroll is the
+    // gesture that actually pays off — press and pull DOWN to drag older output
+    // into view, like a touch surface. Drag travel is translated into the same
+    // mouse-wheel encoding the wheel bridge emits (term_native_wheel), so claude
+    // scrolls identically whether you flick the trackpad or grab and pull. A
+    // press with no travel falls through as a click so cmd+click links still
+    // open. Shell mode (and the inline, non-alt-screen agent) keep left-drag =
+    // text selection, handled by the original path below.
+    const dragScrolls = altScreen;
+    const DRAG_THRESHOLD = 6; // px before a press commits to a scroll-drag
+    const DRAG_LINE_PX = 16; // px of drag travel per scrolled line (matches wheel)
+    const CELL_W = 13 * 0.6;
+    const CELL_H = 13 * 1.3;
+    let scrollMode = false;
+    let startX = 0;
+    let startY = 0;
+    let lastDragY = 0;
+    let dragAccumPx = 0;
+
     let dragging = false;
     // The latest pointer position during a drag, kept so the autoscroll loop
     // can re-dispatch a drag (extending the selection) when the pointer is held
@@ -1034,6 +1056,38 @@ export function BlockTerminal({
     };
     const onMove = (e: globalThis.MouseEvent) => {
       if (!dragging) return;
+      if (dragScrolls) {
+        if (!scrollMode) {
+          // Stay a (potential) click until the pointer clears the threshold,
+          // so a tap/cmd-click isn't swallowed by an over-eager scroll.
+          if (
+            Math.abs(e.clientY - startY) < DRAG_THRESHOLD &&
+            Math.abs(e.clientX - startX) < DRAG_THRESHOLD
+          )
+            return;
+          scrollMode = true;
+          lastDragY = startY;
+        }
+        e.preventDefault();
+        dragAccumPx += e.clientY - lastDragY;
+        lastDragY = e.clientY;
+        const want = Math.trunc(dragAccumPx / DRAG_LINE_PX);
+        if (want !== 0) {
+          dragAccumPx -= want * DRAG_LINE_PX;
+          const rect = el.getBoundingClientRect();
+          const col = Math.max(1, Math.floor((e.clientX - rect.left) / CELL_W) + 1);
+          const row = Math.max(1, Math.floor((e.clientY - rect.top) / CELL_H) + 1);
+          // Natural drag: pulling DOWN (want > 0) should reveal OLDER output —
+          // that's a wheel-UP — so negate to match the wheel bridge's sign.
+          invoke("term_native_wheel", {
+            id: ptyId,
+            deltaLines: -want,
+            col,
+            row,
+          }).catch(() => {});
+        }
+        return;
+      }
       lastX = e.clientX;
       lastY = e.clientY;
       lastMods = { shift: e.shiftKey, cmd: e.metaKey, alt: e.altKey, ctrl: e.ctrlKey };
@@ -1045,18 +1099,38 @@ export function BlockTerminal({
       dragging = false;
       if (autoRaf) cancelAnimationFrame(autoRaf);
       autoRaf = 0;
-      send("up", e);
       window.removeEventListener("mousemove", onMove, true);
       window.removeEventListener("mouseup", onUp, true);
+      if (dragScrolls) {
+        // No travel → it was a click, not a scroll. Replay down+up at the
+        // release point so plain clicks and cmd+click link-opens still reach
+        // warpui. A committed scroll-drag emits nothing (so it never selects).
+        if (!scrollMode) {
+          send("down", e);
+          send("up", e);
+        }
+        return;
+      }
+      send("up", e);
     };
     const onDown = (e: globalThis.MouseEvent) => {
       if (e.button !== 0) return;
       e.preventDefault();
       dragging = true;
-      lastX = e.clientX;
-      lastY = e.clientY;
+      startX = e.clientX;
+      startY = e.clientY;
       lastMods = { shift: e.shiftKey, cmd: e.metaKey, alt: e.altKey, ctrl: e.ctrlKey };
-      send("down", e);
+      if (dragScrolls) {
+        // Defer the decision: a press might be a click (cmd+click link) or the
+        // start of a scroll-drag. Don't open a selection on the down edge.
+        scrollMode = false;
+        dragAccumPx = 0;
+        lastDragY = e.clientY;
+      } else {
+        lastX = e.clientX;
+        lastY = e.clientY;
+        send("down", e);
+      }
       window.addEventListener("mousemove", onMove, true);
       window.addEventListener("mouseup", onUp, true);
     };
@@ -1067,7 +1141,7 @@ export function BlockTerminal({
       window.removeEventListener("mouseup", onUp, true);
       if (autoRaf) cancelAnimationFrame(autoRaf);
     };
-  }, [nativeActive, agentMode, altScreen, paneKey]);
+  }, [nativeActive, agentMode, altScreen, paneKey, ptyId]);
 
   // Cmd+C copies the native selection (kept by warpui's SelectableArea, exposed
   // via term_native_selection_text) through the existing pbcopy path. Capture-

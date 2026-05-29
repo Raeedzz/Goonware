@@ -166,6 +166,11 @@ export function DiffAskOverlay({
       }
     };
     window.addEventListener("keydown", onKey);
+    // clipboard-handler-audited: onKey above gates on
+    // (metaKey||ctrlKey) && key==="l" and bails when there's no
+    // selection, so it never touches the Cmd+C/V/X/A chords. The
+    // grep-based audit scans forward from this registration and can't
+    // see that gate (it lives above) — hence this opt-out sentinel.
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
