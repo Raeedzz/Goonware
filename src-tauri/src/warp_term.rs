@@ -1393,10 +1393,20 @@ impl View for TerminalRootView {
         let main_col = build_pane_column(main, self.mono);
         let side_on = side.active();
         let column: Box<dyn Element> = if side_on {
-            // Both panes visible (the right-panel split is open). The surface
+            // Both panes placed (the right-panel split is open). The surface
             // covers the combined bounding box; lay the panes side-by-side by
             // width (they share the AppShell row's top + height), with the gap
             // between them (the React divider) left black.
+            //
+            // NOTE: the MAIN pane keeps its rect even when it's showing a
+            // non-terminal tab (editor/diff) — see `term_native_detach` /
+            // `term_surface_set_rect`, which detach the pty + clear the grid but
+            // DON'T zero the rect. So `main.rect()` is the real main-column box
+            // here, the gap stays ~0 (not `side.x`), and the combined surface
+            // size is unchanged from the both-terminals layout. That's what keeps
+            // the side terminal in place: the surface never resizes on a main
+            // tab switch, it just paints the main column empty/black behind the
+            // opaque editor DOM. (A detached main renders an empty grid, hidden.)
             let (mx, my, mw, mh) = main.rect();
             let (sx, sy, sw, sh) = side.rect();
             let gap = (sx - (mx + mw)).max(0.0);
@@ -1657,7 +1667,22 @@ pub fn attach(app: &tauri::AppHandle) {
 #[tauri::command]
 pub fn term_surface_set_rect(pane_key: String, x: f64, y: f64, width: f64, height: f64) {
     let p = pane(&pane_key);
-    if let Ok(mut r) = p.rect.lock() {
+    let zero = width <= 1.0 || height <= 1.0;
+    // The MAIN pane keeps its last real rect across a zero report. Its
+    // `WarpSurfaceTracker` reports (0,0,0,0) whenever a non-terminal tab
+    // (editor/diff/markdown) is active — but the main column ALWAYS sits behind
+    // either a transparent terminal-hole or an OPAQUE non-terminal DOM panel, so
+    // the surface covering that box is never visible when no terminal is there.
+    // Keeping the rect means the combined surface DOESN'T resize on a main tab
+    // switch (the detached pane just paints empty/black behind the editor), which
+    // is what stops the right-panel side terminal from blanking / shrinking: the
+    // shared GPU surface is fragile to resize, and a zeroed main both collapsed
+    // the box AND broke the side's side-by-side gap math. The side pane is NOT
+    // retained — collapsing the right panel SHOULD shrink the surface.
+    let is_main = pane_key != "side";
+    if is_main && zero {
+        // Drop the stale report; keep the prior rect.
+    } else if let Ok(mut r) = p.rect.lock() {
         *r = (x as f32, y as f32, width as f32, height as f32);
     }
     reposition_surface();
@@ -1725,8 +1750,13 @@ pub fn term_native_attach(
     }
 }
 
-/// Tauri command: stop mirroring any pty (a non-terminal tab is active). The
-/// surface is also hidden via a zero rect by `WarpSurfaceTracker`.
+/// Tauri command: stop mirroring any pty (a non-terminal tab is active). Clears
+/// the pty + retained grid so the pane paints empty/black. For the MAIN pane the
+/// rect is deliberately KEPT (not zeroed) so the combined surface doesn't resize
+/// on a tab switch — see `term_surface_set_rect` for the full rationale. The
+/// empty main pane then paints black behind the opaque editor DOM, while the
+/// side terminal keeps its place. The side pane still zeroes (collapsing the
+/// right panel should shrink the surface).
 #[tauri::command]
 pub fn term_native_detach(pane_key: String) {
     let p = pane(&pane_key);
@@ -1737,8 +1767,10 @@ pub fn term_native_detach(pane_key: String) {
     if let Ok(mut g) = p.pty.lock() {
         g.clear();
     }
-    if let Ok(mut r) = p.rect.lock() {
-        *r = (0.0, 0.0, 0.0, 0.0);
+    if pane_key == "side" {
+        if let Ok(mut r) = p.rect.lock() {
+            *r = (0.0, 0.0, 0.0, 0.0);
+        }
     }
     if let Ok(mut g) = p.grid.lock() {
         *g = TermGrid::empty();
