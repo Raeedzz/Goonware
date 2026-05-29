@@ -26,14 +26,12 @@ import {
   IconSettings,
   IconEdit,
   IconPullRequest,
-} from "@/design/icons";
-import {
-  Image01Icon,
-  Link01Icon,
-  ViewOffIcon,
-  Delete01Icon,
-  FolderOffIcon,
-} from "hugeicons-react";
+  IconImage,
+  IconColor,
+  IconHide,
+  IconDelete,
+  IconFolderOff,
+} from "@/design/codicons";
 import {
   useActiveWorktree,
   useAppDispatch,
@@ -322,7 +320,7 @@ function ProjectGroup({
     {
       id: "create-from",
       label: "Create from…",
-      Glyph: Link01Icon,
+      Glyph: IconColor,
       shortcut: "⌘⇧N",
       onSelect: () => {
         // TODO: open a "create from branch" dialog. For now, behave
@@ -340,13 +338,13 @@ function ProjectGroup({
     {
       id: "change-icon",
       label: "Change icon",
-      Glyph: Image01Icon,
+      Glyph: IconImage,
       onSelect: () => setPickerOpen(true),
     },
     {
       id: "hide",
       label: "Hide repository",
-      Glyph: ViewOffIcon,
+      Glyph: IconHide,
       onSelect: () =>
         dispatch({
           type: "set-project-expanded",
@@ -357,7 +355,7 @@ function ProjectGroup({
     {
       id: "remove",
       label: "Remove repository",
-      Glyph: Delete01Icon,
+      Glyph: IconDelete,
       destructive: true,
       onSelect: () => {
         if (
@@ -1024,7 +1022,7 @@ const WorktreeRow = memo(function WorktreeRowImpl({
           }}
         >
           {worktree.missing ? (
-            <FolderOffIcon key="missing" size={16} />
+            <IconFolderOff key="missing" size={16} />
           ) : isRunning ? (
             <Loader key="running" size={16} />
           ) : iconEntry ? (
@@ -1112,19 +1110,19 @@ const WorktreeRow = memo(function WorktreeRowImpl({
           {
             id: "icon",
             label: "Change icon",
-            Glyph: Image01Icon,
+            Glyph: IconImage,
             onSelect: () => setPickerOpen(true),
           },
           {
             id: "color",
             label: "Change color",
-            Glyph: Link01Icon,
+            Glyph: IconColor,
             onSelect: () => setPickerOpen(true),
           },
           {
             id: "archive",
             label: "Archive worktree",
-            Glyph: Delete01Icon,
+            Glyph: IconDelete,
             destructive: true,
             onSelect: () => {
               const e = {

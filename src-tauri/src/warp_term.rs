@@ -170,6 +170,20 @@ struct TermGrid {
     alt_screen: bool,
     /// Closed command blocks (history), oldest first.
     blocks: Vec<NativeBlock>,
+    /// Rows that have scrolled OFF the top of the visible grid during the CURRENT
+    /// in-progress command/agent block (oldest first). For a long-running inline
+    /// agent (claude/codex in the normal screen) the whole conversation lives
+    /// here until the block closes — without it only the last `n_rows` visible
+    /// lines survive and the conversation is "cut from the top" / unscrollable.
+    /// Fed by `RenderFrame::scrollback_appended`. Scoped to the live block via
+    /// `live_block_id`: cleared on a block boundary so it never double-renders
+    /// the content a closed block already carries (a finished command's output
+    /// is re-rendered from its transcript, not from here).
+    scrollback: Vec<RowSnapshot>,
+    /// `block_id` of the frame whose scrolled-off rows currently fill
+    /// `scrollback`. When the next frame reports a different id (a new prompt /
+    /// command, or the block closing to 0) the buffer is dropped.
+    live_block_id: u64,
     /// Scroll-back offset (px from the top of the transcript content), mirrored
     /// into the `ClippedScrollStateHandle` each render. Only meaningful while
     /// `stick_bottom` is false.
@@ -196,6 +210,8 @@ impl TermGrid {
             command_running: false,
             alt_screen: false,
             blocks: Vec::new(),
+            scrollback: Vec::new(),
+            live_block_id: 0,
             scroll_px: 0.0,
             stick_bottom: true,
             frames: 0,
@@ -230,6 +246,30 @@ impl TermGrid {
         self.cursor_visible = f.cursor_visible;
         self.command_running = f.command_running;
         self.alt_screen = f.alt_screen;
+
+        // Mirror the rows that scrolled off the visible grid into PTY scrollback
+        // so the in-progress command/agent's full output stays scrollable (not
+        // just the last screenful). Scope the buffer to the current block:
+        //   - `scrollback_reset` (term_start re-emit / history reflow-evict) →
+        //      drop and re-sync from the appended snapshot,
+        //   - a new `block_id` (new prompt/command, or the block closing to 0) →
+        //      drop, since a closed command's output is rendered from its own
+        //      closed-block transcript and would otherwise appear twice.
+        // We only retain while a block is live (`block_id != 0`); idle-shell
+        // scroll deltas are dropped (closed blocks carry that history).
+        if f.scrollback_reset || f.block_id != self.live_block_id {
+            self.scrollback.clear();
+        }
+        self.live_block_id = f.block_id;
+        if f.block_id != 0 && !f.alt_screen {
+            self.scrollback.reserve(f.scrollback_appended.len());
+            for d in &f.scrollback_appended {
+                self.scrollback.push(RowSnapshot {
+                    spans: d.spans.clone(),
+                });
+            }
+        }
+
         self.frames = self.frames.wrapping_add(1);
     }
 
@@ -1181,7 +1221,12 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
         } else {
             0
         };
-        content_est += live_count as f32 * LINE_PX;
+        // The in-progress block's scrolled-off rows sit BETWEEN the last closed
+        // block and the live grid in the scroll flow (oldest first). Their height
+        // feeds the total so the scroll range covers the whole agent conversation.
+        let sb_count = g.scrollback.len();
+        let sb_height = sb_count as f32 * LINE_PX;
+        content_est += live_count as f32 * LINE_PX + sb_height;
         let build_live = |g: &TermGrid| -> Box<dyn Element> {
             let mut row_els: Vec<Box<dyn Element>> = Vec::with_capacity(live_count);
             for (r, row) in g.rows.iter().take(live_count).enumerate() {
@@ -1205,6 +1250,9 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             let mut children: Vec<Box<dyn Element>> = Vec::with_capacity(heights.len() + 1);
             for block in &g.blocks[start..] {
                 children.push(build_block(block, mono, None));
+            }
+            for row in &g.scrollback {
+                children.push(build_row(&row.spans, None, mono));
             }
             if live_on {
                 children.push(build_live(&g));
@@ -1293,6 +1341,27 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             }
             if skipped > 0.5 {
                 col_children.push(spacer_box(skipped));
+            }
+            // In-progress command/agent scrolled-off rows (e.g. claude's whole
+            // conversation history) sit here, flush between the closed blocks and
+            // the live grid. Row-level virtualization, same as a tall block: build
+            // only the rows intersecting the window, coalesce the rest into top /
+            // bottom spacers. Uniform LINE_PX rows, so the index math is exact.
+            if sb_count > 0 {
+                let sb_top = y;
+                let first =
+                    (((build_top - sb_top) / LINE_PX).floor()).clamp(0.0, sb_count as f32) as usize;
+                let last =
+                    (((build_bot - sb_top) / LINE_PX).ceil()).clamp(0.0, sb_count as f32) as usize;
+                if first > 0 {
+                    col_children.push(spacer_box(first as f32 * LINE_PX));
+                }
+                for row in &g.scrollback[first..last] {
+                    col_children.push(build_row(&row.spans, None, mono));
+                }
+                if last < sb_count {
+                    col_children.push(spacer_box((sb_count - last) as f32 * LINE_PX));
+                }
             }
             if live_on {
                 col_children.push(build_live(&g));
@@ -1393,10 +1462,20 @@ impl View for TerminalRootView {
         let main_col = build_pane_column(main, self.mono);
         let side_on = side.active();
         let column: Box<dyn Element> = if side_on {
-            // Both panes visible (the right-panel split is open). The surface
+            // Both panes placed (the right-panel split is open). The surface
             // covers the combined bounding box; lay the panes side-by-side by
             // width (they share the AppShell row's top + height), with the gap
             // between them (the React divider) left black.
+            //
+            // NOTE: the MAIN pane keeps its rect even when it's showing a
+            // non-terminal tab (editor/diff) — see `term_native_detach` /
+            // `term_surface_set_rect`, which detach the pty + clear the grid but
+            // DON'T zero the rect. So `main.rect()` is the real main-column box
+            // here, the gap stays ~0 (not `side.x`), and the combined surface
+            // size is unchanged from the both-terminals layout. That's what keeps
+            // the side terminal in place: the surface never resizes on a main
+            // tab switch, it just paints the main column empty/black behind the
+            // opaque editor DOM. (A detached main renders an empty grid, hidden.)
             let (mx, my, mw, mh) = main.rect();
             let (sx, sy, sw, sh) = side.rect();
             let gap = (sx - (mx + mw)).max(0.0);
@@ -1657,7 +1736,22 @@ pub fn attach(app: &tauri::AppHandle) {
 #[tauri::command]
 pub fn term_surface_set_rect(pane_key: String, x: f64, y: f64, width: f64, height: f64) {
     let p = pane(&pane_key);
-    if let Ok(mut r) = p.rect.lock() {
+    let zero = width <= 1.0 || height <= 1.0;
+    // The MAIN pane keeps its last real rect across a zero report. Its
+    // `WarpSurfaceTracker` reports (0,0,0,0) whenever a non-terminal tab
+    // (editor/diff/markdown) is active — but the main column ALWAYS sits behind
+    // either a transparent terminal-hole or an OPAQUE non-terminal DOM panel, so
+    // the surface covering that box is never visible when no terminal is there.
+    // Keeping the rect means the combined surface DOESN'T resize on a main tab
+    // switch (the detached pane just paints empty/black behind the editor), which
+    // is what stops the right-panel side terminal from blanking / shrinking: the
+    // shared GPU surface is fragile to resize, and a zeroed main both collapsed
+    // the box AND broke the side's side-by-side gap math. The side pane is NOT
+    // retained — collapsing the right panel SHOULD shrink the surface.
+    let is_main = pane_key != "side";
+    if is_main && zero {
+        // Drop the stale report; keep the prior rect.
+    } else if let Ok(mut r) = p.rect.lock() {
         *r = (x as f32, y as f32, width as f32, height as f32);
     }
     reposition_surface();
@@ -1725,8 +1819,13 @@ pub fn term_native_attach(
     }
 }
 
-/// Tauri command: stop mirroring any pty (a non-terminal tab is active). The
-/// surface is also hidden via a zero rect by `WarpSurfaceTracker`.
+/// Tauri command: stop mirroring any pty (a non-terminal tab is active). Clears
+/// the pty + retained grid so the pane paints empty/black. For the MAIN pane the
+/// rect is deliberately KEPT (not zeroed) so the combined surface doesn't resize
+/// on a tab switch — see `term_surface_set_rect` for the full rationale. The
+/// empty main pane then paints black behind the opaque editor DOM, while the
+/// side terminal keeps its place. The side pane still zeroes (collapsing the
+/// right panel should shrink the surface).
 #[tauri::command]
 pub fn term_native_detach(pane_key: String) {
     let p = pane(&pane_key);
@@ -1737,8 +1836,10 @@ pub fn term_native_detach(pane_key: String) {
     if let Ok(mut g) = p.pty.lock() {
         g.clear();
     }
-    if let Ok(mut r) = p.rect.lock() {
-        *r = (0.0, 0.0, 0.0, 0.0);
+    if pane_key == "side" {
+        if let Ok(mut r) = p.rect.lock() {
+            *r = (0.0, 0.0, 0.0, 0.0);
+        }
     }
     if let Ok(mut g) = p.grid.lock() {
         *g = TermGrid::empty();

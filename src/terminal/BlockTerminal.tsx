@@ -11,7 +11,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { joinShellPaths } from "@/lib/shellQuote";
 import { BlockList } from "./BlockList";
-import { AgentChrome, AGENT_CHROME_HEIGHT_PX } from "./AgentChrome";
 import { LiveBlock } from "./LiveBlock";
 import { PromptInput, type PromptInputHandle } from "./PromptInput";
 import { PtyPassthrough, type PtyPassthroughHandle } from "./PtyPassthrough";
@@ -816,14 +815,14 @@ export function BlockTerminal({
   // user scrolls back down or the content fits.
   useEffect(() => {
     const el = scrollContainerRef.current;
-    // Active for the SHELL transcript only. While an agent is foregrounded the
-    // wheel must drive the agent's OWN scroll (its conversation), not the
-    // Goonware transcript behind it — claude/codex render a fixed grid whose
-    // history lives inside the agent, not in our closed-block stream. So bail
-    // in agent mode and let the agent-wheel bridge below forward the wheel to
-    // the PTY instead. Alt-screen (vim/htop) renders no scroll container, so
-    // `el` is null there and this no-ops automatically.
-    if (!el || !nativeActive || agentMode) return;
+    // Active for the native transcript: the shell history AND inline agents
+    // (claude/codex in the NORMAL screen). An inline agent's conversation
+    // scrolls off into PTY scroll-back, which the native renderer mirrors into
+    // the transcript flow — so the wheel drives `term_native_scroll` to move
+    // through it, exactly like scrolling up in a real terminal. Only ALT-SCREEN
+    // apps (vim/htop, or an agent that took the alt screen) own their own
+    // scroll; those are handled by the agent-wheel bridge below, so bail here.
+    if (!el || !nativeActive || altScreen) return;
     // Coalesce to ONE batched scroll per animation frame. Each invoke pokes a
     // full native re-render of the transcript; one per wheel event (60–120/sec
     // on a trackpad) floods the main thread and the scroll-back stutters.
@@ -871,23 +870,22 @@ export function BlockTerminal({
       el.removeEventListener("wheel", onWheel);
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [nativeActive, agentMode, paneKey]);
+  }, [nativeActive, altScreen, paneKey]);
 
-  // Agent wheel → forward to the PTY so the agent (claude / codex, OR an
-  // alt-screen app like vim/htop) scrolls ITS OWN view — exactly like a real
-  // terminal. Fires for the WHOLE agent mode, not just alt-screen: an inline
-  // agent's conversation also lives inside its repainting grid (not in our
-  // closed-block stream), so the only way to scroll back through it is to feed
-  // the wheel to the PTY. term_native_wheel encodes SGR/X10 mouse-wheel bytes
-  // for mouse-aware apps (claude sets SGR mode) and no-ops for the rest. This
-  // is why "I can't scroll while claude is running" — the transcript
-  // scroll-back bridge above used to swallow the wheel into the Goonware
-  // transcript. Pixel→notch conversion + the cell coords under the cursor
-  // (SF Mono 0.6em × 1.3 line) are sent so mouse-aware apps scroll the right
-  // region.
+  // Alt-screen wheel → forward to the PTY so a full-screen app (vim/htop, or an
+  // agent that took the ALT screen) scrolls ITS OWN view — exactly like a real
+  // terminal. ONLY alt-screen: an INLINE agent (claude/codex in the normal
+  // screen) has no internal scroll-back — its conversation scrolls into the PTY
+  // history, which the native renderer now mirrors into the transcript flow, so
+  // the shell-transcript bridge above drives `term_native_scroll` for it. Routing
+  // the inline-agent wheel to the PTY was the "can't scroll while claude runs"
+  // bug: the agent ignores it and nothing moves. term_native_wheel encodes
+  // SGR/X10 mouse-wheel bytes for mouse-aware apps and no-ops for the rest;
+  // pixel→notch conversion + the cell coords under the cursor (SF Mono 0.6em ×
+  // 1.3 line) are sent so apps scroll the right region.
   useEffect(() => {
     const el = containerRef.current;
-    if (!el || !nativeActive || !agentMode) return;
+    if (!el || !nativeActive || !altScreen) return;
     const CELL_W = 13 * 0.6;
     const CELL_H = 13 * 1.3;
     const LINE_PX = 16; // px of wheel travel per scroll line/notch
@@ -936,7 +934,7 @@ export function BlockTerminal({
       el.removeEventListener("wheel", onWheel);
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [nativeActive, agentMode, ptyId]);
+  }, [nativeActive, altScreen, ptyId]);
 
   // Selection mouse bridge. Same situation as the wheel bridge: the native
   // surface renders through a transparent hole and ignores mouse events, so
@@ -1024,11 +1022,12 @@ export function BlockTerminal({
     };
     const maybeAutoscroll = () => {
       if (autoRaf) return; // already looping
-      // Edge autoscroll drives the Goonware transcript (term_native_scroll).
-      // In agent mode the wheel/scroll belongs to the agent and there's no
-      // transcript behind the fixed agent grid to reveal, so skip it — the
-      // selection just clamps to the visible grid, like a real terminal.
-      if (agentMode) return;
+      // Edge autoscroll drives the native transcript (term_native_scroll), which
+      // now carries the inline agent's scroll-back too — so a drag-select can
+      // reveal older conversation while dragging past the top, same as the shell.
+      // Only alt-screen apps own their own scroll with no transcript to reveal,
+      // so skip there — the selection just clamps to the visible grid.
+      if (altScreen) return;
       const r = el.getBoundingClientRect();
       if (lastY < r.top + EDGE || lastY > r.bottom - EDGE)
         autoRaf = requestAnimationFrame(tick);
@@ -1068,7 +1067,7 @@ export function BlockTerminal({
       window.removeEventListener("mouseup", onUp, true);
       if (autoRaf) cancelAnimationFrame(autoRaf);
     };
-  }, [nativeActive, agentMode, paneKey]);
+  }, [nativeActive, agentMode, altScreen, paneKey]);
 
   // Cmd+C copies the native selection (kept by warpui's SelectableArea, exposed
   // via term_native_selection_text) through the existing pbcopy path. Capture-
@@ -1267,16 +1266,10 @@ export function BlockTerminal({
       // the terminal grid (38px + a 6px breathing strip = 44).
       const inputChrome = agentMode ? 44 : 80;
       const liveBlockChrome = 50;
-      // Warp-style status strip rendered above the agent canvas (see
-      // AgentChrome.tsx). Pinned via AGENT_CHROME_HEIGHT_PX — the
-      // chrome itself uses height + boxSizing:border-box with the
-      // same constant, so the PTY reserve here can never drift from
-      // the chrome's measured height. Drift was the root cause of
-      // "agent pane goes blank when Claude asks for permission":
-      // each status flip changed the chrome's content height by a
-      // few px, which fired CanvasGrid's inner ResizeObserver and
-      // reconfigured the WebGPU swapchain mid-frame.
-      const agentChromeHeight = agentMode ? AGENT_CHROME_HEIGHT_PX : 0;
+      // The agent status strip that used to sit above the canvas was
+      // removed, so there's no chrome height to reserve here anymore —
+      // the agent's PTY reclaims that space and fills the pane.
+      const agentChromeHeight = 0;
       // On a NATIVE agent pane the only real chrome is the AgentChrome strip:
       // the input bar is hidden and the live block is opacity:0, so reserving
       // their heights (inputChrome + liveBlockChrome) would shrink Claude's PTY
@@ -2220,13 +2213,9 @@ export function BlockTerminal({
         </div>
       )}
 
-      {/* Warp-style agent status strip. Visible whenever the pane is
-          in agent mode — covers both alt-screen TUIs (claude / codex /
-          gemini in their full-screen editor) AND the non-alt-screen
-          agent case (a print-mode invocation that still trips the
-          banner sniffer). The strip is driven by hook events, so it
-          stays accurate without polling the PTY. */}
-      {!exited && foregroundIsAgent && <AgentChrome cwd={liveCwd ?? cwd} />}
+      {/* The Warp-style agent status strip ("claude is idle ✓") was
+          removed — it restated what the agent's own TUI already shows
+          and just ate vertical space above the pane. */}
 
       {/* Alt-screen TUIs (vim, htop, claude-in-alt-screen) render on the
           native Metal surface. The previous React WebGPU CanvasGrid

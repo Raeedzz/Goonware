@@ -189,12 +189,20 @@ pub async fn git_diff(
     cwd: String,
     path: Option<String>,
     staged: bool,
+    // When true, expand context so the *whole file* surrounds the
+    // changes — the single-file viewer wants every line on screen with
+    // the edits tinted in place, not just the default 3-line hunks. A
+    // very large `--unified` value collapses the file into one hunk.
+    full_file: Option<bool>,
 ) -> Result<String, String> {
     let mut args: Vec<&str> = vec!["diff"];
     if staged {
         args.push("--staged");
     }
     args.push("--no-color");
+    if full_file.unwrap_or(false) {
+        args.push("--unified=100000");
+    }
     if let Some(p) = path.as_deref() {
         args.push("--");
         args.push(p);

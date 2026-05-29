@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { ErrorBoundary } from "./shell/ErrorBoundary";
+import "@vscode/codicons/dist/codicon.css";
 import "./styles.css";
 
 const rootEl = document.getElementById("root");
