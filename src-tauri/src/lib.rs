@@ -284,6 +284,8 @@ pub fn run() {
             warp_term::term_native_selection_text,
             #[cfg(target_os = "macos")]
             warp_term::term_native_set_viewport,
+            #[cfg(target_os = "macos")]
+            warp_term::term_native_link_at,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Goonware");

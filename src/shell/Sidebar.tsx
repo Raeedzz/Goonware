@@ -38,6 +38,7 @@ import {
   useActiveWorktree,
   useAppDispatch,
   useAppState,
+  useProjectWorktrees,
 } from "@/state/AppState";
 import {
   applyBranchPrefix,
@@ -165,10 +166,30 @@ export function Sidebar() {
 
 function SidebarHeader() {
   const dispatch = useAppDispatch();
+  const projectId = useAppState().activeProjectId;
+  const activeWorktreeByProject = useAppState().activeWorktreeByProject;
+  const worktrees = useProjectWorktrees(projectId);
+
+  // Cycle the active worktree within the current project. The list order
+  // matches the sidebar's vertical order, so +1 moves "one down" and -1
+  // moves "one up"; wrap around so the arrows never become dead at the ends.
+  const stepWorktree = (delta: number) => {
+    if (!projectId || worktrees.length < 2) return;
+    const activeId = activeWorktreeByProject[projectId] ?? null;
+    const cur = worktrees.findIndex((w) => w.id === activeId);
+    const base = cur < 0 ? 0 : cur;
+    const next = worktrees[(base + delta + worktrees.length) % worktrees.length];
+    if (next) {
+      dispatch({ type: "set-active-worktree", projectId, worktreeId: next.id });
+    }
+  };
+
+  const canCycle = worktrees.length > 1;
+
   return (
     <div
       style={{
-        height: 32,
+        height: "var(--tab-height)",
         flexShrink: 0,
         display: "flex",
         alignItems: "center",
@@ -185,10 +206,18 @@ function SidebarHeader() {
         <IconSidebar size={16} />
       </IconButton>
       <div style={{ flex: 1 }} />
-      <IconButton title="Back" disabled>
+      <IconButton
+        title="Previous worktree"
+        onClick={() => stepWorktree(-1)}
+        disabled={!canCycle}
+      >
         <IconBack size={14} />
       </IconButton>
-      <IconButton title="Forward" disabled>
+      <IconButton
+        title="Next worktree"
+        onClick={() => stepWorktree(1)}
+        disabled={!canCycle}
+      >
         <IconForward size={14} />
       </IconButton>
     </div>
@@ -563,7 +592,7 @@ function HistorySection({ records }: { records: ArchiveRecord[] }) {
           borderRadius: 0,
           border: "none",
           textAlign: "left",
-          cursor: "default",
+          cursor: "pointer",
           transition:
             "background-color var(--motion-instant) var(--ease-out-quart)",
         }}
@@ -933,7 +962,7 @@ const WorktreeRow = memo(function WorktreeRowImpl({
     fontSize: "var(--text-sm)",
     textAlign: "left",
     border: "none",
-    cursor: "default",
+    cursor: "pointer",
     transition:
       "background-color var(--motion-instant) var(--ease-out-quart)," +
       "color var(--motion-instant) var(--ease-out-quart)",
@@ -1593,7 +1622,7 @@ function IconButton({
           borderRadius: "var(--radius-sm)",
           color: disabled ? "var(--text-disabled)" : "var(--text-tertiary)",
           backgroundColor: "transparent",
-          cursor: disabled ? "default" : "default",
+          cursor: disabled ? "default" : "pointer",
           transition:
             "background-color var(--motion-instant) var(--ease-out-quart)," +
             "color var(--motion-instant) var(--ease-out-quart)",
@@ -1651,7 +1680,7 @@ function SmallIconButton({
           borderRadius: "var(--radius-xs)",
           color: "var(--text-tertiary)",
           backgroundColor: "transparent",
-          cursor: "default",
+          cursor: "pointer",
           transition:
             "background-color var(--motion-instant) var(--ease-out-quart)," +
             "color var(--motion-instant) var(--ease-out-quart)",

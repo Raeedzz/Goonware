@@ -206,7 +206,7 @@ function FileBlock({ section }: { section: FileSection }) {
           color: "var(--text-secondary)",
           borderBottom: "var(--border-1)",
           textAlign: "left",
-          cursor: "default",
+          cursor: "pointer",
         }}
         title={section.path}
       >

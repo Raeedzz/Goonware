@@ -816,12 +816,14 @@ export function BlockTerminal({
   // user scrolls back down or the content fits.
   useEffect(() => {
     const el = scrollContainerRef.current;
-    // Active for the shell transcript AND inline agents (claude/codex) — both
-    // now render in the one scrollable native transcript, so the wheel scrolls
-    // the whole terminal up through history while an agent is foregrounded
-    // (Warp's continuous scroll). Alt-screen (vim/htop) renders no scroll
-    // container, so `el` is null there and this no-ops automatically.
-    if (!el || !nativeActive) return;
+    // Active for the SHELL transcript only. While an agent is foregrounded the
+    // wheel must drive the agent's OWN scroll (its conversation), not the
+    // Goonware transcript behind it — claude/codex render a fixed grid whose
+    // history lives inside the agent, not in our closed-block stream. So bail
+    // in agent mode and let the agent-wheel bridge below forward the wheel to
+    // the PTY instead. Alt-screen (vim/htop) renders no scroll container, so
+    // `el` is null there and this no-ops automatically.
+    if (!el || !nativeActive || agentMode) return;
     // Coalesce to ONE batched scroll per animation frame. Each invoke pokes a
     // full native re-render of the transcript; one per wheel event (60–120/sec
     // on a trackpad) floods the main thread and the scroll-back stutters.
@@ -871,19 +873,21 @@ export function BlockTerminal({
     };
   }, [nativeActive, agentMode, paneKey]);
 
-  // Alt-screen wheel → forward to the PTY so the app (vim, htop, claude's TUI)
-  // scrolls ITS OWN view — exactly like a real terminal. In alt-screen the
-  // native surface paints the full grid and NO React scroll container is
-  // mounted, so the wheel lands on the pane container instead; term_native_wheel
-  // translates it to mouse-wheel / arrow bytes based on the app's mode. This is
-  // why "I can't scroll while claude is running" — claude is an alt-screen TUI,
-  // so the transcript scroll-back bridge above (which needs the scroll
-  // container) never applied. Pixel→notch conversion + the cell coords under
-  // the cursor (SF Mono 0.6em × 1.3 line) are sent so mouse-aware apps scroll
-  // the right region.
+  // Agent wheel → forward to the PTY so the agent (claude / codex, OR an
+  // alt-screen app like vim/htop) scrolls ITS OWN view — exactly like a real
+  // terminal. Fires for the WHOLE agent mode, not just alt-screen: an inline
+  // agent's conversation also lives inside its repainting grid (not in our
+  // closed-block stream), so the only way to scroll back through it is to feed
+  // the wheel to the PTY. term_native_wheel encodes SGR/X10 mouse-wheel bytes
+  // for mouse-aware apps (claude sets SGR mode) and no-ops for the rest. This
+  // is why "I can't scroll while claude is running" — the transcript
+  // scroll-back bridge above used to swallow the wheel into the Goonware
+  // transcript. Pixel→notch conversion + the cell coords under the cursor
+  // (SF Mono 0.6em × 1.3 line) are sent so mouse-aware apps scroll the right
+  // region.
   useEffect(() => {
     const el = containerRef.current;
-    if (!el || !nativeActive || !altScreen) return;
+    if (!el || !nativeActive || !agentMode) return;
     const CELL_W = 13 * 0.6;
     const CELL_H = 13 * 1.3;
     const LINE_PX = 16; // px of wheel travel per scroll line/notch
@@ -932,19 +936,27 @@ export function BlockTerminal({
       el.removeEventListener("wheel", onWheel);
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [nativeActive, altScreen, ptyId]);
+  }, [nativeActive, agentMode, ptyId]);
 
   // Selection mouse bridge. Same situation as the wheel bridge: the native
-  // surface renders the shell transcript through a transparent hole and ignores
-  // mouse events, so drags land on this (invisible) container. Forward
-  // down/drag/up to `term_native_mouse` → warpui's own hit-testing + selection.
-  // `(x, y)` are relative to this container's top-left, which in shell mode is
-  // the pane (and therefore surface) top-left. Move/up listen on the window so a
-  // drag tracks past the container edge. `preventDefault` on mousedown stops the
-  // hidden DOM block list from starting its own text selection. Left button only.
+  // surface renders through a transparent hole and ignores mouse events, so
+  // drags land on this (invisible) container. Forward down/drag/up to
+  // `term_native_mouse` → warpui's own hit-testing + selection. Runs for BOTH
+  // shell AND agent mode (Warp-style: Goonware owns left-drag selection over the
+  // agent; the agent is keyboard-driven and no longer receives mouse drags).
+  // The attach target differs: shell mode uses the transcript scroll container
+  // (so mousedowns on the input bar / status strip don't start a selection);
+  // agent mode uses the whole pane container — in alt-screen the scroll
+  // container isn't even mounted. `(x, y)` are window-content coords
+  // (clientX/clientY) regardless, so the attach target doesn't affect
+  // hit-testing — Rust subtracts the surface origin. Move/up listen on the
+  // window so a drag tracks past the container edge. `preventDefault` on
+  // mousedown stops the hidden DOM block list from starting its own text
+  // selection. Left button only. A native cmd+left-click also routes here: the
+  // warpui Text link handler consumes it (opens the URL) — see styled_run.
   useEffect(() => {
-    const el = scrollContainerRef.current;
-    if (!el || !nativeActive || agentMode) return;
+    const el = agentMode ? containerRef.current : scrollContainerRef.current;
+    if (!el || !nativeActive) return;
     let dragging = false;
     // The latest pointer position during a drag, kept so the autoscroll loop
     // can re-dispatch a drag (extending the selection) when the pointer is held
@@ -1012,6 +1024,11 @@ export function BlockTerminal({
     };
     const maybeAutoscroll = () => {
       if (autoRaf) return; // already looping
+      // Edge autoscroll drives the Goonware transcript (term_native_scroll).
+      // In agent mode the wheel/scroll belongs to the agent and there's no
+      // transcript behind the fixed agent grid to reveal, so skip it — the
+      // selection just clamps to the visible grid, like a real terminal.
+      if (agentMode) return;
       const r = el.getBoundingClientRect();
       if (lastY < r.top + EDGE || lastY > r.bottom - EDGE)
         autoRaf = requestAnimationFrame(tick);
@@ -1053,14 +1070,15 @@ export function BlockTerminal({
     };
   }, [nativeActive, agentMode, paneKey]);
 
-  // Cmd+C copies the native transcript selection (kept by warpui's
-  // SelectableArea, exposed via term_native_selection_text) through the existing
-  // pbcopy path. Capture-phase + window-level so it wins over the focused
-  // PromptInput textarea — UNLESS that textarea has its own selection, in which
-  // case we defer to the browser's normal copy. Shell-transcript only (agent
-  // mode routes Cmd+C through PtyPassthrough; alt-screen has no native surface).
+  // Cmd+C copies the native selection (kept by warpui's SelectableArea, exposed
+  // via term_native_selection_text) through the existing pbcopy path. Capture-
+  // phase + window-level so it wins over the focused PromptInput / PtyPassthrough
+  // — UNLESS that textarea has its own selection, in which case we defer to the
+  // browser's normal copy. Runs for shell AND agent mode now that the agent grid
+  // is selectable too (Cmd+C is copy, not interrupt — Ctrl+C is the agent's
+  // interrupt and routes through PtyPassthrough untouched).
   useEffect(() => {
-    if (!nativeActive || agentMode || !isVisible) return;
+    if (!nativeActive || !isVisible) return;
     const onKey = (e: KeyboardEvent) => {
       if (!e.metaKey || e.ctrlKey || e.altKey || e.key.toLowerCase() !== "c") return;
       const ae = document.activeElement;
@@ -1077,6 +1095,69 @@ export function BlockTerminal({
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
+  }, [nativeActive, agentMode, isVisible, paneKey]);
+
+  // Cmd-hover link cursor. The native surface renders detected URLs underlined
+  // and makes them Cmd-clickable (see warp_term.rs styled_run), but the embedded
+  // child window has `ignoresMouseEvents: YES`, so the macOS cursor over the pane
+  // is owned by the DOM — warpui can't flip it to a pointing hand. So while Cmd
+  // is held we query the native link hit-test for the point under the cursor and
+  // set the pane cursor ourselves. rAF-throttled; cleared the instant Cmd lifts
+  // or the pointer leaves. Agent mode + native pane only — that's where links are
+  // tracked (term_native_link_at returns false elsewhere).
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !nativeActive || !agentMode || !isVisible) return;
+    let lastX = 0;
+    let lastY = 0;
+    let metaHeld = false;
+    let raf = 0;
+    let shown = false;
+    const setCursor = (on: boolean) => {
+      if (on === shown) return;
+      shown = on;
+      el.style.cursor = on ? "pointer" : "";
+    };
+    const query = () => {
+      raf = 0;
+      if (!metaHeld) {
+        setCursor(false);
+        return;
+      }
+      invoke<boolean>("term_native_link_at", { paneKey, x: lastX, y: lastY })
+        .then((hit) => setCursor(metaHeld && hit === true))
+        .catch(() => {});
+    };
+    const schedule = () => {
+      if (!raf) raf = requestAnimationFrame(query);
+    };
+    const onMove = (e: globalThis.MouseEvent) => {
+      lastX = e.clientX;
+      lastY = e.clientY;
+      metaHeld = e.metaKey;
+      if (metaHeld) schedule();
+      else setCursor(false);
+    };
+    // Cmd pressed/released without the pointer moving still toggles the cursor —
+    // re-query at the last known point.
+    const onKeyToggle = (e: KeyboardEvent) => {
+      metaHeld = e.metaKey;
+      if (metaHeld) schedule();
+      else setCursor(false);
+    };
+    const onLeave = () => setCursor(false);
+    el.addEventListener("mousemove", onMove);
+    el.addEventListener("mouseleave", onLeave);
+    window.addEventListener("keydown", onKeyToggle);
+    window.addEventListener("keyup", onKeyToggle);
+    return () => {
+      el.removeEventListener("mousemove", onMove);
+      el.removeEventListener("mouseleave", onLeave);
+      window.removeEventListener("keydown", onKeyToggle);
+      window.removeEventListener("keyup", onKeyToggle);
+      if (raf) cancelAnimationFrame(raf);
+      setCursor(false);
+    };
   }, [nativeActive, agentMode, isVisible, paneKey]);
 
   // Report this scroll container's region (top offset within the pane + height)
@@ -2131,7 +2212,7 @@ export function BlockTerminal({
               fontFamily: "var(--font-sans)",
               fontSize: "var(--text-xs)",
               fontWeight: "var(--weight-medium)",
-              cursor: "default",
+              cursor: "pointer",
             }}
           >
             restart

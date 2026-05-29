@@ -100,7 +100,7 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
         style={{
           display: "flex",
           alignItems: "center",
-          height: 36,
+          height: "var(--tab-height)",
           padding: "0 var(--space-2)",
           gap: 2,
           borderBottom: "var(--border-1)",
@@ -256,7 +256,7 @@ function PanelTab({
         display: "inline-flex",
         alignItems: "center",
         gap: 4,
-        cursor: "default",
+        cursor: "pointer",
         transition: "color var(--motion-fast) var(--ease-out-quart)",
       }}
     >

@@ -361,17 +361,17 @@ function TabButton({
         display: "inline-flex",
         alignItems: "center",
         gap: 8,
-        // Fixed at 36 — leaves 4px breathing inside the 40px strip,
+        // Fixed at 32 — leaves 4px breathing inside the 36px strip,
         // and is tall enough to host the two-line label stack
         // (title 12px / summary 10px = ~23px content) without ever
         // growing further when the summary line appears. The tab no
         // longer "stretches" on agent start; the second line just
         // fills the space we already reserved.
-        height: 36,
+        height: 32,
         minWidth: 120,
         maxWidth: 240,
         padding: "0 var(--space-2) 0 10px",
-        cursor: "default",
+        cursor: "pointer",
         backgroundColor: active ? "var(--surface-2)" : "transparent",
         color: active ? "var(--text-primary)" : "var(--text-secondary)",
         borderTopLeftRadius: 6,
@@ -1291,7 +1291,7 @@ function DialogButton({
           ? "1px solid var(--accent)"
           : "1px solid var(--border-default)",
         borderRadius: "var(--radius-sm)",
-        cursor: "default",
+        cursor: "pointer",
         transition:
           "background-color var(--motion-instant) var(--ease-out-quart)," +
           "border-color var(--motion-instant) var(--ease-out-quart)",
