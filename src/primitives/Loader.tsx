@@ -65,9 +65,23 @@ PERIMETER_CYCLE.forEach((gridIdx, snakePos) => {
 
 export function Loader({
   size = 14,
+  baseColor,
+  crestColor,
+  centerColor,
 }: {
   /** Pixel size of the square slot. Default 14. */
   size?: number;
+  /**
+   * Color the dim cells fade into — set this to the color BEHIND the
+   * loader so the wave reads as bright crests rising out of that
+   * surface rather than out of a generic dark gray. e.g. pass the
+   * worktree's tag color so a white wave spins over orange.
+   */
+  baseColor?: string;
+  /** Color of the bright moving crest. Default a near-white. */
+  crestColor?: string;
+  /** Color of the static center anchor. */
+  centerColor?: string;
 }) {
   // Squares are integer-sized so they line up pixel-perfect on the
   // grid (CSS subpixel rounding can leave hairline seams between cells
@@ -84,12 +98,20 @@ export function Loader({
         width: gridWidth,
         height: gridWidth,
         flexShrink: 0,
-        // Dark base under the perimeter cells. The cells themselves
-        // are a fixed bright color whose opacity animates, so when a
-        // cell dims it fades into this base — giving us a smooth,
+        // Base under the perimeter cells. The cells themselves are a
+        // fixed bright color whose opacity animates, so when a cell
+        // dims it fades into this base — giving us a smooth,
         // GPU-accelerated wave that's not vulnerable to main-thread
         // paint stalls the way `background-color` interpolation is.
-        backgroundColor: "oklch(36% 0.003 250)",
+        // Defaults to a neutral dark; callers can override it (and the
+        // crest/center colors via CSS vars) to recolor the whole loader.
+        backgroundColor: baseColor ?? "oklch(36% 0.003 250)",
+        ...(crestColor
+          ? ({ "--goonware-loader-crest": crestColor } as CSSProperties)
+          : null),
+        ...(centerColor
+          ? ({ "--goonware-loader-center": centerColor } as CSSProperties)
+          : null),
       }}
       aria-hidden
     >

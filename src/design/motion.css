@@ -226,8 +226,11 @@
      wave keeps a steady cadence even when the main thread is busy
      (20+ agents streaming, big diffs in flight, tab-switch storms).
      `background-color` interpolation is paint-only and was the real
-     source of the perceptible micro-stutters. */
-  background-color: oklch(96% 0.003 250);
+     source of the perceptible micro-stutters.
+
+     `--goonware-loader-crest` lets a caller recolor the crest (e.g. a
+     pure white wave over a colored loader base); defaults to near-white. */
+  background-color: var(--goonware-loader-crest, oklch(96% 0.003 250));
   opacity: 0;
   animation: goonware-loader-snake-wave 1.2s ease-in-out infinite;
   /* `--goonware-loader-snake-pos` is 0..7 set inline per cell. A negative
@@ -241,8 +244,9 @@
 .goonware-loader-cell-center {
   /* Static anchor at calm mid-brightness. Sits between the crest's
      dark and lightest stops so it never competes with the moving
-     wave but always reads as "this loader is on". */
-  background-color: oklch(54% 0.003 250);
+     wave but always reads as "this loader is on". `--goonware-loader-center`
+     overrides it to stay coherent with a recolored crest/base. */
+  background-color: var(--goonware-loader-center, oklch(54% 0.003 250));
 }
 
 /* ------------------------------------------------------------------
