@@ -928,18 +928,22 @@ const WorktreeRow = memo(function WorktreeRowImpl({
 
   // Idle: transparent. Hover: surface-3 (matches the project header
   // hover so the sidebar reads as one consistent rail). Active:
-  // surface-4 fill plus a colored tag tint when set. When colored,
-  // blend the tag in subtly so the row reads tinted but doesn't fight
-  // the rest of the chrome.
+  // surface-4 fill plus a colored tag tint when set.
+  //
+  // When colored, the row stays the SAME hue across every state — we
+  // blend the tag over `transparent` (never over a gray surface) and
+  // only push its opacity up, so selecting an orange worktree keeps it
+  // orange instead of shifting toward a muddy surface tint. Selection
+  // is signalled by the stronger fill + the brighter border below.
   const colored = !!worktree.color;
   const restingBg = colored
     ? `color-mix(in oklch, transparent, var(--tag-${worktree.color}) 45%)`
     : "transparent";
   const hoverBg = colored
-    ? `color-mix(in oklch, var(--surface-3), var(--tag-${worktree.color}) 55%)`
+    ? `color-mix(in oklch, transparent, var(--tag-${worktree.color}) 60%)`
     : "var(--surface-3)";
   const activeBg = colored
-    ? `color-mix(in oklch, var(--surface-4), var(--tag-${worktree.color}) 60%)`
+    ? `color-mix(in oklch, transparent, var(--tag-${worktree.color}) 80%)`
     : "var(--surface-4)";
   const startBg = isActive ? activeBg : restingBg;
   const textColor = isActive ? "var(--text-primary)" : "var(--text-secondary)";
@@ -947,13 +951,14 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   // Match the project header: 4px outer inset on both sides creates a
   // rounded "box" hover that lines up vertically with the header above
   // it. width: calc(100% - 8px) keeps the box from butting against the
-  // sidebar's right edge.
+  // sidebar's right edge. A small vertical margin separates adjacent
+  // rows instead of a border.
   const rowStyle: CSSProperties = {
     display: "flex",
     alignItems: "center",
     gap: 12,
     width: "calc(100% - 8px)",
-    margin: "0 4px",
+    margin: "2px 4px",
     height: 36,
     padding: "0 var(--space-2) 0 32px",
     borderRadius: "var(--radius-sm)",
@@ -962,6 +967,7 @@ const WorktreeRow = memo(function WorktreeRowImpl({
     fontSize: "var(--text-sm)",
     textAlign: "left",
     border: "none",
+    boxSizing: "border-box",
     cursor: "pointer",
     transition:
       "background-color var(--motion-instant) var(--ease-out-quart)," +
@@ -1026,7 +1032,23 @@ const WorktreeRow = memo(function WorktreeRowImpl({
           {worktree.missing ? (
             <FolderOffIcon key="missing" size={16} />
           ) : isRunning ? (
-            <Loader key="running" size={16} />
+            <Loader
+              key="running"
+              size={16}
+              // When the worktree is colored, spin a white wave on top
+              // of its own color instead of the default dark base, so
+              // the loader reads as white-on-orange rather than
+              // white-on-black sitting in a colored row.
+              baseColor={
+                worktree.color ? `var(--tag-${worktree.color})` : undefined
+              }
+              crestColor={worktree.color ? "oklch(100% 0 0)" : undefined}
+              centerColor={
+                worktree.color
+                  ? `color-mix(in oklch, var(--tag-${worktree.color}), white 50%)`
+                  : undefined
+              }
+            />
           ) : iconEntry ? (
             <iconEntry.Component size={16} />
           ) : (

@@ -71,6 +71,22 @@ export interface RenderFrame {
    * middle of a picker description row.
    */
   cursor_visible: boolean;
+  /**
+   * True when the PTY's line discipline has left canonical mode
+   * (`ICANON` cleared via `tcsetattr`) — the universal signal that the
+   * foreground program is reading keystrokes raw and doing its own line
+   * editing / key handling. Interactive prompts (inquirer / `prompts` /
+   * clack), `fzf`, password readers, and full TUIs all clear it, even
+   * the ones that never emit `app_cursor` / `bracketed_paste`.
+   *
+   * Consumers MUST gate on `command_running` before acting: the shell's
+   * own line editor (zsh ZLE, bash readline) also runs the tty raw at an
+   * idle prompt, so raw mode alone can't tell "shell prompt" from "child
+   * prompt" — but raw mode *while a command is running* means a child
+   * has taken over the keyboard and needs every key (arrows included)
+   * forwarded verbatim rather than intercepted by the block editor.
+   */
+  raw_input: boolean;
   dirty: DirtyRow[];
   /**
    * Rows that just scrolled OUT of the visible grid into PTY scrollback

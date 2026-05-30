@@ -36,6 +36,7 @@ import {
   agentScrollContainerStyle,
   shouldRenderBlockList,
 } from "./agentScrollLayout";
+import { deriveInputMode, nextRawLatch } from "./inputModeDecision";
 
 /** Command names that always run as an interactive TUI agent. */
 function isAgentCommand(command: string): boolean {
@@ -347,6 +348,13 @@ export function BlockTerminal({
   useEffect(() => {
     foregroundIsAgentRef.current = foregroundIsAgent;
   }, [foregroundIsAgent]);
+  // Same latest-value-without-re-registration trick for "is PtyPassthrough
+  // the mounted input layer." Covers inline agents AND inline raw prompts
+  // (inquirer/fzf/…) — the latter never flips `foregroundIsAgent`, so the
+  // closure below would otherwise try to focus a PromptInput that isn't
+  // mounted while a raw prompt owns the surface. Synced in an effect after
+  // `passthroughActive` is computed.
+  const passthroughActiveRef = useRef(false);
 
   // Register a focus function for this terminal's tab id, so the
   // global `useFocusActiveTerminal` hook can send focus here whenever
@@ -356,7 +364,7 @@ export function BlockTerminal({
   // straight to the PTY); in shell mode we focus PromptInput's textarea.
   useEffect(() => {
     registerTerminalFocus(id, () => {
-      if (foregroundIsAgentRef.current) {
+      if (foregroundIsAgentRef.current || passthroughActiveRef.current) {
         passthroughRef.current?.focus();
       } else {
         promptRef.current?.focus();
@@ -753,12 +761,55 @@ export function BlockTerminal({
     return () => clearTerminalRunning(id);
   }, [id]);
 
-  // `altScreen` covers vim/htop; `foregroundIsAgent` covers
-  // claude/codex/etc. that render in the normal screen. Both hide
-  // PromptInput + status bar so the agent's own UI owns the surface.
-  // After the PTY exits, downshift back to shell-mode chrome regardless
-  // of what the last frame's flags were — those readings are stale.
-  const agentMode = !exited && (altScreen || foregroundIsAgent);
+  // Latch raw-prompt mode for the LIFETIME of the running command. Prompt
+  // libraries restore canonical mode briefly between questions (`npm
+  // init` and other multi-step wizards) and some toggle it per keypress;
+  // reading `raw_input` raw would make the mode flicker false on those
+  // gaps and flip the input layer + chrome back to shell for a frame —
+  // visible as the whole pane jittering as the user navigates and selects.
+  // Once a running command has gone raw even once, stay raw until it ends
+  // (passthrough forwards canonical input fine too, so there's no reason
+  // to flip back mid-command). Reset the instant the command ends / the
+  // pane exits / an alt-screen TUI takes over.
+  const rawSeen = liveFrame?.raw_input ?? false;
+  const [rawLatched, setRawLatched] = useState(false);
+  useEffect(() => {
+    const next = nextRawLatch(rawLatched, {
+      exited,
+      altScreen,
+      commandRunning,
+      rawInput: rawSeen,
+    });
+    if (next !== rawLatched) setRawLatched(next);
+  }, [exited, altScreen, commandRunning, rawSeen, rawLatched]);
+
+  // Which input layer owns the keyboard. `deriveInputMode` (pure, tested
+  // in inputModeDecision.test.ts) folds the live frame flags into three
+  // decisions:
+  //   - inlineRawPrompt: a child put the tty into raw mode (ICANON
+  //     cleared → frame `raw_input`) WHILE a command runs, rendered
+  //     inline — inquirer / `prompts` / clack menus, fzf, password
+  //     readers. PromptInput would otherwise swallow the arrow keys these
+  //     need for menu nav (see its history / completion onKeyDown
+  //     handlers), so we forward every key raw via PtyPassthrough. Gated
+  //     on commandRunning because the shell's OWN ZLE runs the tty raw at
+  //     an idle prompt too (see types.ts:raw_input). Fed the LATCHED raw
+  //     bit (rawSeen || rawLatched) so it doesn't flicker mid-command.
+  //   - agentMode: hide PromptInput + status bar so the running program
+  //     owns the surface (alt-screen TUIs, inline agents, inline raw).
+  //   - passthroughActive: PtyPassthrough is the mounted input layer.
+  //     One flag so the JSX mount and the autofocus effect can't drift.
+  const { inlineRawPrompt, agentMode, passthroughActive } = deriveInputMode({
+    exited,
+    altScreen,
+    commandRunning,
+    rawInput: rawSeen || rawLatched,
+    foregroundIsAgent,
+    nativeSurface,
+  });
+  useEffect(() => {
+    passthroughActiveRef.current = passthroughActive;
+  }, [passthroughActive]);
 
   // Tell the native surface when this pane is in agent mode. In agent mode the
   // PromptInput is hidden and keystrokes go raw to the PTY (PtyPassthrough), so
@@ -791,15 +842,14 @@ export function BlockTerminal({
   // visible and grabs focus on click.) Click-to-refocus + the window-level
   // Ctrl+C fallback cover focus drift after that.
   useEffect(() => {
-    // PtyPassthrough is the input layer for inline agents AND native alt-screen
-    // (vim/htop on a native pane). Focus it whenever it's the one mounted so the
-    // user can type / Ctrl+C without a visible element to click.
-    const needsPassthrough =
-      (foregroundIsAgent && !altScreen) || (altScreen && nativeSurface);
-    if (!isVisible || !needsPassthrough) return;
+    // PtyPassthrough is the input layer for inline agents, inline raw
+    // prompts, AND native alt-screen (vim/htop on a native pane). Focus it
+    // whenever it's the one mounted so the user can type / Ctrl+C without a
+    // visible element to click.
+    if (!isVisible || !passthroughActive) return;
     const t = setTimeout(() => passthroughRef.current?.focus(), 0);
     return () => clearTimeout(t);
-  }, [isVisible, foregroundIsAgent, altScreen, nativeSurface]);
+  }, [isVisible, passthroughActive]);
 
   // Scroll-back wheel bridge. The native surface renders the shell transcript
   // through a transparent hole; the embedded child window has
@@ -2371,18 +2421,19 @@ export function BlockTerminal({
                 command={activeCommand}
                 frame={liveFrame}
                 cwd={effectiveCwd}
-                preserveGrid={foregroundIsAgent}
+                // Render inline raw prompts (inquirer / fzf / wizards) on
+                // the SAME fixed-grid, pane-filling surface as inline
+                // agents — not the content-sized shell-output surface.
+                // Two reasons: (1) these prompts position their UI by grid
+                // coordinates, so grid-accurate no-wrap rendering matches
+                // what they drew; (2) a content-sized block re-measures its
+                // height every redraw, so as the prompt moves its cursor
+                // through a menu the block grows/shrinks and the whole pane
+                // jitters per keystroke. The hard 100cqh fill height pins it
+                // stable — the cursor moves inside a fixed surface instead.
+                preserveGrid={foregroundIsAgent || inlineRawPrompt}
                 noWrap={allowHorizontalScroll}
-                // Agent TUIs own the surface — let the LiveBlock fill
-                // the pane instead of sizing to content. Without this,
-                // a tall agent grid (claude with the slash-command
-                // picker open) draws below an empty BlockList region,
-                // the outer scroll anchors that combined column at the
-                // bottom, and the user sees a fat band of blank canvas
-                // above the picker. Filling the pane puts the picker's
-                // first row at the visible top edge — what users mean
-                // by "I want to see what I'm picking."
-                fill={foregroundIsAgent}
+                fill={foregroundIsAgent || inlineRawPrompt}
               />
             )}
           </div>
@@ -2420,7 +2471,7 @@ export function BlockTerminal({
           autoFocus={autoFocus}
         />
       )}
-      {((foregroundIsAgent && !altScreen) || (altScreen && nativeSurface)) && (
+      {passthroughActive && (
         <PtyPassthrough
           ref={passthroughRef}
           onSendBytes={onSendBytesVoid}
