@@ -948,25 +948,17 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   const startBg = isActive ? activeBg : restingBg;
   const textColor = isActive ? "var(--text-primary)" : "var(--text-secondary)";
 
-  // Subtle per-row border so adjacent worktrees read as distinct cards.
-  // On a colored row the edge is a BRIGHTER shade of the row's own hue
-  // (mix toward white) so it lifts off the fill instead of muddying
-  // into it; neutral rows get a faint white edge. Never a random hue —
-  // it always tracks whatever color the row is.
-  const borderColor = colored
-    ? `color-mix(in oklch, var(--tag-${worktree.color}), white ${isActive ? 12 : 6}%)`
-    : `rgba(255, 255, 255, ${isActive ? 0.18 : 0.1})`;
-
   // Match the project header: 4px outer inset on both sides creates a
   // rounded "box" hover that lines up vertically with the header above
   // it. width: calc(100% - 8px) keeps the box from butting against the
-  // sidebar's right edge.
+  // sidebar's right edge. A small vertical margin separates adjacent
+  // rows instead of a border.
   const rowStyle: CSSProperties = {
     display: "flex",
     alignItems: "center",
     gap: 12,
     width: "calc(100% - 8px)",
-    margin: "0 4px",
+    margin: "2px 4px",
     height: 36,
     padding: "0 var(--space-2) 0 32px",
     borderRadius: "var(--radius-sm)",
@@ -974,7 +966,7 @@ const WorktreeRow = memo(function WorktreeRowImpl({
     color: textColor,
     fontSize: "var(--text-sm)",
     textAlign: "left",
-    border: `1px solid ${borderColor}`,
+    border: "none",
     boxSizing: "border-box",
     cursor: "pointer",
     transition:
