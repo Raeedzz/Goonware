@@ -583,6 +583,23 @@ pub struct RenderFrame {
     /// "█ in the middle of 'Switch between Clau█'" symptom users
     /// reported.
     pub cursor_visible: bool,
+    /// True iff the PTY's line discipline has left canonical mode
+    /// (`ICANON` cleared via `tcsetattr`). This is the universal signal
+    /// that the foreground program is reading keystrokes raw and doing
+    /// its own line editing / key handling — interactive prompts
+    /// (inquirer / `prompts` / clack / enquirer), `fzf`, password
+    /// readers, and full TUIs all clear it. Unlike `app_cursor` /
+    /// `bracketed_paste` (which a prompt library may never emit), raw
+    /// mode is set by *every* program that does its own keystroke
+    /// reading, so it's the reliable trigger for routing arrows + every
+    /// other key straight to the PTY.
+    ///
+    /// The frontend gates this on `command_running` before acting on it:
+    /// the interactive shell's OWN line editor (zsh ZLE, bash readline)
+    /// also runs the tty raw at an idle prompt, so raw mode alone can't
+    /// tell "shell prompt" from "child prompt" — but raw mode *while a
+    /// command is running* can.
+    pub raw_input: bool,
     /// Sparse: only rows that changed since the last frame. Frontend
     /// keeps the rest from its previous snapshot.
     pub dirty: Vec<DirtyRow>,
@@ -686,6 +703,30 @@ pub fn set_native_block_sink(sink: NativeBlockSink) {
 }
 
 /// Hand a finished block to the native sink iff `id` is a mirrored pty.
+/// True iff the PTY's line discipline has left canonical mode (`ICANON`
+/// cleared). See `RenderFrame::raw_input` for the full rationale — this
+/// is the per-frame probe that fills that field.
+///
+/// Reads termios off the master fd: on a PTY the master and slave share
+/// one line-discipline state, so this reflects whatever the foreground
+/// child set on its stdin (the same reason `stty` works from either
+/// end). Returns false if the platform doesn't expose the fd or the
+/// ioctl fails, degrading to the prior escape-sequence-only behavior.
+fn pty_in_raw_mode(master: &dyn MasterPty) -> bool {
+    let Some(fd) = master.as_raw_fd() else {
+        return false;
+    };
+    let mut tio = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: `fd` is a live PTY master owned by the Session for the
+    // duration of this call; tcgetattr only writes into our stack
+    // termios and reads nothing from us.
+    if unsafe { libc::tcgetattr(fd, tio.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let tio = unsafe { tio.assume_init() };
+    (tio.c_lflag & libc::ICANON) == 0
+}
+
 #[inline]
 fn emit_native_block(id: &str, block: &ClosedBlock) {
     let is_target = NATIVE_PTYS
@@ -740,6 +781,7 @@ pub fn reemit_native(state: &TerminalState, id: &str) {
         app_cursor: s.term.mode().contains(TermMode::APP_CURSOR),
         bracketed_paste: s.term.mode().contains(TermMode::BRACKETED_PASTE),
         cursor_visible: s.term.mode().contains(TermMode::SHOW_CURSOR),
+        raw_input: pty_in_raw_mode(s.pty_master.as_ref()),
         dirty,
         scrollback_appended: Vec::new(),
         scrollback_reset: false,
@@ -2202,6 +2244,7 @@ pub fn term_start(
                     app_cursor: s.term.mode().contains(TermMode::APP_CURSOR),
                     bracketed_paste: s.term.mode().contains(TermMode::BRACKETED_PASTE),
                     cursor_visible: s.term.mode().contains(TermMode::SHOW_CURSOR),
+                    raw_input: pty_in_raw_mode(s.pty_master.as_ref()),
                     dirty,
                     scrollback_appended,
                     scrollback_reset: true,
@@ -2977,6 +3020,7 @@ fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
         app_cursor: s.term.mode().contains(TermMode::APP_CURSOR),
         bracketed_paste: s.term.mode().contains(TermMode::BRACKETED_PASTE),
         cursor_visible: s.term.mode().contains(TermMode::SHOW_CURSOR),
+        raw_input: pty_in_raw_mode(s.pty_master.as_ref()),
         dirty,
         scrollback_appended,
         scrollback_reset,
@@ -4032,6 +4076,52 @@ mod tests {
             rows.len(),
             history,
             "asking for more rows than exist must clamp to history size",
+        );
+    }
+
+    /// `pty_in_raw_mode` is the whole mechanism behind routing arrow
+    /// keys / Enter to interactive prompts (inquirer / `prompts` / fzf):
+    /// when the foreground child clears `ICANON`, the frontend swaps the
+    /// block editor for raw passthrough. This pins two things that are
+    /// easy to get wrong and platform-specific:
+    ///   1. `tcgetattr` works on the PTY *master* fd (the Session drops
+    ///      the slave after spawn, so the master is all we have). On
+    ///      BSD/macOS this isn't a given for every tty ioctl.
+    ///   2. The master fd reflects the slave's termios — so a child
+    ///      flipping raw mode is observable from our side.
+    #[test]
+    fn pty_in_raw_mode_tracks_canonical_flag() {
+        use std::os::fd::RawFd;
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+
+        // A fresh PTY is in canonical mode (the shell's cooked default).
+        assert!(
+            !pty_in_raw_mode(pair.master.as_ref()),
+            "fresh PTY must report canonical (not raw) mode",
+        );
+
+        // Emulate what an interactive prompt does on startup: clear
+        // ICANON. We poke the master fd directly — the kernel shares the
+        // line-discipline state between master and slave, so this is
+        // equivalent to the child calling tcsetattr on its stdin.
+        let fd: RawFd = pair.master.as_raw_fd().expect("master fd");
+        let mut tio = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(unsafe { libc::tcgetattr(fd, tio.as_mut_ptr()) }, 0);
+        let mut tio = unsafe { tio.assume_init() };
+        tio.c_lflag &= !libc::ICANON;
+        assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &tio) }, 0);
+
+        assert!(
+            pty_in_raw_mode(pair.master.as_ref()),
+            "after ICANON is cleared the PTY must report raw mode",
         );
     }
 }
