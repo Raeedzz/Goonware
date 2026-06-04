@@ -184,6 +184,33 @@ fn parse_change_entry(rest: &str, renamed: bool) -> StatusEntry {
    Diff
    ------------------------------------------------------------------ */
 
+/// Synthesize a `/dev/null`-vs-file diff for one path via
+/// `git diff --no-index`. Plain `git diff` skips untracked files
+/// entirely, so this is how brand-new files get shown — as an
+/// all-additions block — in both the single-file viewer and the
+/// all-changes view. `--no-index` exits 1 when the two inputs differ
+/// (the normal case here), so 0 and 1 both count as success. Git
+/// normalizes the header to `a/<path> b/<path>` with a `new file mode`
+/// line, so the frontend's `diff --git` slicer parses it like any other.
+async fn untracked_diff(cwd: &str, path: &str) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["diff", "--no-color", "--no-index", "--", "/dev/null", path])
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("spawn git: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    match out.status.code() {
+        Some(0) | Some(1) => Ok(stdout),
+        code => {
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            Err(format!("git exited {}: {}", code.unwrap_or(-1), stderr.trim()))
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn git_diff(
     cwd: String,
@@ -225,24 +252,7 @@ pub async fn git_diff(
     if untracked.trim().is_empty() {
         return Ok(primary);
     }
-    // `git diff --no-index` exits with 1 when files differ — the
-    // expected case here. Accept 0 or 1 as success.
-    let out = Command::new("git")
-        .args(["diff", "--no-color", "--no-index", "--", "/dev/null", p])
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("spawn git: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    match out.status.code() {
-        Some(0) | Some(1) => Ok(stdout),
-        code => {
-            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            Err(format!("git exited {}: {}", code.unwrap_or(-1), stderr.trim()))
-        }
-    }
+    untracked_diff(&cwd, p).await
 }
 
 /// Aggregate diff stats vs HEAD (working tree + index). Powers the
@@ -260,7 +270,26 @@ pub async fn git_diff_all(cwd: String) -> Result<String, String> {
     // HEAD-relative so staged + unstaged collapse into one stream.
     // The frontend parses `diff --git` boundaries to slice the
     // result into per-file sections for the all-changes view.
-    run(&cwd, &["diff", "HEAD", "--no-color"]).await
+    let mut combined = run(&cwd, &["diff", "HEAD", "--no-color"]).await?;
+
+    // `git diff HEAD` deliberately omits untracked files, so brand-new
+    // files (status "U") would silently miss from the all-changes view.
+    // Append a synthesized /dev/null-vs-file diff for each untracked path
+    // — the same `--no-index` trick the single-file viewer uses — so new
+    // files read as all-additions alongside the tracked changes. Reusing
+    // `git_status` means we diff exactly the paths the UI marks untracked.
+    let status = git_status(cwd.clone()).await?;
+    for entry in status.entries.iter().filter(|e| e.kind == "untracked") {
+        // Best-effort: one unreadable file shouldn't blank the whole view.
+        let Ok(block) = untracked_diff(&cwd, &entry.path).await else {
+            continue;
+        };
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&block);
+    }
+    Ok(combined)
 }
 
 #[tauri::command]

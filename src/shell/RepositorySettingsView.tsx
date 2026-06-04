@@ -17,7 +17,7 @@ import {
 } from "@/state/types";
 import { git } from "@/lib/git";
 import { IconChevronDown, IconChevronRight } from "@/design/icons";
-import { Delete01Icon } from "hugeicons-react";
+import { TrashIcon } from "@phosphor-icons/react";
 import { lookupPickerIcon } from "@/design/picker-icons";
 
 /**
@@ -1140,7 +1140,7 @@ function RemoveRepoButton({ project }: { project: Project }) {
         e.currentTarget.style.backgroundColor = "transparent";
       }}
     >
-      <Delete01Icon size={14} />
+      <TrashIcon size={14} />
       Remove repository
     </button>
   );

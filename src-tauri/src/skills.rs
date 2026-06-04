@@ -59,6 +59,60 @@ pub struct McpEntry {
 static SKILLS_CACHE: OnceLock<Mutex<Option<Vec<SkillEntry>>>> = OnceLock::new();
 static MCPS_CACHE: OnceLock<Mutex<Option<Vec<McpEntry>>>> = OnceLock::new();
 
+/* ------------------------------------------------------------------
+   Bundled skills — shipped with Goonware, installed into the user's
+   ~/.claude/skills so every Goonware user gets them in Claude Code.
+   ------------------------------------------------------------------ */
+
+/// Skills that ship inside the Goonware binary. Each entry is
+/// `(directory name, SKILL.md contents)`; the body is embedded at build
+/// time via `include_str!` from `resources/skills/<name>/SKILL.md`, so
+/// there's no runtime dependency on the bundle layout. Add a tuple here
+/// to ship another skill.
+const BUNDLED_SKILLS: &[(&str, &str)] = &[(
+    "browser",
+    include_str!("../resources/skills/browser/SKILL.md"),
+)];
+
+/// Write every bundled skill into `~/.claude/skills/<name>/SKILL.md`.
+///
+/// Called once at startup (right after the agent hooks install) so a
+/// freshly-downloaded Goonware seeds its skills into Claude Code on first
+/// launch — the same way `install_hooks()` seeds the event hooks.
+///
+/// Idempotent and quiet:
+///   * We create `~/.claude/skills/<name>/` if missing.
+///   * We only write when the on-disk copy differs from what we ship, so
+///     re-launching doesn't churn the file's mtime (which would trip
+///     Claude's skill-reload watcher) and a user who deleted the file
+///     gets it back.
+///
+/// This only ever touches directories we own (`skills/<bundled name>`),
+/// never the user's own skills. Best-effort: a write failure logs and
+/// moves on rather than aborting startup.
+pub fn install_bundled_skills() {
+    let Some(skills_root) = dirs::home_dir().map(|h| h.join(".claude").join("skills")) else {
+        return;
+    };
+    for (name, body) in BUNDLED_SKILLS {
+        let dir = skills_root.join(name);
+        if let Err(e) = fs::create_dir_all(&dir) {
+            eprintln!("[goonware-skills] mkdir {} failed: {e}", dir.display());
+            continue;
+        }
+        let path = dir.join("SKILL.md");
+        // Skip the write when content already matches — avoids bumping
+        // mtime on every launch.
+        if fs::read_to_string(&path).ok().as_deref() == Some(*body) {
+            continue;
+        }
+        match fs::write(&path, body) {
+            Ok(()) => eprintln!("[goonware-skills] wrote {}", path.display()),
+            Err(e) => eprintln!("[goonware-skills] write {} failed: {e}", path.display()),
+        }
+    }
+}
+
 #[tauri::command]
 pub fn skills_list() -> Result<Vec<SkillEntry>, String> {
     let slot = SKILLS_CACHE.get_or_init(|| Mutex::new(None));

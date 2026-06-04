@@ -144,6 +144,14 @@ pub fn run() {
             agent_hooks::install_hooks();
             agent_hooks::start_socket_server(app.handle().clone());
 
+            // Seed the skills Goonware ships with into ~/.claude/skills so
+            // every install gets them in Claude Code automatically (e.g. the
+            // `browser` skill that points agents at the built-in browser
+            // daemon instead of the Claude-in-Chrome MCP). Same lifecycle as
+            // the hooks above: idempotent, runs once per launch, only touches
+            // directories we own.
+            skills::install_bundled_skills();
+
             // Native terminal migration (M0 spike): stand up an embedded
             // warpui render surface under Tauri's run loop (no second
             // [NSApp run]). v0 renders a solid surface to prove the

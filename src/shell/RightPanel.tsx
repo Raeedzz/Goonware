@@ -6,6 +6,7 @@ import {
   IconChevronDown,
   IconPlus,
   IconPush,
+  IconRevert,
   IconSparkles,
 } from "@/design/icons";
 import {
@@ -712,6 +713,21 @@ function ChangesView({
     }
   };
 
+  // Reverts a single file to HEAD (staged + worktree); untracked files
+  // are deleted. Destructive and unrecoverable, so gate behind a confirm.
+  const discardFile = async (entry: StatusEntry) => {
+    const ok = window.confirm(
+      `Discard changes in ${entry.path}?\n\nTracked files are reverted to HEAD; new files are deleted. This cannot be undone.`,
+    );
+    if (!ok) return;
+    try {
+      await git.discard(worktree.path, [entry.path]);
+      await refresh();
+    } catch (e) {
+      toast.show({ message: `Discard failed: ${e}` });
+    }
+  };
+
   if (error) {
     return (
       <div style={{ padding: "var(--space-3)", color: "var(--state-error)" }}>
@@ -773,6 +789,7 @@ function ChangesView({
                       entry={entry}
                       onOpen={openDiff}
                       onToggle={toggleStage}
+                      onRevert={discardFile}
                     />
                   ))}
               </ul>
@@ -796,6 +813,7 @@ function ChangesView({
                       entry={entry}
                       onOpen={openDiff}
                       onToggle={toggleStage}
+                      onRevert={discardFile}
                     />
                   ))}
               </ul>
@@ -877,10 +895,12 @@ function ChangeRow({
   entry,
   onOpen,
   onToggle,
+  onRevert,
 }: {
   entry: StatusEntry;
   onOpen: (e: StatusEntry) => void;
   onToggle: (e: StatusEntry) => void;
+  onRevert: (e: StatusEntry) => void;
 }) {
   const tint = kindTint(entry.kind);
   return (
@@ -941,6 +961,38 @@ function ChangeRow({
         >
           {entry.path}
         </span>
+        <button
+          type="button"
+          title="Discard changes"
+          aria-label={`Discard changes in ${entry.path}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onRevert(entry);
+          }}
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "var(--text-tertiary)",
+            padding: "2px 5px",
+            backgroundColor: "transparent",
+            borderRadius: "var(--radius-xs)",
+            opacity: 0.7,
+            transition: "opacity var(--motion-instant) var(--ease-out-quart), color var(--motion-instant) var(--ease-out-quart), background-color var(--motion-instant) var(--ease-out-quart)",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.opacity = "1";
+            e.currentTarget.style.color = "var(--state-error)";
+            e.currentTarget.style.backgroundColor = "var(--surface-3)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.opacity = "0.7";
+            e.currentTarget.style.color = "var(--text-tertiary)";
+            e.currentTarget.style.backgroundColor = "transparent";
+          }}
+        >
+          <IconRevert size={13} />
+        </button>
         <button
           type="button"
           title={entry.staged ? "Unstage" : "Stage"}

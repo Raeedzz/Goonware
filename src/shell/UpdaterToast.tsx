@@ -2,11 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import type { Update } from "@tauri-apps/plugin-updater";
 import {
-  Download04Icon,
-  Cancel01Icon,
-  Loading03Icon,
-  AlertCircleIcon,
-} from "hugeicons-react";
+  DownloadSimpleIcon,
+  XIcon,
+  CircleNotchIcon,
+  WarningCircleIcon,
+} from "@phosphor-icons/react";
 import {
   checkForUpdate,
   downloadAndInstall,
@@ -172,7 +172,7 @@ export function UpdaterToast() {
 function PhaseIcon({ phase }: { phase: UpdaterPhase }) {
   if (phase.kind === "error") {
     return (
-      <AlertCircleIcon
+      <WarningCircleIcon
         size={13}
         style={{ color: "var(--state-error)", flexShrink: 0 }}
       />
@@ -190,12 +190,12 @@ function PhaseIcon({ phase }: { phase: UpdaterPhase }) {
         animate={{ rotate: 360 }}
         transition={{ duration: 1.1, ease: "linear", repeat: Infinity }}
       >
-        <Loading03Icon size={13} />
+        <CircleNotchIcon size={13} />
       </motion.span>
     );
   }
   return (
-    <Download04Icon
+    <DownloadSimpleIcon
       size={13}
       style={{ color: "var(--accent)", flexShrink: 0 }}
     />
@@ -376,7 +376,7 @@ function DismissButton({ onClick }: { onClick: () => void }) {
         e.currentTarget.style.color = "var(--text-tertiary)";
       }}
     >
-      <Cancel01Icon size={11} />
+      <XIcon size={11} />
     </button>
   );
 }

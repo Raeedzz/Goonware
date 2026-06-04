@@ -53,10 +53,11 @@ export interface Project {
   /** Resolved at scan time; data URI if found. Null if no icon source. */
   faviconDataUri: string | null;
   /**
-   * User-picked HugeIcons component name (e.g. `Folder01Icon`,
-   * `BrainIcon`). Renders ahead of `faviconDataUri` and `glyph` when
-   * set. Lives on Project; worktrees inherit this unless they have
-   * their own override.
+   * User-picked icon key from the picker registry (e.g. `Folder01`,
+   * `Brain`) — a stable name resolved to a Phosphor glyph via
+   * `lookupPickerIcon`. Renders ahead of `faviconDataUri` and `glyph`
+   * when set. Lives on Project; worktrees inherit this unless they
+   * have their own override.
    */
   iconName?: string;
   pinned: boolean;

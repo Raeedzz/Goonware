@@ -19,7 +19,7 @@ import { projectSettings } from "@/state/types";
 import { collectWorktreePtyIds, worktreeArchive } from "@/lib/worktrees";
 import { forgetPtys } from "@/terminal/sessionMemory";
 import { useToast } from "@/primitives/Toast";
-import { FolderOffIcon } from "hugeicons-react";
+import { FolderDashedIcon } from "@phosphor-icons/react";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
@@ -1421,7 +1421,7 @@ function MissingWorktreeView({
             color: "var(--state-error)",
           }}
         >
-          <FolderOffIcon size={18} />
+          <FolderDashedIcon size={18} />
           <h2
             style={{
               margin: 0,
