@@ -1,25 +1,24 @@
 import type { CSSProperties, ReactNode } from "react";
 import {
-  Settings02Icon,
+  GearIcon,
   SlidersHorizontalIcon,
-  Image01Icon,
-  Hexagon01Icon,
+  ImageIcon,
+  HexagonIcon,
   GitBranchIcon,
   LockIcon,
-  CssFile01Icon,
-  HtmlFile01Icon,
-  PythonIcon,
-  DocumentCodeIcon,
-  FileScriptIcon,
-  SqlIcon,
-  JavaIcon,
-  FileAttachmentIcon,
-} from "hugeicons-react";
+  FileCssIcon,
+  FileHtmlIcon,
+  FilePyIcon,
+  FileCodeIcon,
+  FileTextIcon,
+  FileSqlIcon,
+  CoffeeIcon,
+} from "@phosphor-icons/react";
 
 /**
  * Per-extension file icon. Mixed rendering: short colored chips for
  * languages with a recognizable two-letter mark (TS/JS/Rs/Go/Py),
- * hugeicons line icons for files with a clear "category" glyph
+ * Phosphor line icons for files with a clear "category" glyph
  * (settings/cog for envs, lock for locks, image for media), and
  * hand-drawn SVG for files that need a brand silhouette (Docker
  * whale, markdown's M↓).
@@ -176,34 +175,30 @@ function Chip({
 }
 
 /**
- * Pure-color line-icon wrapper. Drops a hugeicons component (or any
+ * Pure-color line-icon wrapper. Drops a Phosphor component (or any
  * other component that accepts `size` / `color`) into a fixed
  * inline-flex box so width/height are stable across all variants.
  */
-/** Optical scale factor — hugeicons paths span ~76% of their
+/** Optical scale factor — the glyph paths span ~78% of their
  *  viewBox; scaling the rendered glyph up by this amount makes the
  *  visible ink match the filled chips painted at full container
- *  size. The stroke weight is divided by the same factor so the
- *  visual stroke stays at the intended `strokeWidth` after scaling.
- *  The wrapper's bounding box is unchanged, so flex alignment is
- *  identical to chips and the box-to-box positions across rows
- *  line up to the pixel. */
+ *  size. The wrapper's bounding box is unchanged, so flex alignment
+ *  is identical to chips and the box-to-box positions across rows
+ *  line up to the pixel. Phosphor controls line weight via `weight`
+ *  (default `regular`) rather than a numeric stroke. */
 const LINE_ICON_SCALE = 1.3;
 
 function LineIcon({
   size,
   color,
   Component,
-  strokeWidth = 1.4,
 }: {
   size: number;
   color: string;
   Component: React.ComponentType<{
     size?: number | string;
     color?: string;
-    strokeWidth?: number;
   }>;
-  strokeWidth?: number;
 }) {
   return (
     <span
@@ -227,11 +222,7 @@ function LineIcon({
           transformOrigin: "center",
         }}
       >
-        <Component
-          size={size}
-          color={color}
-          strokeWidth={strokeWidth / LINE_ICON_SCALE}
-        />
+        <Component size={size} color={color} />
       </span>
     </span>
   );
@@ -330,21 +321,21 @@ const FILENAME_RENDERERS: Record<string, Renderer> = {
   ".gitkeep":         (s) => <LineIcon size={s} color={C.git} Component={GitBranchIcon} />,
 
   // Env / generic config
-  ".env":              (s) => <LineIcon size={s} color={C.env} Component={Settings02Icon} />,
-  ".env.local":        (s) => <LineIcon size={s} color={C.env} Component={Settings02Icon} />,
-  ".env.development":  (s) => <LineIcon size={s} color={C.env} Component={Settings02Icon} />,
-  ".env.production":   (s) => <LineIcon size={s} color={C.env} Component={Settings02Icon} />,
-  ".env.test":         (s) => <LineIcon size={s} color={C.env} Component={Settings02Icon} />,
+  ".env":              (s) => <LineIcon size={s} color={C.env} Component={GearIcon} />,
+  ".env.local":        (s) => <LineIcon size={s} color={C.env} Component={GearIcon} />,
+  ".env.development":  (s) => <LineIcon size={s} color={C.env} Component={GearIcon} />,
+  ".env.production":   (s) => <LineIcon size={s} color={C.env} Component={GearIcon} />,
+  ".env.test":         (s) => <LineIcon size={s} color={C.env} Component={GearIcon} />,
   ".env.example":      (s) => <LineIcon size={s} color={C.config} Component={SlidersHorizontalIcon} />,
   ".env.sample":       (s) => <LineIcon size={s} color={C.config} Component={SlidersHorizontalIcon} />,
   ".env.template":     (s) => <LineIcon size={s} color={C.config} Component={SlidersHorizontalIcon} />,
-  ".editorconfig":     (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  ".browserslistrc":   (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  ".nvmrc":            (s) => <LineIcon size={s} color={C.shell} Component={Hexagon01Icon} />,
-  ".node-version":     (s) => <LineIcon size={s} color={C.shell} Component={Hexagon01Icon} />,
+  ".editorconfig":     (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  ".browserslistrc":   (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  ".nvmrc":            (s) => <LineIcon size={s} color={C.shell} Component={HexagonIcon} />,
+  ".node-version":     (s) => <LineIcon size={s} color={C.shell} Component={HexagonIcon} />,
   ".ruby-version":     (s) => <Chip size={s} bg={C.ruby} text="Rb" />,
-  ".python-version":   (s) => <LineIcon size={s} color={C.python} Component={PythonIcon} />,
-  ".tool-versions":    (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
+  ".python-version":   (s) => <LineIcon size={s} color={C.python} Component={FilePyIcon} />,
+  ".tool-versions":    (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
 
   // Linters / formatters
   ".prettierrc":          (s) => <Chip size={s} bg={C.prettier} text="Pr" />,
@@ -369,26 +360,26 @@ const FILENAME_RENDERERS: Record<string, Renderer> = {
   ".stylelintrc.json":    (s) => <Chip size={s} bg={C.css} text="St" />,
 
   // Node ecosystem
-  "package.json":      (s) => <LineIcon size={s} color={C.npm} Component={Hexagon01Icon} />,
+  "package.json":      (s) => <LineIcon size={s} color={C.npm} Component={HexagonIcon} />,
   "package-lock.json": (s) => <LineIcon size={s} color={C.lock} Component={LockIcon} />,
-  ".npmrc":            (s) => <LineIcon size={s} color={C.npm} Component={Hexagon01Icon} />,
-  ".yarnrc":           (s) => <LineIcon size={s} color={C.yarn} Component={Hexagon01Icon} />,
-  ".yarnrc.yml":       (s) => <LineIcon size={s} color={C.yarn} Component={Hexagon01Icon} />,
+  ".npmrc":            (s) => <LineIcon size={s} color={C.npm} Component={HexagonIcon} />,
+  ".yarnrc":           (s) => <LineIcon size={s} color={C.yarn} Component={HexagonIcon} />,
+  ".yarnrc.yml":       (s) => <LineIcon size={s} color={C.yarn} Component={HexagonIcon} />,
   "yarn.lock":         (s) => <LineIcon size={s} color={C.lock} Component={LockIcon} />,
   "pnpm-lock.yaml":    (s) => <LineIcon size={s} color={C.lock} Component={LockIcon} />,
-  "pnpm-workspace.yaml":(s)=> <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
+  "pnpm-workspace.yaml":(s)=> <LineIcon size={s} color={C.config} Component={GearIcon} />,
   "bun.lock":          (s) => <LineIcon size={s} color={C.lock} Component={LockIcon} />,
   "bun.lockb":         (s) => <LineIcon size={s} color={C.lock} Component={LockIcon} />,
-  "bunfig.toml":       (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
+  "bunfig.toml":       (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
 
   // Python ecosystem
-  "requirements.txt":   (s) => <LineIcon size={s} color={C.python} Component={PythonIcon} />,
+  "requirements.txt":   (s) => <LineIcon size={s} color={C.python} Component={FilePyIcon} />,
   "requirements.lock":  (s) => <LineIcon size={s} color={C.lock} Component={LockIcon} />,
-  "pyproject.toml":     (s) => <LineIcon size={s} color={C.python} Component={PythonIcon} />,
-  "pipfile":            (s) => <LineIcon size={s} color={C.python} Component={PythonIcon} />,
+  "pyproject.toml":     (s) => <LineIcon size={s} color={C.python} Component={FilePyIcon} />,
+  "pipfile":            (s) => <LineIcon size={s} color={C.python} Component={FilePyIcon} />,
   "pipfile.lock":       (s) => <LineIcon size={s} color={C.lock} Component={LockIcon} />,
-  "setup.py":           (s) => <LineIcon size={s} color={C.python} Component={PythonIcon} />,
-  "setup.cfg":          (s) => <LineIcon size={s} color={C.python} Component={Settings02Icon} />,
+  "setup.py":           (s) => <LineIcon size={s} color={C.python} Component={FilePyIcon} />,
+  "setup.cfg":          (s) => <LineIcon size={s} color={C.python} Component={GearIcon} />,
   "poetry.lock":        (s) => <LineIcon size={s} color={C.lock} Component={LockIcon} />,
 
   // Ruby ecosystem
@@ -420,12 +411,12 @@ const FILENAME_RENDERERS: Record<string, Renderer> = {
   "composer.lock":  (s) => <LineIcon size={s} color={C.lock} Component={LockIcon} />,
 
   // Build systems / misc
-  "makefile":         (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  "gnumakefile":      (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  "cmakelists.txt":   (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  "jenkinsfile":      (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  "procfile":         (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  "vagrantfile":      (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
+  "makefile":         (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  "gnumakefile":      (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  "cmakelists.txt":   (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  "jenkinsfile":      (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  "procfile":         (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  "vagrantfile":      (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
 
   // Readmes / licenses / common docs
   "readme.md":        (s) => <MarkdownBadge size={s} />,
@@ -435,7 +426,7 @@ const FILENAME_RENDERERS: Record<string, Renderer> = {
   "changelog":        (s) => <MarkdownBadge size={s} />,
   "contributing.md":  (s) => <MarkdownBadge size={s} />,
   "code_of_conduct.md":(s) => <MarkdownBadge size={s} />,
-  "authors":          (s) => <LineIcon size={s} color={C.config} Component={FileAttachmentIcon} />,
+  "authors":          (s) => <LineIcon size={s} color={C.config} Component={FileTextIcon} />,
   "license":          (s) => <LineIcon size={s} color={C.config} Component={LockIcon} />,
   "license.md":       (s) => <LineIcon size={s} color={C.config} Component={LockIcon} />,
   "license.txt":      (s) => <LineIcon size={s} color={C.config} Component={LockIcon} />,
@@ -469,7 +460,7 @@ const FILENAME_PATTERNS: { pattern: RegExp; render: Renderer }[] = [
     render: (s) => <Chip size={s} bg={C.rollup} text="Rl" /> },
   // Other JS/TS configs — generic settings cog
   { pattern: /^(babel|postcss|jest|vitest|cypress|playwright|svelte|astro|remix|nuxt|drizzle|prisma|wrangler|fly)\.config\.(ts|js|mjs|cjs|mts|cts|json)$/i,
-    render: (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} /> },
+    render: (s) => <LineIcon size={s} color={C.config} Component={GearIcon} /> },
 ];
 
 /**
@@ -487,19 +478,19 @@ const EXT_RENDERERS: Record<string, Renderer> = {
   cjs:   (s) => <Chip size={s} bg={C.js} text="JS" />,
 
   // Other languages
-  py:    (s) => <LineIcon size={s} color={C.python} Component={PythonIcon} />,
-  pyc:   (s) => <LineIcon size={s} color={C.python} Component={PythonIcon} />,
-  pyi:   (s) => <LineIcon size={s} color={C.python} Component={PythonIcon} />,
-  pyw:   (s) => <LineIcon size={s} color={C.python} Component={PythonIcon} />,
+  py:    (s) => <LineIcon size={s} color={C.python} Component={FilePyIcon} />,
+  pyc:   (s) => <LineIcon size={s} color={C.python} Component={FilePyIcon} />,
+  pyi:   (s) => <LineIcon size={s} color={C.python} Component={FilePyIcon} />,
+  pyw:   (s) => <LineIcon size={s} color={C.python} Component={FilePyIcon} />,
   ipynb: (s) => <Chip size={s} bg={C.python} text="Nb" />,
   rb:    (s) => <Chip size={s} bg={C.ruby} text="Rb" />,
   erb:   (s) => <Chip size={s} bg={C.ruby} text="Eb" />,
   rs:    (s) => <Chip size={s} bg={C.rust} text="Rs" />,
   go:    (s) => <Chip size={s} bg={C.go} text="Go" />,
   swift: (s) => <Chip size={s} bg={C.swift} text="Sw" />,
-  java:  (s) => <LineIcon size={s} color={C.java} Component={JavaIcon} />,
-  class: (s) => <LineIcon size={s} color={C.java} Component={JavaIcon} />,
-  jar:   (s) => <LineIcon size={s} color={C.java} Component={JavaIcon} />,
+  java:  (s) => <LineIcon size={s} color={C.java} Component={CoffeeIcon} />,
+  class: (s) => <LineIcon size={s} color={C.java} Component={CoffeeIcon} />,
+  jar:   (s) => <LineIcon size={s} color={C.java} Component={CoffeeIcon} />,
   kt:    (s) => <Chip size={s} bg={C.kotlin} text="Kt" />,
   kts:   (s) => <Chip size={s} bg={C.kotlin} text="Kt" />,
   scala: (s) => <Chip size={s} bg={C.scala} text="Sc" />,
@@ -552,21 +543,21 @@ const EXT_RENDERERS: Record<string, Renderer> = {
   ksh:   (s) => <Chip size={s} bg={C.shell} text=">_" />,
   ps1:   (s) => <Chip size={s} bg={C.config} text="Ps" />, // PowerShell
   psm1:  (s) => <Chip size={s} bg={C.config} text="Ps" />,
-  bat:   (s) => <LineIcon size={s} color={C.shell} Component={FileScriptIcon} />,
-  cmd:   (s) => <LineIcon size={s} color={C.shell} Component={FileScriptIcon} />,
+  bat:   (s) => <LineIcon size={s} color={C.shell} Component={FileTextIcon} />,
+  cmd:   (s) => <LineIcon size={s} color={C.shell} Component={FileTextIcon} />,
   awk:   (s) => <Chip size={s} bg={C.shell} text="Aw" />,
   sed:   (s) => <Chip size={s} bg={C.shell} text="Sd" />,
 
   // Web / markup
-  html:  (s) => <LineIcon size={s} color={C.html} Component={HtmlFile01Icon} />,
-  htm:   (s) => <LineIcon size={s} color={C.html} Component={HtmlFile01Icon} />,
-  xhtml: (s) => <LineIcon size={s} color={C.html} Component={HtmlFile01Icon} />,
-  css:   (s) => <LineIcon size={s} color={C.css} Component={CssFile01Icon} />,
-  scss:  (s) => <LineIcon size={s} color={C.css} Component={CssFile01Icon} />,
-  sass:  (s) => <LineIcon size={s} color={C.css} Component={CssFile01Icon} />,
-  less:  (s) => <LineIcon size={s} color={C.css} Component={CssFile01Icon} />,
-  styl:  (s) => <LineIcon size={s} color={C.css} Component={CssFile01Icon} />,
-  pcss:  (s) => <LineIcon size={s} color={C.css} Component={CssFile01Icon} />,
+  html:  (s) => <LineIcon size={s} color={C.html} Component={FileHtmlIcon} />,
+  htm:   (s) => <LineIcon size={s} color={C.html} Component={FileHtmlIcon} />,
+  xhtml: (s) => <LineIcon size={s} color={C.html} Component={FileHtmlIcon} />,
+  css:   (s) => <LineIcon size={s} color={C.css} Component={FileCssIcon} />,
+  scss:  (s) => <LineIcon size={s} color={C.css} Component={FileCssIcon} />,
+  sass:  (s) => <LineIcon size={s} color={C.css} Component={FileCssIcon} />,
+  less:  (s) => <LineIcon size={s} color={C.css} Component={FileCssIcon} />,
+  styl:  (s) => <LineIcon size={s} color={C.css} Component={FileCssIcon} />,
+  pcss:  (s) => <LineIcon size={s} color={C.css} Component={FileCssIcon} />,
   vue:   (s) => <Chip size={s} bg={C.vue} text="Vu" />,
   svelte:(s) => <Chip size={s} bg={C.svelte} text="Sv" />,
   astro: (s) => <Chip size={s} bg={C.config} text="As" />,
@@ -582,27 +573,27 @@ const EXT_RENDERERS: Record<string, Renderer> = {
   slim:  (s) => <Chip size={s} bg={C.ruby} text="Sl" />,
 
   // Data
-  json:  (s) => <LineIcon size={s} color={C.json} Component={DocumentCodeIcon} />,
-  jsonc: (s) => <LineIcon size={s} color={C.json} Component={DocumentCodeIcon} />,
-  json5: (s) => <LineIcon size={s} color={C.json} Component={DocumentCodeIcon} />,
-  yaml:  (s) => <LineIcon size={s} color={C.yaml} Component={Settings02Icon} />,
-  yml:   (s) => <LineIcon size={s} color={C.yaml} Component={Settings02Icon} />,
-  toml:  (s) => <LineIcon size={s} color={C.toml} Component={Settings02Icon} />,
+  json:  (s) => <LineIcon size={s} color={C.json} Component={FileCodeIcon} />,
+  jsonc: (s) => <LineIcon size={s} color={C.json} Component={FileCodeIcon} />,
+  json5: (s) => <LineIcon size={s} color={C.json} Component={FileCodeIcon} />,
+  yaml:  (s) => <LineIcon size={s} color={C.yaml} Component={GearIcon} />,
+  yml:   (s) => <LineIcon size={s} color={C.yaml} Component={GearIcon} />,
+  toml:  (s) => <LineIcon size={s} color={C.toml} Component={GearIcon} />,
   xml:   (s) => <Chip size={s} bg={C.xml} text="<>" />,
-  sql:   (s) => <LineIcon size={s} color={C.sql} Component={SqlIcon} />,
+  sql:   (s) => <LineIcon size={s} color={C.sql} Component={FileSqlIcon} />,
   prisma:(s) => <Chip size={s} bg={C.config} text="Pr" />,
   graphql:(s)=> <Chip size={s} bg={C.svelte} text="Gq" />,
   gql:   (s) => <Chip size={s} bg={C.svelte} text="Gq" />,
   proto: (s) => <Chip size={s} bg={C.config} text="Pb" />,
   avro:  (s) => <Chip size={s} bg={C.config} text="Av" />,
-  csv:   (s) => <LineIcon size={s} color={C.json} Component={FileAttachmentIcon} />,
-  tsv:   (s) => <LineIcon size={s} color={C.json} Component={FileAttachmentIcon} />,
-  parquet:(s)=> <LineIcon size={s} color={C.json} Component={FileAttachmentIcon} />,
+  csv:   (s) => <LineIcon size={s} color={C.json} Component={FileTextIcon} />,
+  tsv:   (s) => <LineIcon size={s} color={C.json} Component={FileTextIcon} />,
+  parquet:(s)=> <LineIcon size={s} color={C.json} Component={FileTextIcon} />,
   md:    (s) => <MarkdownBadge size={s} />,
   mdx:   (s) => <MarkdownBadge size={s} />,
   rst:   (s) => <MarkdownBadge size={s} />,
-  txt:   (s) => <LineIcon size={s} color={C.text} Component={FileAttachmentIcon} />,
-  log:   (s) => <LineIcon size={s} color={C.text} Component={FileAttachmentIcon} />,
+  txt:   (s) => <LineIcon size={s} color={C.text} Component={FileTextIcon} />,
+  log:   (s) => <LineIcon size={s} color={C.text} Component={FileTextIcon} />,
   diff:  (s) => <Chip size={s} bg={C.git} text="Df" />,
   patch: (s) => <Chip size={s} bg={C.git} text="Df" />,
 
@@ -610,32 +601,32 @@ const EXT_RENDERERS: Record<string, Renderer> = {
   lock:        (s) => <LineIcon size={s} color={C.lock} Component={LockIcon} />,
   gitignore:   (s) => <LineIcon size={s} color={C.git} Component={GitBranchIcon} />,
   gitattributes:(s)=> <LineIcon size={s} color={C.git} Component={GitBranchIcon} />,
-  env:         (s) => <LineIcon size={s} color={C.env} Component={Settings02Icon} />,
-  ini:         (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  conf:        (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  cfg:         (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  properties:  (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
+  env:         (s) => <LineIcon size={s} color={C.env} Component={GearIcon} />,
+  ini:         (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  conf:        (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  cfg:         (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  properties:  (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
   // Infrastructure / build
   tf:          (s) => <Chip size={s} bg={C.kotlin} text="Tf" />, // Terraform
   tfvars:      (s) => <Chip size={s} bg={C.kotlin} text="Tf" />,
   hcl:         (s) => <Chip size={s} bg={C.kotlin} text="Tf" />,
   gradle:      (s) => <Chip size={s} bg={C.gradle} text="Gr" />,
   pom:         (s) => <Chip size={s} bg={C.maven} text="Mv" />,
-  mk:          (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  cmake:       (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
-  ninja:       (s) => <LineIcon size={s} color={C.config} Component={Settings02Icon} />,
+  mk:          (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  cmake:       (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
+  ninja:       (s) => <LineIcon size={s} color={C.config} Component={GearIcon} />,
 
   // Images / media
-  png:   (s) => <LineIcon size={s} color={C.image} Component={Image01Icon} />,
-  jpg:   (s) => <LineIcon size={s} color={C.image} Component={Image01Icon} />,
-  jpeg:  (s) => <LineIcon size={s} color={C.image} Component={Image01Icon} />,
-  gif:   (s) => <LineIcon size={s} color={C.image} Component={Image01Icon} />,
-  webp:  (s) => <LineIcon size={s} color={C.image} Component={Image01Icon} />,
-  avif:  (s) => <LineIcon size={s} color={C.image} Component={Image01Icon} />,
-  svg:   (s) => <LineIcon size={s} color={C.image} Component={Image01Icon} />,
-  ico:   (s) => <LineIcon size={s} color={C.image} Component={Image01Icon} />,
-  bmp:   (s) => <LineIcon size={s} color={C.image} Component={Image01Icon} />,
-  tiff:  (s) => <LineIcon size={s} color={C.image} Component={Image01Icon} />,
+  png:   (s) => <LineIcon size={s} color={C.image} Component={ImageIcon} />,
+  jpg:   (s) => <LineIcon size={s} color={C.image} Component={ImageIcon} />,
+  jpeg:  (s) => <LineIcon size={s} color={C.image} Component={ImageIcon} />,
+  gif:   (s) => <LineIcon size={s} color={C.image} Component={ImageIcon} />,
+  webp:  (s) => <LineIcon size={s} color={C.image} Component={ImageIcon} />,
+  avif:  (s) => <LineIcon size={s} color={C.image} Component={ImageIcon} />,
+  svg:   (s) => <LineIcon size={s} color={C.image} Component={ImageIcon} />,
+  ico:   (s) => <LineIcon size={s} color={C.image} Component={ImageIcon} />,
+  bmp:   (s) => <LineIcon size={s} color={C.image} Component={ImageIcon} />,
+  tiff:  (s) => <LineIcon size={s} color={C.image} Component={ImageIcon} />,
   pdf:   (s) => <Chip size={s} bg={C.pdf} text="Pd" />,
   mp4:   (s) => <Chip size={s} bg={C.video} text="Vd" />,
   mov:   (s) => <Chip size={s} bg={C.video} text="Vd" />,
