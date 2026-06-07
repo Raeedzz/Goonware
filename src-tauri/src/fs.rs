@@ -13,7 +13,7 @@
 //! reveal/right-click-open files in Finder, VS Code, browsers, etc.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -559,6 +559,176 @@ pub async fn system_open_with(path: String, app: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Rename (or move) a path within the project. Powers the file tree's
+/// right-click → Rename. `to` is the full destination path (parent +
+/// new basename), computed on the frontend so directory renames and
+/// in-place renames go through the same call.
+///
+/// Refuses to clobber: if `to` already exists we error rather than
+/// silently overwrite a sibling file. The frontend surfaces the error
+/// inline and keeps the old name.
+#[tauri::command]
+pub fn fs_rename(from: String, to: String) -> Result<String, String> {
+    let from_path = Path::new(&from);
+    let to_path = Path::new(&to);
+    if !from_path.exists() {
+        return Err(format!("no such file: {from}"));
+    }
+    // No-op rename (same path) — treat as success so a rename that
+    // doesn't change the name doesn't surface a spurious error.
+    if from_path == to_path {
+        return Ok(to);
+    }
+    if to_path.exists() {
+        let name = to_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| to.clone());
+        return Err(format!("\"{name}\" already exists"));
+    }
+    match to_path.parent() {
+        Some(parent) if parent.exists() => {}
+        _ => return Err(format!("destination folder does not exist: {to}")),
+    }
+    fs::rename(from_path, to_path).map_err(|e| e.to_string())?;
+    Ok(to)
+}
+
+/// Permanently delete a file or directory. Powers the file tree's
+/// right-click → Delete; the frontend gates it behind a confirm dialog
+/// because this is irreversible (no Trash round-trip — moving to
+/// ~/.Trash via Finder automation would fire a TCC prompt, which the
+/// app deliberately avoids elsewhere). Directories are removed
+/// recursively.
+///
+/// Refuses a path with no parent (e.g. `/`) as a guard against ever
+/// nuking a volume root through a bug upstream.
+#[tauri::command]
+pub fn fs_delete(path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        // Already gone — treat as success so the tree just refreshes.
+        return Ok(());
+    }
+    if p.parent().is_none() {
+        return Err(format!("refusing to delete a root path: {path}"));
+    }
+    if p.is_dir() {
+        fs::remove_dir_all(p).map_err(|e| e.to_string())
+    } else {
+        fs::remove_file(p).map_err(|e| e.to_string())
+    }
+}
+
+/// Copy external paths (dropped from Finder) into `dest_dir`. Each
+/// source keeps its basename; on a name collision we append " (2)",
+/// " (3)", … before the extension — matching Finder's duplicate
+/// behavior — so a drop never clobbers an existing file. Directories
+/// are copied recursively. Returns the list of created destination
+/// paths so the frontend can refresh the tree and report a count.
+///
+/// This is a COPY, not a move: files dragged from Finder must stay put
+/// at their origin. "Bring in files" = import a copy into the project.
+#[tauri::command]
+pub fn fs_import_paths(paths: Vec<String>, dest_dir: String) -> Result<Vec<String>, String> {
+    let dest = Path::new(&dest_dir);
+    if !dest.is_dir() {
+        return Err(format!("not a directory: {dest_dir}"));
+    }
+    let dest_canon = dest.canonicalize().map_err(|e| e.to_string())?;
+
+    let mut created = Vec::new();
+    let mut errors = Vec::new();
+    for src_str in &paths {
+        let src = Path::new(src_str);
+        if !src.exists() {
+            errors.push(format!("{src_str}: no longer exists"));
+            continue;
+        }
+        // Guard against copying a folder into itself / a descendant,
+        // which would recurse forever.
+        if let Ok(src_canon) = src.canonicalize() {
+            if dest_canon == src_canon || dest_canon.starts_with(&src_canon) {
+                errors.push(format!(
+                    "{src_str}: cannot copy a folder into itself"
+                ));
+                continue;
+            }
+        }
+        let file_name = match src.file_name() {
+            Some(n) => n.to_owned(),
+            None => {
+                errors.push(format!("{src_str}: has no file name"));
+                continue;
+            }
+        };
+        let target = unique_dest(dest, &file_name);
+        let result = if src.is_dir() {
+            copy_dir_recursive(src, &target)
+        } else {
+            fs::copy(src, &target).map(|_| ())
+        };
+        match result {
+            Ok(()) => created.push(target.to_string_lossy().into_owned()),
+            Err(e) => errors.push(format!("{src_str}: {e}")),
+        }
+    }
+
+    // Surface a hard error only when nothing landed. Partial success
+    // (some files copied, some failed) still returns the winners so
+    // the tree refreshes; the count tells the user what made it in.
+    if created.is_empty() && !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    Ok(created)
+}
+
+/// Pick a non-colliding destination path inside `dir` for `file_name`.
+/// Returns `dir/file_name` when free; otherwise `dir/stem (2).ext`,
+/// `dir/stem (3).ext`, … The suffix goes before the extension for
+/// files; directories (and extensionless files) get a trailing
+/// ` (n)`.
+fn unique_dest(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+    let direct = dir.join(file_name);
+    if !direct.exists() {
+        return direct;
+    }
+    let name = file_name.to_string_lossy();
+    // Split on the LAST dot so multi-dot names (`a.test.ts`) keep
+    // `.ts` as the extension. Leading-dot dotfiles (`.env`) have an
+    // empty stem → treat the whole thing as the stem (no extension).
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name.as_ref(), ""),
+    };
+    let mut n = 2;
+    loop {
+        let candidate = dir.join(format!("{stem} ({n}){ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Recursively copy `src` directory to `dst` (which must not yet
+/// exist — `unique_dest` guarantees that). Mirrors files and nested
+/// directories; symlinks are followed via `fs::copy`'s semantics.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let child_src = entry.path();
+        let child_dst = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&child_src, &child_dst)?;
+        } else {
+            fs::copy(&child_src, &child_dst)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,5 +789,130 @@ mod tests {
         // valid UTF-8 (it's just U+0000). So this should succeed.
         let s = decode_text(&bytes).unwrap();
         assert!(s.starts_with("aaaa"));
+    }
+
+    #[test]
+    fn unique_dest_suffixes_before_extension_on_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // Free name → used verbatim.
+        assert_eq!(
+            unique_dest(d, std::ffi::OsStr::new("a.txt")),
+            d.join("a.txt")
+        );
+        // Collision → ` (2)` before the extension; multi-dot keeps only
+        // the last segment as the extension.
+        fs::write(d.join("a.txt"), b"x").unwrap();
+        assert_eq!(
+            unique_dest(d, std::ffi::OsStr::new("a.txt")),
+            d.join("a (2).txt")
+        );
+        // Extensionless and dotfiles get a trailing ` (2)`.
+        fs::write(d.join("README"), b"x").unwrap();
+        assert_eq!(
+            unique_dest(d, std::ffi::OsStr::new("README")),
+            d.join("README (2)")
+        );
+        fs::write(d.join(".env"), b"x").unwrap();
+        assert_eq!(
+            unique_dest(d, std::ffi::OsStr::new(".env")),
+            d.join(".env (2)")
+        );
+    }
+
+    #[test]
+    fn fs_rename_moves_and_refuses_to_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("old.txt");
+        let to = dir.path().join("new.txt");
+        fs::write(&from, b"hello").unwrap();
+
+        let out = fs_rename(
+            from.to_string_lossy().into_owned(),
+            to.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        assert_eq!(out, to.to_string_lossy());
+        assert!(!from.exists());
+        assert_eq!(fs::read_to_string(&to).unwrap(), "hello");
+
+        // A no-op rename (same path) succeeds without error.
+        assert!(fs_rename(
+            to.to_string_lossy().into_owned(),
+            to.to_string_lossy().into_owned()
+        )
+        .is_ok());
+
+        // Refuse to overwrite an existing sibling.
+        let other = dir.path().join("taken.txt");
+        fs::write(&other, b"keep").unwrap();
+        let err = fs_rename(
+            to.to_string_lossy().into_owned(),
+            other.to_string_lossy().into_owned(),
+        )
+        .unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+        assert_eq!(fs::read_to_string(&other).unwrap(), "keep");
+    }
+
+    #[test]
+    fn fs_delete_removes_files_and_dirs_and_tolerates_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // File deletion.
+        let f = dir.path().join("gone.txt");
+        fs::write(&f, b"x").unwrap();
+        fs_delete(f.to_string_lossy().into_owned()).unwrap();
+        assert!(!f.exists());
+        // Recursive directory deletion.
+        let sub = dir.path().join("pkg");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("a.txt"), b"x").unwrap();
+        fs_delete(sub.to_string_lossy().into_owned()).unwrap();
+        assert!(!sub.exists());
+        // Already-missing path is a no-op success (tree just refreshes).
+        assert!(fs_delete(f.to_string_lossy().into_owned()).is_ok());
+    }
+
+    #[test]
+    fn fs_import_paths_copies_files_and_dirs_without_clobbering() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dest_dir = tempfile::tempdir().unwrap();
+
+        // A loose file and a nested directory to import.
+        let file = src_dir.path().join("note.txt");
+        fs::write(&file, b"data").unwrap();
+        let folder = src_dir.path().join("pkg");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("inner.txt"), b"nested").unwrap();
+
+        let created = fs_import_paths(
+            vec![
+                file.to_string_lossy().into_owned(),
+                folder.to_string_lossy().into_owned(),
+            ],
+            dest_dir.path().to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        assert_eq!(created.len(), 2);
+        // Source untouched (copy, not move).
+        assert!(file.exists());
+        assert!(dest_dir.path().join("note.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("pkg/inner.txt")).unwrap(),
+            "nested"
+        );
+
+        // Re-importing the same file lands a ` (2)` copy, not a clobber.
+        let created2 = fs_import_paths(
+            vec![file.to_string_lossy().into_owned()],
+            dest_dir.path().to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        assert_eq!(created2.len(), 1);
+        assert!(dest_dir.path().join("note (2).txt").exists());
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("note.txt")).unwrap(),
+            "data"
+        );
     }
 }

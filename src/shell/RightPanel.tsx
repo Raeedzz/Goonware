@@ -358,6 +358,7 @@ function hoverableIcon(active: boolean): CSSProperties {
 
 export function FilesView({ worktree }: { worktree: Worktree }) {
   const dispatch = useAppDispatch();
+  const state = useAppState();
 
   const onOpen = (path: string) => {
     const id = `t_${Date.now().toString(36)}`;
@@ -378,6 +379,43 @@ export function FilesView({ worktree }: { worktree: Worktree }) {
     });
   };
 
+  // After a rename in the tree, follow any open editor/diff tab that
+  // pointed at the moved path — or at anything under a renamed folder —
+  // so the tab keeps showing the same file instead of going stale.
+  const onRenamed = (from: string, to: string) => {
+    const tabs = state.tabs ?? {};
+    for (const tab of Object.values(tabs)) {
+      const fp = (tab as { filePath?: unknown }).filePath;
+      if (typeof fp !== "string") continue;
+      const isExact = fp === from;
+      const isUnder = fp.startsWith(from + "/");
+      if (!isExact && !isUnder) continue;
+      const next = isExact ? to : to + fp.slice(from.length);
+      dispatch({
+        type: "update-tab",
+        id: tab.id,
+        patch: {
+          filePath: next,
+          title: next.split("/").pop() ?? next,
+          summary: relPath(next, worktree.path),
+        },
+      });
+    }
+  };
+
+  // After a delete, close any open tab for the removed path (or for a
+  // file under a removed folder) — its backing file is gone.
+  const onDeleted = (path: string) => {
+    const tabs = state.tabs ?? {};
+    for (const tab of Object.values(tabs)) {
+      const fp = (tab as { filePath?: unknown }).filePath;
+      if (typeof fp !== "string") continue;
+      if (fp === path || fp.startsWith(path + "/")) {
+        dispatch({ type: "close-tab", id: tab.id });
+      }
+    }
+  };
+
   // FileTree is the direct child of the PaneSlot flex column — its
   // outer element carries the `flex:1 + minHeight:0 + overflowY:auto`
   // contract that makes the right-panel file list scrollable. An
@@ -385,8 +423,17 @@ export function FilesView({ worktree }: { worktree: Worktree }) {
   // `flex:0 1 auto` sized the wrapper to content, so FileTree's `flex:1`
   // had no flex parent to claim and the list overflowed silently into
   // the PaneSlot's `overflow:hidden`). Pinned by `paneSlotLayout.test.ts`
-  // and `filesViewScroll.test.tsx`.
-  return <FileTree root={worktree.path} onOpenFile={onOpen} />;
+  // and `filesViewScroll.test.tsx`. FileTree itself renders a fragment
+  // (tree + portaled context menu); the scroll container is its first
+  // child, so the contract still holds.
+  return (
+    <FileTree
+      root={worktree.path}
+      onOpenFile={onOpen}
+      onRenamed={onRenamed}
+      onDeleted={onDeleted}
+    />
+  );
 }
 
 function relPath(abs: string, root: string): string {
