@@ -59,6 +59,8 @@ export {
   ArrowsClockwiseIcon as IconRefresh,
   ArrowClockwiseIcon as IconReload,
   PencilSimpleIcon as IconEdit,
+  CopyIcon as IconCopy,
+  TrashIcon as IconTrash,
   ArrowCounterClockwiseIcon as IconRevert,
   CheckIcon as IconCheck,
   StopCircleIcon as IconStop,

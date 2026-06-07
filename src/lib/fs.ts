@@ -13,6 +13,26 @@ export const fs = {
   writeTextFile: (path: string, content: string) =>
     invoke<void>("fs_write_text_file", { path, content }),
   /**
+   * Rename / move a path. `to` is the full destination (parent + new
+   * basename). Powers the file tree's right-click → Rename. Resolves
+   * to the new path; rejects (without clobbering) if `to` exists.
+   */
+  rename: (from: string, to: string) =>
+    invoke<string>("fs_rename", { from, to }),
+  /**
+   * Permanently delete a file or directory (recursive for dirs).
+   * Powers the file tree's right-click → Delete; callers gate it behind
+   * a confirm because it's irreversible.
+   */
+  delete: (path: string) => invoke<void>("fs_delete", { path }),
+  /**
+   * Copy external paths (dropped from Finder) into `destDir`. Returns
+   * the created destination paths. Collisions get a ` (n)` suffix
+   * rather than overwriting. Directories are copied recursively.
+   */
+  importPaths: (paths: string[], destDir: string) =>
+    invoke<string[]>("fs_import_paths", { paths, destDir }),
+  /**
    * Best-effort scan for a project's own app icon — favicon, Tauri app
    * icon, Next.js icon, etc. — returned as a `data:` URI ready to drop
    * into `<img src>`. Resolves to `null` when nothing matched. The

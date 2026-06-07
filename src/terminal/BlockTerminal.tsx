@@ -10,6 +10,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { joinShellPaths } from "@/lib/shellQuote";
+import { toLogicalDragPoint } from "@/lib/dragPoint";
 import { BlockList } from "./BlockList";
 import { LiveBlock } from "./LiveBlock";
 import { PromptInput, type PromptInputHandle } from "./PromptInput";
@@ -1006,17 +1007,23 @@ export function BlockTerminal({
     const el = agentMode ? containerRef.current : scrollContainerRef.current;
     if (!el || !nativeActive) return;
 
-    // Agent alt-screen (the claude/codex TUI): a left-drag SCROLLS the agent's
-    // pager instead of selecting. The surface is keyboard-driven and warpui
+    // Non-agent alt-screen (vim / htop / less): a left-drag SCROLLS the app's
+    // pager instead of selecting. These surfaces are keyboard-driven and warpui
     // selection just clamps to the visible grid there, so grab-to-scroll is the
     // gesture that actually pays off — press and pull DOWN to drag older output
     // into view, like a touch surface. Drag travel is translated into the same
-    // mouse-wheel encoding the wheel bridge emits (term_native_wheel), so claude
+    // mouse-wheel encoding the wheel bridge emits (term_native_wheel), so the app
     // scrolls identically whether you flick the trackpad or grab and pull. A
     // press with no travel falls through as a click so cmd+click links still
-    // open. Shell mode (and the inline, non-alt-screen agent) keep left-drag =
-    // text selection, handled by the original path below.
-    const dragScrolls = altScreen;
+    // open.
+    //
+    // Agents (claude/codex) are the exception: even when they take the alt
+    // screen, a left-drag SELECTS (Warp-style), so you can highlight and Cmd+C
+    // their output mid-run. The selection clamps to the visible grid — the agent
+    // still owns its scroll-back — and scrolling stays on the wheel/trackpad
+    // (the alt-screen wheel bridge above). Shell mode and the inline,
+    // non-alt-screen agent keep left-drag = text selection via the path below.
+    const dragScrolls = altScreen && !foregroundIsAgent;
     const DRAG_THRESHOLD = 6; // px before a press commits to a scroll-drag
     const DRAG_LINE_PX = 16; // px of drag travel per scrolled line (matches wheel)
     const CELL_W = 13 * 0.6;
@@ -1191,7 +1198,7 @@ export function BlockTerminal({
       window.removeEventListener("mouseup", onUp, true);
       if (autoRaf) cancelAnimationFrame(autoRaf);
     };
-  }, [nativeActive, agentMode, altScreen, paneKey, ptyId]);
+  }, [nativeActive, agentMode, altScreen, foregroundIsAgent, paneKey, ptyId]);
 
   // Cmd+C copies the native selection (kept by warpui's SelectableArea, exposed
   // via term_native_selection_text) through the existing pbcopy path. Capture-
@@ -1973,14 +1980,18 @@ export function BlockTerminal({
         if (!container) return;
         const rect = container.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) return;
-        // Tauri's drag-drop event reports `position` in PHYSICAL pixels
-        // while `getBoundingClientRect()` returns CSS (logical) pixels.
-        // On a Retina display the physical coords are ~2× larger, so
-        // without this scale-down a drop on the lower-right pane of a
-        // split layout would match the *upper-left* terminal's rect.
-        const dpr = window.devicePixelRatio || 1;
-        const x = event.payload.position.x / dpr;
-        const y = event.payload.position.y / dpr;
+        // `position` must be normalized to CSS pixels before comparing
+        // against `getBoundingClientRect()`. On macOS Tauri reports it
+        // in logical points (NOT physical pixels, despite the type), so
+        // a naive `/ devicePixelRatio` halved the coords on Retina —
+        // which made this terminal grab drops meant for the right-hand
+        // file tree. `toLogicalDragPoint` only scales when the values
+        // actually overshoot the viewport. Shared with FileTree so the
+        // two panes hit-test in the same space and never both match.
+        const { x, y } = toLogicalDragPoint(
+          event.payload.position.x,
+          event.payload.position.y,
+        );
         const inside =
           x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
         if (event.payload.type === "enter" || event.payload.type === "over") {
