@@ -27,8 +27,18 @@ export async function openProjectDialog(
     return null;
   }
   if (typeof selected !== "string") return null;
+  return addProjectAtPath(dispatch, selected);
+}
 
-  const path = selected;
+/**
+ * Register an existing folder as a project. Shared by the folder
+ * picker above and the clone flow (which already knows the path of
+ * the repo it just created). Returns the new project's id.
+ */
+export function addProjectAtPath(
+  dispatch: Dispatch<AppAction>,
+  path: string,
+): string {
   const name = path.split("/").filter(Boolean).pop() ?? path;
   const glyph = name.charAt(0).toUpperCase();
   const id = `p_${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}_${Date.now().toString(36)}`;

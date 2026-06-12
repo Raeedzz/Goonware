@@ -225,6 +225,12 @@ pub fn run() {
             git::git_worktree_add,
             git::git_worktree_remove,
             git::git_log,
+            git::git_log_graph,
+            git::git_commit_detail,
+            git::git_commit_diff,
+            git::git_fetch,
+            git::git_pull,
+            git::git_clone,
             // Worktree lifecycle (v2 UI rewrite)
             worktree::worktree_list,
             worktree::worktree_create,

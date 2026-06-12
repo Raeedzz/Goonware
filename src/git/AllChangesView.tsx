@@ -183,7 +183,7 @@ export function AllChangesView({ projectPath }: { projectPath: string }) {
   );
 }
 
-interface FileSection {
+export interface FileSection {
   path: string;
   lines: DiffLine[];
   added: number;
@@ -200,7 +200,7 @@ function FileSections({ sections }: { sections: FileSection[] }) {
   );
 }
 
-function FileBlock({ section }: { section: FileSection }) {
+export function FileBlock({ section }: { section: FileSection }) {
   const [collapsed, setCollapsed] = useState(false);
   const filename = section.path.split("/").pop() ?? section.path;
   const dirname = section.path.includes("/")
@@ -327,7 +327,7 @@ function Empty({ label }: { label: string }) {
  * --git a/<x> b/<x>` is the canonical file boundary; the `b/` path is
  * authoritative for renames (a/ is the old name).
  */
-function sliceByFile(raw: string): FileSection[] {
+export function sliceByFile(raw: string): FileSection[] {
   const out: FileSection[] = [];
   const lines = raw.split("\n");
   let bufStart = -1;

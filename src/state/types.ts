@@ -322,12 +322,24 @@ export interface AllChangesTab extends TabBase {
   kind: "all-changes";
 }
 
+/**
+ * Tab variant showing one commit from the history graph: metadata
+ * (author, sha, parents, refs, message) plus the full diff the commit
+ * introduced. Opened by clicking a row in the right panel's History
+ * section. Only the hash is stored — the view loads everything live.
+ */
+export interface CommitTab extends TabBase {
+  kind: "commit";
+  hash: string;
+}
+
 export type Tab =
   | TerminalTab
   | DiffTab
   | MarkdownTab
   | ProjectSettingsTab
-  | AllChangesTab;
+  | AllChangesTab
+  | CommitTab;
 
 /**
  * Which page the Settings overlay shows. `general` = global RLI

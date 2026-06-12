@@ -25,6 +25,7 @@ import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
 import { DiffView } from "@/git/DiffView";
 import { AllChangesView } from "@/git/AllChangesView";
+import { CommitDetailView } from "@/git/CommitDetailView";
 import { Editor } from "@/editor/Editor";
 import { MarkdownView } from "@/editor/MarkdownView";
 import { fs } from "@/lib/fs";
@@ -489,6 +490,9 @@ function fullTabSummary(tab: Tab): string | null {
   if (tab.kind === "all-changes") {
     return trim(tab.title) || "All changes";
   }
+  if (tab.kind === "commit") {
+    return trim(tab.title) || trim(tab.hash) || "Commit";
+  }
   return null;
 }
 
@@ -609,6 +613,10 @@ function tabLabel(tab: Tab): string {
   }
   if (tab.kind === "all-changes") {
     return tab.title || "Changes";
+  }
+  if (tab.kind === "commit") {
+    // Subject line on top; the short sha rides the summary line below.
+    return tab.title || tab.hash.slice(0, 7);
   }
   // diff / markdown — show the filename basename, unless the basename
   // is a generic per-directory file (SKILL.md, README.md) — in that
@@ -761,6 +769,13 @@ function TabContent({
               />
             ) : tab.kind === "all-changes" ? (
               <AllChangesView key={tab.id} projectPath={cwd} />
+            ) : tab.kind === "commit" ? (
+              <CommitDetailView
+                key={tab.id}
+                cwd={cwd}
+                hash={tab.hash}
+                worktreeId={tab.worktreeId}
+              />
             ) : tab.kind === "project-settings" ? (
               <RepositorySettingsView
                 key={tab.id}
