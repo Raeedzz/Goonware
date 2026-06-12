@@ -19,6 +19,16 @@
   opacity: 1;
 }
 
+/* Hide the prompt textarea's scrollbar. When the input grows past its
+   max height it scrolls internally, but a visible scrollbar (the global
+   5px *::-webkit-scrollbar in design/tokens.css) would eat content width
+   and make the textarea wrap a column earlier than its gutter-less
+   syntax-highlight overlay — desyncing the caret from the colored text
+   on tall input. Hiding it keeps both layers exactly the same width.
+   Scrolling still works via wheel/trackpad/keyboard. */
+.goonware-prompt-input { scrollbar-width: none; }
+.goonware-prompt-input::-webkit-scrollbar { width: 0; height: 0; }
+
 /* ------------------------------------------------------------------
    Clickable affordance (single source of truth)
    ------------------------------------------------------------------
