@@ -322,12 +322,24 @@ export interface AllChangesTab extends TabBase {
   kind: "all-changes";
 }
 
+/**
+ * Tab variant showing one commit from the history graph: metadata
+ * (author, sha, parents, refs, message) plus the full diff the commit
+ * introduced. Opened by clicking a row in the right panel's History
+ * section. Only the hash is stored — the view loads everything live.
+ */
+export interface CommitTab extends TabBase {
+  kind: "commit";
+  hash: string;
+}
+
 export type Tab =
   | TerminalTab
   | DiffTab
   | MarkdownTab
   | ProjectSettingsTab
-  | AllChangesTab;
+  | AllChangesTab
+  | CommitTab;
 
 /**
  * Which page the Settings overlay shows. `general` = global RLI
@@ -579,6 +591,14 @@ export type AppAction =
   | { type: "add-worktree"; worktree: Worktree }
   | { type: "update-worktree"; id: WorktreeId; patch: Partial<Worktree> }
   | { type: "set-active-worktree"; projectId: ProjectId; worktreeId: WorktreeId }
+  /** Drag-reorder a worktree relative to a sibling row. Both must
+      belong to the same project — cross-repo moves are rejected. */
+  | {
+      type: "reorder-worktree";
+      id: WorktreeId;
+      targetId: WorktreeId;
+      edge: "above" | "below";
+    }
   | { type: "archive-worktree"; id: WorktreeId; record: ArchiveRecord }
   | { type: "restore-worktree"; archiveId: ArchiveId; worktree: Worktree }
   | { type: "set-right-panel"; worktreeId: WorktreeId; panel: RightPanelTab }

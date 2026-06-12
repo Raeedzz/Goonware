@@ -164,17 +164,9 @@ function evictStaleForCwd(
 async function bootstrap() {
   if (bootstrapped) return;
   bootstrapped = true;
-  // Initial snapshot in case the user starts Goonware while an agent
-  // session is already mid-turn — the hook events for that turn
-  // have already fired and we'd otherwise have nothing in the map
-  // until the next event.
-  try {
-    const initial = await invoke<SessionRecord[]>("agent_sessions");
-    for (const rec of initial) sessions.set(sessionKey(rec), rec);
-    if (initial.length) notifyAll();
-  } catch {
-    // Backend not ready — the listener below will catch up.
-  }
+  // Listener FIRST, then snapshot — the other order drops any event
+  // fired in the gap between the two awaits (e.g. a working→idle flip
+  // during startup leaves a spinner stuck on until the next event).
   try {
     unlistenFn = await listen<SessionRecord>(
       "agent://session/state",
@@ -185,6 +177,24 @@ async function bootstrap() {
     // works without spinners. Surface via console for diagnosis.
     // eslint-disable-next-line no-console
     console.warn("goonware agent hook listener bind failed");
+  }
+  // Initial snapshot in case the user starts Goonware while an agent
+  // session is already mid-turn — the hook events for that turn
+  // have already fired and we'd otherwise have nothing in the map
+  // until the next event. Live events that beat the snapshot win:
+  // a session already in the map is newer than the snapshot row.
+  try {
+    const initial = await invoke<SessionRecord[]>("agent_sessions");
+    let added = false;
+    for (const rec of initial) {
+      const k = sessionKey(rec);
+      if (sessions.has(k)) continue;
+      sessions.set(k, rec);
+      added = true;
+    }
+    if (added) notifyAll();
+  } catch {
+    // Backend not ready — the listener above will catch up.
   }
 }
 

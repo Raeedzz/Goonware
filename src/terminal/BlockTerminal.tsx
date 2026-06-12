@@ -963,6 +963,12 @@ export function BlockTerminal({
       invoke("term_native_wheel", { id: ptyId, deltaLines: lines, col, row }).catch(
         () => {},
       );
+      // Keep any native selection glued to its text: the app repaints its grid
+      // in place when it scrolls, so shift the stored selection anchors by the
+      // distance the content moved. No-op when nothing is selected.
+      invoke("term_native_selection_scrolled", { paneKey, deltaLines: lines }).catch(
+        () => {},
+      );
       // Drain a fast flick across subsequent frames (momentum) rather than one
       // big jump — smooth deceleration.
       if (Math.abs(accumPx) >= LINE_PX) raf = requestAnimationFrame(flush);
@@ -985,7 +991,7 @@ export function BlockTerminal({
       el.removeEventListener("wheel", onWheel);
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [nativeActive, altScreen, ptyId]);
+  }, [nativeActive, altScreen, ptyId, paneKey]);
 
   // Selection mouse bridge. Same situation as the wheel bridge: the native
   // surface renders through a transparent hole and ignores mouse events, so
@@ -1078,6 +1084,7 @@ export function BlockTerminal({
     // like Warp / a native text view. Speed ramps with how deep into the zone the
     // pointer is.
     const EDGE = 40;
+    let wheelAccumPx = 0; // sub-line drag travel carried between alt-screen ticks
     const tick = () => {
       autoRaf = 0;
       if (!dragging) return;
@@ -1094,7 +1101,29 @@ export function BlockTerminal({
         edgeY = r.bottom - 1;
       }
       if (delta === 0) return; // back inside the safe zone — stop the loop
-      invoke("term_native_scroll", { paneKey, deltaPx: delta }).catch(() => {});
+      if (altScreen) {
+        // Alt-screen AGENT (claude/codex on the alt screen): the app owns its
+        // scroll-back, so page it with the same wheel encoding the wheel
+        // bridge uses, then shift the native selection anchors by the distance
+        // the content moved (term_native_selection_scrolled) so the highlight
+        // stays glued to the text it was started on instead of whatever
+        // scrolled under it. Whole lines only; the px remainder carries.
+        wheelAccumPx += delta;
+        const lines = Math.trunc(wheelAccumPx / DRAG_LINE_PX);
+        if (lines !== 0) {
+          wheelAccumPx -= lines * DRAG_LINE_PX;
+          const col = Math.max(1, Math.floor((lastX - r.left) / CELL_W) + 1);
+          const row = Math.max(1, Math.floor((edgeY - r.top) / CELL_H) + 1);
+          invoke("term_native_wheel", { id: ptyId, deltaLines: lines, col, row }).catch(
+            () => {},
+          );
+          invoke("term_native_selection_scrolled", { paneKey, deltaLines: lines }).catch(
+            () => {},
+          );
+        }
+      } else {
+        invoke("term_native_scroll", { paneKey, deltaPx: delta }).catch(() => {});
+      }
       // Re-extend the selection to the edge after the scroll lands.
       sendAt("drag", lastX, edgeY);
       autoRaf = requestAnimationFrame(tick);
@@ -1102,11 +1131,12 @@ export function BlockTerminal({
     const maybeAutoscroll = () => {
       if (autoRaf) return; // already looping
       // Edge autoscroll drives the native transcript (term_native_scroll), which
-      // now carries the inline agent's scroll-back too — so a drag-select can
-      // reveal older conversation while dragging past the top, same as the shell.
-      // Only alt-screen apps own their own scroll with no transcript to reveal,
-      // so skip there — the selection just clamps to the visible grid.
-      if (altScreen) return;
+      // carries the inline agent's scroll-back too — so a drag-select can reveal
+      // older conversation while dragging past the top, same as the shell. An
+      // alt-screen AGENT is paged through its own scroll-back via the wheel
+      // bridge (see tick). Only the non-agent alt-screen path (vim/htop/less)
+      // skips: there left-drag IS the scroll gesture and no selection runs.
+      if (dragScrolls) return;
       const r = el.getBoundingClientRect();
       if (lastY < r.top + EDGE || lastY > r.bottom - EDGE)
         autoRaf = requestAnimationFrame(tick);
@@ -1186,6 +1216,7 @@ export function BlockTerminal({
       } else {
         lastX = e.clientX;
         lastY = e.clientY;
+        wheelAccumPx = 0;
         send("down", e);
       }
       window.addEventListener("mousemove", onMove, true);

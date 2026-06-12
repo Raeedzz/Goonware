@@ -39,6 +39,36 @@ export interface BranchEntry {
   current: boolean;
 }
 
+export interface CommitRef {
+  name: string;
+  kind: "head" | "branch" | "remote" | "tag";
+}
+
+export interface GraphCommit {
+  hash: string;
+  short: string;
+  parents: string[];
+  refs: CommitRef[];
+  author: string;
+  email: string;
+  /** Unix seconds. */
+  timestamp: number;
+  subject: string;
+}
+
+export interface CommitDetail {
+  hash: string;
+  short: string;
+  parents: string[];
+  refs: CommitRef[];
+  author: string;
+  email: string;
+  date: string;
+  relative_time: string;
+  subject: string;
+  body: string;
+}
+
 export const git = {
   status: (cwd: string) => invoke<StatusResult>("git_status", { cwd }),
   diff: (cwd: string, path?: string, staged = false, fullFile = false) =>
@@ -70,6 +100,16 @@ export const git = {
     invoke<void>("git_worktree_remove", { cwd, path, force }),
   log: (cwd: string, n?: number) =>
     invoke<LogEntry[]>("git_log", { cwd, n }),
+  logGraph: (cwd: string, n?: number) =>
+    invoke<GraphCommit[]>("git_log_graph", { cwd, n }),
+  commitDetail: (cwd: string, hash: string) =>
+    invoke<CommitDetail>("git_commit_detail", { cwd, hash }),
+  commitDiff: (cwd: string, hash: string) =>
+    invoke<string>("git_commit_diff", { cwd, hash }),
+  fetch: (cwd: string) => invoke<string>("git_fetch", { cwd }),
+  pull: (cwd: string) => invoke<string>("git_pull", { cwd }),
+  clone: (url: string, destDir: string) =>
+    invoke<string>("git_clone", { url, destDir }),
   /**
    * Generate a commit message via the helper-agent layer. Reads the
    * staged diff, truncates, and shells out to whichever CLI the

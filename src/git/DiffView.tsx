@@ -54,10 +54,18 @@ export function DiffView({ projectPath, filePath, staged, onClose }: Props) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onClose();
-      }
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      // Escape aimed at a dialog, menu, or text field belongs to that
+      // surface — only a "bare" Escape closes the diff.
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.isContentEditable ||
+          t.closest("input, textarea, [role=dialog], [role=menu]"))
+      )
+        return;
+      e.preventDefault();
+      onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

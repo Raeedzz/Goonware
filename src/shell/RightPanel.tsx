@@ -23,6 +23,7 @@ import {
 import { fs } from "@/lib/fs";
 import { git, type StatusEntry } from "@/lib/git";
 import { FileTree } from "@/files/FileTree";
+import { HistoryView } from "@/git/HistoryView";
 import { paneSlotStyle } from "./paneSlotLayout";
 import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
@@ -159,6 +160,8 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
             worktree={worktree}
             entries={status.entries}
             ahead={status.ahead}
+            behind={status.behind}
+            branch={status.branch}
             error={status.error}
             refresh={status.refresh}
           />
@@ -464,8 +467,36 @@ function relPath(abs: string, root: string): string {
 interface WorktreeStatusState {
   entries: StatusEntry[];
   ahead: number;
+  behind: number;
+  branch: string | null;
   error: string | null;
   refresh: () => Promise<void>;
+}
+
+/** Last successful status per worktree — lets a worktree switch paint
+    the previous result instantly while the fresh poll runs. Module-
+    level so it survives pane/panel remounts; entries are tiny. */
+const statusCache = new Map<
+  string,
+  {
+    entries: StatusEntry[];
+    ahead: number;
+    behind: number;
+    branch: string | null;
+  }
+>();
+
+function sameStatusEntries(a: StatusEntry[], b: StatusEntry[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (
+      a[i].path !== b[i].path ||
+      a[i].kind !== b[i].kind ||
+      a[i].staged !== b[i].staged
+    )
+      return false;
+  }
+  return true;
 }
 
 function useWorktreeStatus(
@@ -476,6 +507,8 @@ function useWorktreeStatus(
   const dispatch = useAppDispatch();
   const [entries, setEntries] = useState<StatusEntry[]>([]);
   const [ahead, setAhead] = useState<number>(0);
+  const [behind, setBehind] = useState<number>(0);
+  const [branch, setBranch] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Stable refresh fn — the dependent effect re-creates it on
@@ -495,8 +528,22 @@ function useWorktreeStatus(
       // switch in flight) — the next effect will fire a fresh poll
       // against the new path.
       if (path !== pathRef.current) return;
-      setEntries(result.entries);
+      statusCache.set(worktreeId, {
+        entries: result.entries,
+        ahead: result.ahead,
+        behind: result.behind,
+        branch: result.branch,
+      });
+      // Keep the previous array identity when the entries are
+      // equivalent — the 4s poll usually returns the same status, and
+      // a fresh identity would re-render ChangesView's file rows for
+      // nothing.
+      setEntries((prev) =>
+        sameStatusEntries(prev, result.entries) ? prev : result.entries,
+      );
       setAhead(result.ahead);
+      setBehind(result.behind);
+      setBranch(result.branch);
       setError(null);
       dispatch({
         type: "set-change-count",
@@ -513,6 +560,8 @@ function useWorktreeStatus(
     if (skip) {
       setEntries([]);
       setAhead(0);
+      setBehind(0);
+      setBranch(null);
       setError(null);
       return;
     }
@@ -521,10 +570,15 @@ function useWorktreeStatus(
       if (cancelled) return;
       await refresh();
     };
-    // Blank stale state on worktree change so the user never sees
-    // the previous worktree's entries for a frame.
-    setEntries([]);
-    setAhead(0);
+    // Seed from the last-known status for this worktree so a switch
+    // paints real data immediately (refreshed in the background by
+    // the tick below) instead of flashing an empty pane. Worktrees
+    // we've never polled start blank as before.
+    const cached = statusCache.get(worktreeId);
+    setEntries(cached?.entries ?? []);
+    setAhead(cached?.ahead ?? 0);
+    setBehind(cached?.behind ?? 0);
+    setBranch(cached?.branch ?? null);
     setError(null);
     void tick();
     const t = window.setInterval(() => void tick(), 4000);
@@ -542,7 +596,7 @@ function useWorktreeStatus(
     };
   }, [worktreeId, worktreePath, refresh, skip]);
 
-  return { entries, ahead, error, refresh };
+  return { entries, ahead, behind, branch, error, refresh };
 }
 
 /* ------------------------------------------------------------------
@@ -553,12 +607,16 @@ function ChangesView({
   worktree,
   entries,
   ahead,
+  behind,
+  branch,
   error,
   refresh,
 }: {
   worktree: Worktree;
   entries: StatusEntry[];
   ahead: number;
+  behind: number;
+  branch: string | null;
   error: string | null;
   refresh: () => Promise<void>;
 }) {
@@ -786,25 +844,37 @@ function ChangesView({
   return (
     <div
       style={{
-        display: "grid",
-        gridTemplateRows: "auto 1fr",
+        display: "flex",
+        flexDirection: "column",
         height: "100%",
         minHeight: 0,
       }}
     >
-      <CommitComposer
-        message={message}
-        onChange={setMessage}
-        onDraft={draftMessage}
-        onCommit={commit}
-        onPush={push}
-        onCommitPush={commitPush}
-        busy={busy}
-        stagedCount={stagedCount}
-        ahead={ahead}
-      />
+      <div style={{ flexShrink: 0 }}>
+        <CommitComposer
+          message={message}
+          onChange={setMessage}
+          onDraft={draftMessage}
+          onCommit={commit}
+          onPush={push}
+          onCommitPush={commitPush}
+          busy={busy}
+          stagedCount={stagedCount}
+          ahead={ahead}
+        />
+      </div>
 
-      <div style={{ minHeight: 0, overflow: "auto" }}>
+      {/* Changed-files list sizes to content up to ~40% of the pane,
+          then scrolls — the History graph below keeps the remainder.
+          Before the graph existed this region simply took everything. */}
+      <div
+        style={{
+          flex: "0 1 auto",
+          maxHeight: "40%",
+          minHeight: 0,
+          overflow: "auto",
+        }}
+      >
         {entries.length === 0 ? (
           <div
             style={{
@@ -867,6 +937,10 @@ function ChangesView({
             )}
           </>
         )}
+      </div>
+
+      <div style={{ flex: "1 1 0", minHeight: 0 }}>
+        <HistoryView worktree={worktree} branch={branch} behind={behind} />
       </div>
     </div>
   );

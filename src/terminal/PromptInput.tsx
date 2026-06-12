@@ -3,6 +3,7 @@ import {
   memo,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   type ClipboardEvent,
@@ -83,6 +84,61 @@ const COMPLETION_LIMIT = 8;
  * agent's visible canvas.
  */
 const MAX_INPUT_HEIGHT_PX = 236;
+
+/**
+ * Floor height for the auto-growing textarea — one line of text at the
+ * editor's metrics (fontSize 13 × lineHeight 1.5 ≈ 19.5 px, rounded up).
+ * The box never collapses below a single comfortable row even when
+ * empty, and grows from here up to {@link MAX_INPUT_HEIGHT_PX}.
+ */
+const MIN_INPUT_HEIGHT_PX = 20;
+
+/**
+ * The ONE place the editor's text-layout metrics are defined. Both the
+ * interactive <textarea> and the syntax-highlight <pre> overlay spread
+ * this so their glyph advances, wrapping, and line boxes are
+ * bit-for-bit identical. Any divergence here desyncs the caret (which
+ * lives in the textarea) from the colored tokens (which live in the
+ * overlay) — the user-reported "cursor isn't on the right row" and
+ * "spacing looks off" bugs.
+ *
+ * Two settings are load-bearing and easy to get wrong:
+ *
+ *   • `fontVariantLigatures: "none"` (+ the `liga`/`calt` feature
+ *     disables). The bundled `--font-mono` is JetBrains Mono, which
+ *     ships programming ligatures: `->`, `=>`, `!=`, `>=`, `===`, …
+ *     collapse into a single glyph by default. A bare <textarea>
+ *     inherits the UA default (`normal` → ligatures ON); the overlay
+ *     previously forced them OFF. The width mismatch on every ligature
+ *     sequence walked the caret off its token. Both layers now force
+ *     them OFF so every glyph is exactly one cell wide.
+ *
+ *   • `tabSize`. A literal Tab pasted into the box must occupy the same
+ *     advance in both layers or all following text — and the caret —
+ *     shears. Pinned identically here.
+ *
+ * Wrapping is `pre-wrap` + `overflow-wrap: break-word` + `word-break:
+ * normal`, which is exactly the <textarea> UA default. The overlay used
+ * to set the non-standard `word-break: break-word` (≈ `overflow-wrap:
+ * anywhere`), which breaks long tokens at a different column than the
+ * textarea — another caret-drift source. They now agree.
+ */
+const EDITOR_TEXT_STYLE: React.CSSProperties = {
+  fontFamily: "var(--font-mono)",
+  fontSize: 13,
+  lineHeight: 1.5,
+  letterSpacing: "normal",
+  fontVariantLigatures: "none",
+  fontFeatureSettings: '"liga" 0, "calt" 0',
+  fontKerning: "none",
+  tabSize: 4,
+  whiteSpace: "pre-wrap",
+  overflowWrap: "break-word",
+  wordBreak: "normal",
+  margin: 0,
+  padding: 0,
+  border: 0,
+};
 
 /* ------------------------------------------------------------------
    Shell tokenizer for the input overlay.
@@ -390,15 +446,6 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
     // float in place while the textarea content scrolled underneath.
     const highlightRef = useRef<HTMLPreElement>(null);
     const [value, setValue] = useState("");
-    // Track the newline count of the last value so the height-resize
-    // path only runs when the line count actually changes. Reading
-    // `scrollHeight` after writing `height = "auto"` forces a
-    // synchronous layout flush — doing it on every keystroke (the
-    // previous behaviour) stalled fast typing by tens of ms per char,
-    // which the user perceives as the terminal "stopping for a sec
-    // and then catching up all at once." Single-line typing now skips
-    // the reflow entirely.
-    const lastNewlineCountRef = useRef(0);
     // Index into history. -1 = composing a new line; 0 = most recent
     // committed entry; N-1 = oldest.
     const [historyCursor, setHistoryCursor] = useState(-1);
@@ -465,15 +512,44 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
       textareaRef.current?.focus();
     }, [autoFocus]);
 
+    // Auto-grow the textarea to fit its content, clamped to
+    // [MIN, MAX]. Keyed on `value` so it runs after EVERY change to the
+    // text — typed, pasted, history-recalled, completion-applied, or
+    // cleared on submit — without each of those paths remembering to
+    // poke `style.height`. A single source of truth replaces the old
+    // newline-count heuristic, which only resized on explicit `\n`
+    // and so never grew for soft-wrapped lines or a pasted blob with
+    // no newlines (the "box doesn't expand" report). useLayoutEffect
+    // (not useEffect) so the measure+resize happens before paint — no
+    // one-frame flash of a too-short box. The scrollHeight read is one
+    // forced reflow per change; since this component is memoized and
+    // `value` only changes on real edits (never on PTY frames), that's
+    // a per-keystroke cost a human can't outrun.
+    useLayoutEffect(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.style.height = "auto";
+      const fit = Math.min(
+        Math.max(ta.scrollHeight, MIN_INPUT_HEIGHT_PX),
+        MAX_INPUT_HEIGHT_PX,
+      );
+      ta.style.height = `${fit}px`;
+      // Re-glue the overlay to the textarea's scroll offset: a
+      // programmatic value change (paste/history/completion) can land
+      // the caret past the fold, and the overlay must track it or the
+      // colored tokens float away from the cursor.
+      const pre = highlightRef.current;
+      if (pre) pre.scrollTop = ta.scrollTop;
+    }, [value]);
+
     const submit = () => {
       const text = value;
       setValue("");
       setCompletions([]);
       setHistoryCursor(-1);
       onSubmit(text);
-      // Reset the textarea height after multi-line input gets cleared.
-      if (textareaRef.current) textareaRef.current.style.height = "auto";
-      lastNewlineCountRef.current = 0;
+      // Height resets to MIN via the auto-grow layout effect when
+      // `value` becomes "".
     };
 
     /**
@@ -800,9 +876,7 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
             setCompletions([]);
             setHistoryCursor(-1);
             onSubmit(completed);
-            if (textareaRef.current) {
-              textareaRef.current.style.height = "auto";
-            }
+            // Height resets via the auto-grow layout effect on clear.
           }
           return;
         }
@@ -1051,27 +1125,11 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
               if (pre) pre.scrollTop = e.currentTarget.scrollTop;
             }}
             onChange={(e) => {
-              const next = e.target.value;
-              setValue(next);
+              setValue(e.target.value);
               if (historyCursor >= 0) setHistoryCursor(-1);
-              // Auto-grow height for multi-line commands. Only run the
-              // forced-reflow path when the newline count actually
-              // changes — typing on a single line never triggers a
-              // layout flush, which keeps fast typists fluid. Counts
-              // are cheap; reflow is not.
-              let newlineCount = 0;
-              for (let i = 0; i < next.length; i++) {
-                if (next.charCodeAt(i) === 10) newlineCount++;
-              }
-              if (newlineCount !== lastNewlineCountRef.current) {
-                lastNewlineCountRef.current = newlineCount;
-                const ta = e.currentTarget;
-                ta.style.height = "auto";
-                ta.style.height = `${Math.min(
-                  ta.scrollHeight,
-                  MAX_INPUT_HEIGHT_PX,
-                )}px`;
-              }
+              // Height is handled by the auto-grow layout effect keyed
+              // on `value` — it covers typed, pasted, and wrapped text
+              // uniformly, so there's no per-path resize to do here.
             }}
             onPaste={(e: ClipboardEvent<HTMLTextAreaElement>) => {
               // Image paste: macOS Cmd+Shift+Ctrl+4, web-page image copy,
@@ -1116,6 +1174,11 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
             autoCorrect="off"
             autoCapitalize="off"
             style={{
+              // Shared metrics first so the textarea's glyph advances,
+              // wrapping, ligature handling, and tab stops match the
+              // overlay <pre> exactly — the caret can't drift off the
+              // colored tokens.
+              ...EDITOR_TEXT_STYLE,
               // Anti-AI-slop visual: no border, no box, no fill. The
               // input zone is implied by its position between the pill
               // bar above and the hint row below. Text is transparent —
@@ -1126,18 +1189,18 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
               position: "relative",
               zIndex: 1,
               background: "transparent",
-              border: "none",
               outline: "none",
               resize: "none",
               width: "100%",
-              padding: 0,
-              margin: 0,
-              fontFamily: "var(--font-mono)",
-              fontSize: 13,
-              lineHeight: 1.5,
               color: "transparent",
               caretColor: "var(--accent-bright)",
               maxHeight: MAX_INPUT_HEIGHT_PX,
+              // Internal scroll once the box hits MAX. The scrollbar is
+              // hidden via the `.goonware-prompt-input` CSS rule so its
+              // gutter never steals content width — if it did, the
+              // textarea would wrap a column earlier than the
+              // (gutter-less) overlay and the caret would desync on tall
+              // input.
               overflowY: "auto",
             }}
             className="goonware-prompt-input"
@@ -1204,16 +1267,13 @@ function PromptHighlight({
         ref={preRef}
         aria-hidden
         style={{
+          // Same shared metrics as the textarea — see EDITOR_TEXT_STYLE.
+          // This is the half the user actually sees; it must lay out
+          // character-for-character like the (transparent) textarea
+          // above it.
+          ...EDITOR_TEXT_STYLE,
           position: "absolute",
           inset: 0,
-          margin: 0,
-          padding: 0,
-          fontFamily: "var(--font-mono)",
-          fontSize: 13,
-          lineHeight: 1.5,
-          fontVariantLigatures: "none",
-          whiteSpace: "pre-wrap",
-          wordBreak: "break-word",
           pointerEvents: "none",
           userSelect: "none",
           overflow: "hidden",

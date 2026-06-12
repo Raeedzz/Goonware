@@ -27,6 +27,12 @@ pub struct Flex {
     spacing: f32,
     layout_state: Option<LayoutState>,
     constrain_horizontal_bounds_to_parent: bool,
+    /// When false, `get_selection` does NOT synthesize a separator fragment
+    /// (" " for rows, "\n" for columns) between adjacent children's selected
+    /// text. Terminal grid rows need this: their children are contiguous
+    /// styled runs of the SAME line, so the implicit " " corrupted copied
+    /// text with a phantom space at every color/style boundary.
+    selection_separators: bool,
     #[cfg(debug_assertions)]
     container_constructor_location: Option<&'static std::panic::Location<'static>>,
     #[cfg(debug_assertions)]
@@ -94,6 +100,7 @@ impl Flex {
             spacing: 0.0,
             layout_state: None,
             constrain_horizontal_bounds_to_parent: false,
+            selection_separators: true,
             #[cfg(debug_assertions)]
             container_constructor_location: None,
             #[cfg(debug_assertions)]
@@ -158,6 +165,14 @@ impl Flex {
 
     pub fn is_empty(&self) -> bool {
         self.children.is_empty()
+    }
+
+    /// Suppress the synthesized separator (" " / "\n") between children's
+    /// selection fragments. Use when the children are contiguous runs of one
+    /// logical line (e.g. a terminal grid row split into styled spans).
+    pub fn without_selection_separators(mut self) -> Self {
+        self.selection_separators = false;
+        self
     }
 }
 
@@ -570,7 +585,9 @@ impl SelectableElement for Flex {
                 {
                     // If we're adding new selection fragments from a new child in a Flex,
                     // add a separator between the previous child's and this child's selected text.
-                    if let Some(last_fragment) = selection_fragments.last() {
+                    if let Some(last_fragment) =
+                        selection_fragments.last().filter(|_| self.selection_separators)
+                    {
                         let separator = if self.axis == Axis::Vertical {
                             "\n"
                         } else {

@@ -650,6 +650,324 @@ pub async fn git_worktree_remove(
     run(&cwd, &args).await.map(|_| ())
 }
 
+/* ------------------------------------------------------------------
+   History graph — commits across ALL refs (local, remote, tags) so
+   the right-panel git tree can show what teammates pushed to main
+   alongside local work. The frontend computes lane layout; this
+   command just emits structured commits in date order.
+   ------------------------------------------------------------------ */
+
+/// A decorated ref on a commit. `kind` is one of "head" (the local
+/// branch HEAD currently points at), "branch" (other local branch),
+/// "remote" (e.g. origin/main), "tag".
+#[derive(Debug, Serialize, PartialEq)]
+pub struct CommitRef {
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GraphCommit {
+    pub hash: String,
+    pub short: String,
+    pub parents: Vec<String>,
+    pub refs: Vec<CommitRef>,
+    pub author: String,
+    pub email: String,
+    /// Unix seconds — the frontend formats compact absolute times.
+    pub timestamp: i64,
+    pub subject: String,
+}
+
+/// Unit separator — cannot appear in author names / subjects, unlike
+/// tabs. Same trick `%x09` plays in `git_log`, but collision-proof.
+const US: char = '\u{1f}';
+
+#[tauri::command]
+pub async fn git_log_graph(
+    cwd: String,
+    n: Option<u32>,
+) -> Result<Vec<GraphCommit>, String> {
+    let count = n.unwrap_or(200).to_string();
+    let remotes = remote_names(&cwd).await;
+    let raw = run(
+        &cwd,
+        &[
+            "log",
+            // Stash entries are refs too — without the exclude they'd
+            // litter the graph with "WIP on <branch>" merge commits.
+            "--exclude=refs/stash",
+            "--all",
+            // Children before parents, ordered by commit date within
+            // that constraint — the layout the lane algorithm expects
+            // and the order every git GUI's graph reads in.
+            "--date-order",
+            "-n",
+            &count,
+            "--pretty=format:%H%x1f%h%x1f%P%x1f%D%x1f%an%x1f%ae%x1f%at%x1f%s",
+        ],
+    )
+    .await?;
+    Ok(parse_log_graph(&raw, &remotes))
+}
+
+/// Remote names for ref classification. Best-effort — an empty list
+/// just means every decorated ref classifies as a local branch/tag.
+async fn remote_names(cwd: &str) -> Vec<String> {
+    run(cwd, &["remote"])
+        .await
+        .map(|raw| {
+            raw.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_log_graph(raw: &str, remotes: &[String]) -> Vec<GraphCommit> {
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let mut p = line.splitn(8, US);
+            let hash = p.next()?.to_string();
+            let short = p.next()?.to_string();
+            let parents = p
+                .next()?
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            let refs = parse_decorations(p.next()?, remotes);
+            let author = p.next()?.to_string();
+            let email = p.next()?.to_string();
+            let timestamp = p.next()?.trim().parse().ok()?;
+            let subject = p.next().unwrap_or("").to_string();
+            Some(GraphCommit {
+                hash,
+                short,
+                parents,
+                refs,
+                author,
+                email,
+                timestamp,
+                subject,
+            })
+        })
+        .collect()
+}
+
+/// Parse `%D` decorations: `HEAD -> main, origin/main, tag: v1.2`.
+/// Detached `HEAD` (no arrow) is surfaced as a "head" ref named HEAD.
+/// Remote refs are recognized by their first path segment matching a
+/// configured remote — a name test alone can't do it, since local
+/// branches legitimately contain slashes (`feature/auth`).
+fn parse_decorations(raw: &str, remotes: &[String]) -> Vec<CommitRef> {
+    raw.split(", ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|part| {
+            if let Some(branch) = part.strip_prefix("HEAD -> ") {
+                CommitRef {
+                    name: branch.to_string(),
+                    kind: "head".into(),
+                }
+            } else if let Some(tag) = part.strip_prefix("tag: ") {
+                CommitRef {
+                    name: tag.to_string(),
+                    kind: "tag".into(),
+                }
+            } else if part == "HEAD" {
+                CommitRef {
+                    name: "HEAD".into(),
+                    kind: "head".into(),
+                }
+            } else {
+                let is_remote = part
+                    .split_once('/')
+                    .is_some_and(|(first, _)| remotes.iter().any(|r| r == first));
+                CommitRef {
+                    name: part.to_string(),
+                    kind: if is_remote { "remote" } else { "branch" }.into(),
+                }
+            }
+        })
+        .collect()
+}
+
+/* ------------------------------------------------------------------
+   Commit inspection — metadata + diff for the commit-detail tab.
+   ------------------------------------------------------------------ */
+
+#[derive(Debug, Serialize)]
+pub struct CommitDetail {
+    pub hash: String,
+    pub short: String,
+    pub parents: Vec<String>,
+    pub refs: Vec<CommitRef>,
+    pub author: String,
+    pub email: String,
+    pub date: String,
+    pub relative_time: String,
+    pub subject: String,
+    pub body: String,
+}
+
+#[tauri::command]
+pub async fn git_commit_detail(
+    cwd: String,
+    hash: String,
+) -> Result<CommitDetail, String> {
+    let remotes = remote_names(&cwd).await;
+    let raw = run(
+        &cwd,
+        &[
+            "show",
+            "-s",
+            "--date=format:%B %-d, %Y at %-I:%M %p",
+            "--pretty=format:%H%x1f%h%x1f%P%x1f%D%x1f%an%x1f%ae%x1f%ad%x1f%ar%x1f%s%x1f%b",
+            &hash,
+        ],
+    )
+    .await?;
+    parse_commit_detail(&raw, &remotes)
+        .ok_or_else(|| format!("could not parse commit {hash}"))
+}
+
+fn parse_commit_detail(raw: &str, remotes: &[String]) -> Option<CommitDetail> {
+    // %b (the body) is last and may contain anything including
+    // newlines, so split the whole record — not line-by-line.
+    let mut p = raw.splitn(10, US);
+    Some(CommitDetail {
+        hash: p.next()?.to_string(),
+        short: p.next()?.to_string(),
+        parents: p
+            .next()?
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+        refs: parse_decorations(p.next()?, remotes),
+        author: p.next()?.to_string(),
+        email: p.next()?.to_string(),
+        date: p.next()?.to_string(),
+        relative_time: p.next()?.to_string(),
+        subject: p.next()?.to_string(),
+        body: p.next().unwrap_or("").trim().to_string(),
+    })
+}
+
+/// Unified diff a commit introduced. Merge commits diff against their
+/// FIRST parent — "what landed on this branch when the merge happened"
+/// — matching what Fork/Tower show. Root commits (no parent) fall back
+/// to `git show`, which renders them as all-additions.
+#[tauri::command]
+pub async fn git_commit_diff(cwd: String, hash: String) -> Result<String, String> {
+    let parents = run(&cwd, &["rev-list", "--parents", "-n", "1", &hash]).await?;
+    let first_parent = parents.split_whitespace().nth(1).map(str::to_string);
+    match first_parent {
+        Some(parent) => {
+            run(&cwd, &["diff", "--no-color", &parent, &hash]).await
+        }
+        None => run(&cwd, &["show", "--no-color", "--format=", &hash]).await,
+    }
+}
+
+/* ------------------------------------------------------------------
+   Network ops — fetch / pull / clone. All run with the same
+   non-interactive env as push so a missing credential fails fast
+   instead of hanging the UI on an invisible prompt.
+   ------------------------------------------------------------------ */
+
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Clones move whole repos, not refs — give them room.
+const CLONE_TIMEOUT: Duration = Duration::from_secs(300);
+
+async fn run_network(
+    cwd: Option<&str>,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.args(args).stdin(Stdio::null());
+    if let Some(dir) = cwd {
+        if !Path::new(dir).exists() {
+            return Err(format!("cwd does not exist: {dir}"));
+        }
+        command.current_dir(dir);
+    }
+    for (k, v) in NON_INTERACTIVE_GIT_ENV {
+        command.env(k, v);
+    }
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| {
+            format!(
+                "git {} timed out after {}s — check the remote URL, credentials, or network",
+                args.first().unwrap_or(&"command"),
+                timeout.as_secs()
+            )
+        })?
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if output.status.success() {
+        // fetch/clone narrate progress on stderr; surface it so the
+        // caller has something to show ("From github.com:… main -> …").
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if stdout.trim().is_empty() {
+            Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+        } else {
+            Ok(stdout)
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(explain_push_error(&stderr))
+    }
+}
+
+/// `git fetch --all --prune` — refresh every remote so the history
+/// graph shows what teammates pushed without touching the worktree.
+#[tauri::command]
+pub async fn git_fetch(cwd: String) -> Result<String, String> {
+    run_network(Some(&cwd), &["fetch", "--all", "--prune"], FETCH_TIMEOUT).await
+}
+
+/// Plain `git pull` — honors the user's configured merge/rebase
+/// strategy rather than imposing one.
+#[tauri::command]
+pub async fn git_pull(cwd: String) -> Result<String, String> {
+    run_network(Some(&cwd), &["pull"], FETCH_TIMEOUT).await
+}
+
+/// Clone `url` into `dest_dir/<repo-name>` and return the new repo's
+/// absolute path so the frontend can register it as a project.
+#[tauri::command]
+pub async fn git_clone(url: String, dest_dir: String) -> Result<String, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("repository URL cannot be empty".into());
+    }
+    let name = clone_dir_name(&url);
+    if name.is_empty() {
+        return Err(format!("could not derive a directory name from {url}"));
+    }
+    let target = Path::new(&dest_dir).join(&name);
+    if target.exists() {
+        return Err(format!("{} already exists", target.display()));
+    }
+    let target_str = target.to_string_lossy().into_owned();
+    run_network(None, &["clone", &url, &target_str], CLONE_TIMEOUT).await?;
+    Ok(target_str)
+}
+
+/// `git@github.com:org/repo.git` / `https://github.com/org/repo` →
+/// `repo`. Mirrors git's own default-directory derivation.
+fn clone_dir_name(url: &str) -> String {
+    url.trim_end_matches('/')
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(".git")
+        .to_string()
+}
+
 #[tauri::command]
 pub async fn git_log(cwd: String, n: Option<u32>) -> Result<Vec<LogEntry>, String> {
     let count = n.unwrap_or(20).to_string();
@@ -931,6 +1249,88 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].subject, "good");
         assert_eq!(entries[1].subject, "also good");
+    }
+
+    /* ---------- history graph parser ---------- */
+
+    #[test]
+    fn parses_graph_commit_with_refs_and_parents() {
+        let raw = "aaa\u{1f}aa1\u{1f}bbb ccc\u{1f}HEAD -> main, origin/main, tag: v1.0\u{1f}Raeed\u{1f}r@x.dev\u{1f}1717200000\u{1f}merge it\n";
+        let commits = parse_log_graph(raw, &["origin".to_string()]);
+        assert_eq!(commits.len(), 1);
+        let c = &commits[0];
+        assert_eq!(c.hash, "aaa");
+        assert_eq!(c.short, "aa1");
+        assert_eq!(c.parents, vec!["bbb", "ccc"]);
+        assert_eq!(c.author, "Raeed");
+        assert_eq!(c.email, "r@x.dev");
+        assert_eq!(c.timestamp, 1717200000);
+        assert_eq!(c.subject, "merge it");
+        assert_eq!(
+            c.refs,
+            vec![
+                CommitRef { name: "main".into(), kind: "head".into() },
+                CommitRef { name: "origin/main".into(), kind: "remote".into() },
+                CommitRef { name: "v1.0".into(), kind: "tag".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_commit_without_decorations_or_parents() {
+        let raw = "root\u{1f}r00\u{1f}\u{1f}\u{1f}A\u{1f}a@b.c\u{1f}100\u{1f}initial\n";
+        let commits = parse_log_graph(raw, &["origin".to_string()]);
+        assert_eq!(commits.len(), 1);
+        assert!(commits[0].parents.is_empty());
+        assert!(commits[0].refs.is_empty());
+    }
+
+    #[test]
+    fn decorations_detached_head() {
+        let refs = parse_decorations("HEAD, origin/feat", &["origin".to_string()]);
+        assert_eq!(refs[0].kind, "head");
+        assert_eq!(refs[0].name, "HEAD");
+        assert_eq!(refs[1].kind, "remote");
+    }
+
+    #[test]
+    fn decorations_local_branch_without_head() {
+        let refs = parse_decorations("feature/auth", &["origin".to_string()]);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, "branch");
+        assert_eq!(refs[0].name, "feature/auth");
+    }
+
+    /* ---------- commit detail parser ---------- */
+
+    #[test]
+    fn parses_commit_detail_with_multiline_body() {
+        let raw = "aaa\u{1f}aa1\u{1f}bbb\u{1f}origin/main\u{1f}dorocha\u{1f}me@dorocha.dev\u{1f}June 1, 2026 at 12:04 AM\u{1f}2 days ago\u{1f}docs: remove refs\u{1f}line one\n\nline two\n";
+        let d = parse_commit_detail(raw, &["origin".to_string()]).expect("parses");
+        assert_eq!(d.short, "aa1");
+        assert_eq!(d.parents, vec!["bbb"]);
+        assert_eq!(d.refs[0].kind, "remote");
+        assert_eq!(d.subject, "docs: remove refs");
+        assert_eq!(d.body, "line one\n\nline two");
+        assert_eq!(d.date, "June 1, 2026 at 12:04 AM");
+    }
+
+    #[test]
+    fn commit_detail_empty_body() {
+        let raw = "a\u{1f}a1\u{1f}\u{1f}\u{1f}A\u{1f}a@b.c\u{1f}d\u{1f}now\u{1f}subject\u{1f}";
+        let d = parse_commit_detail(raw, &[]).expect("parses");
+        assert_eq!(d.body, "");
+        assert!(d.parents.is_empty());
+    }
+
+    /* ---------- clone dir derivation ---------- */
+
+    #[test]
+    fn clone_dir_name_handles_common_url_shapes() {
+        assert_eq!(clone_dir_name("git@github.com:org/repo.git"), "repo");
+        assert_eq!(clone_dir_name("https://github.com/org/repo"), "repo");
+        assert_eq!(clone_dir_name("https://github.com/org/repo.git/"), "repo");
+        assert_eq!(clone_dir_name("ssh://git@host/path/to/proj.git"), "proj");
     }
 
     /* ---------- git_push: stuck-Pushing UI guard ---------- */

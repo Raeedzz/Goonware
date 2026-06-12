@@ -207,6 +207,36 @@ impl SelectionHandle {
             .clear();
     }
 
+    /// Shift every relative selection bound vertically by `dy` px.
+    ///
+    /// For content that scrolls OUTSIDE warpui's knowledge — an alt-screen
+    /// terminal app paged via injected wheel events repaints its grid in
+    /// place, so a selection anchored to grid coordinates would highlight
+    /// whatever text scrolled under it. The owner knows how far the content
+    /// moved and calls this so the anchors track the text instead.
+    /// Non-`Relative` bounds (TopLeft/BottomRight/Top/Bottom) are edge
+    /// sentinels and are left untouched.
+    pub fn shift_relative_y(&self, dy: f32) {
+        let mut selection = self.selection.lock().expect("Should not be poisoned.");
+        let shift = |bound: &mut Option<SelectionBound>| {
+            if let Some(SelectionBound::Relative(p)) = bound {
+                *p = vec2f(p.x(), p.y() + dy);
+            }
+        };
+        shift(&mut selection.head);
+        shift(&mut selection.tail);
+        shift(&mut selection.expanded_head);
+        shift(&mut selection.expanded_tail);
+        if let Some(smart) = &mut selection.initial_smart_selection {
+            if let SelectionBound::Relative(p) = &mut smart.start {
+                *p = vec2f(p.x(), p.y() + dy);
+            }
+            if let SelectionBound::Relative(p) = &mut smart.end {
+                *p = vec2f(p.x(), p.y() + dy);
+            }
+        }
+    }
+
     #[cfg(feature = "integration_tests")]
     pub fn selection_type(&self) -> SelectionType {
         self.selection.lock().expect("Mutex is not poisoned.").unit
