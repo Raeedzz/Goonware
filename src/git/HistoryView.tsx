@@ -53,6 +53,27 @@ const LANE_COLORS = [
 
 const laneColor = (i: number) => LANE_COLORS[i % LANE_COLORS.length];
 
+/** Last graph per worktree path — a switch paints the previous tree
+    instantly while the fresh `git log` runs in the background. */
+const historyCache = new Map<string, GraphCommit[]>();
+
+/** Equality for poll results: a commit is immutable per hash, but its
+    decorations (refs) change on push/branch ops — compare both so an
+    unchanged tick keeps the old array identity and skips the render. */
+function sameGraphCommits(a: GraphCommit[], b: GraphCommit[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].hash !== b[i].hash) return false;
+    const ra = a[i].refs;
+    const rb = b[i].refs;
+    if (ra.length !== rb.length) return false;
+    for (let j = 0; j < ra.length; j++) {
+      if (ra[j].name !== rb[j].name || ra[j].kind !== rb[j].kind) return false;
+    }
+  }
+  return true;
+}
+
 export function HistoryView({
   worktree,
   branch,
@@ -80,7 +101,12 @@ export function HistoryView({
     try {
       const list = await git.logGraph(path, 200);
       if (path !== pathRef.current) return;
-      setCommits(list);
+      historyCache.set(path, list);
+      // Unchanged tick → keep the old array identity so the 200-row
+      // list (and its SVG cells) skips the re-render entirely.
+      setCommits((prev) =>
+        prev && sameGraphCommits(prev, list) ? prev : list,
+      );
       setError(null);
     } catch (e) {
       if (path !== pathRef.current) return;
@@ -88,9 +114,18 @@ export function HistoryView({
     }
   }, []);
 
+  // The pane sits in a display:none slot whenever another right-panel
+  // tab is selected — don't burn a `git log --all -n 200` every 10s
+  // for a tree nobody can see. Becoming visible re-runs the effect and
+  // refreshes immediately.
+  const visible = worktree.rightPanel === "changes";
+
   useEffect(() => {
-    if (worktree.missing === true) return;
-    setCommits(null);
+    if (worktree.missing === true || !visible) return;
+    // Seed from the last result for this path so a worktree switch
+    // paints the previous tree instantly instead of "loading history…";
+    // the refresh below folds in anything new.
+    setCommits(historyCache.get(worktree.path) ?? null);
     setError(null);
     void refresh();
     // 10s ambient tick — slower than the 4s status poll since `git log
@@ -106,7 +141,7 @@ export function HistoryView({
       window.clearInterval(t);
       window.removeEventListener("goonware-git-refresh", onRefresh);
     };
-  }, [worktree.path, worktree.missing, refresh]);
+  }, [worktree.path, worktree.missing, visible, refresh]);
 
   const layout = useMemo(
     () => computeGraphLayout(commits ?? []),

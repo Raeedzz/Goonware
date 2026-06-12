@@ -763,6 +763,7 @@ function TabContent({
             {tab.kind === "diff" ? (
               <DiffTabContent
                 key={tab.id}
+                tabId={tab.id}
                 cwd={cwd}
                 filePath={tab.filePath}
                 staged={tab.staged}
@@ -798,14 +799,20 @@ function TabContent({
  * has `display: flex`, the rest have `display: none`. Tab switches
  * within a worktree are a single CSS flip — no unmount + remount.
  *
- * Cross-worktree mount was the previous design but caused freezes
- * and rerender cascades: every state dispatch went through every
- * worktree's tabs simultaneously. Restricting the layer to the
- * active worktree's tabs keeps the within-worktree win without
- * paying the global tax. The Rust PTY survives worktree switches
+ * Cross-worktree mount: the layer keeps the last KEEPALIVE_WORKTREES
+ * recently-active worktrees' terminals mounted (MRU), so flipping
+ * between a couple of worktrees is a pure CSS visibility toggle —
+ * no term_start round-trip, no BlockTerminal mount cascade. Mounting
+ * EVERY worktree was the original design and caused freezes (every
+ * state dispatch rendered every worktree's tabs); the MRU cap keeps
+ * the instant-switch win while bounding the global tax, and the
+ * reducer's no-op guards have since removed most of the dispatch
+ * storms that made it expensive. The Rust PTY survives eviction
  * regardless (term_start is idempotent and re-emits the cached
- * grid), so the worktree-switch round-trip is still cheap.
+ * grid), so falling off the MRU only costs a remount on return.
  */
+const KEEPALIVE_WORKTREES = 3;
+
 function TerminalKeepaliveLayer({
   activeTerminalTabId,
   activeWorktree,
@@ -814,17 +821,35 @@ function TerminalKeepaliveLayer({
   activeWorktree: Worktree;
 }) {
   const state = useAppState();
+  // MRU of recently-active worktree ids, most recent first. Mutated
+  // in render (idempotent) so the slot list below can include the
+  // previous worktrees in the same pass that switches the active one.
+  const mruRef = useRef<string[]>([]);
+  const mru = mruRef.current;
+  const pos = mru.indexOf(activeWorktree.id);
+  if (pos !== 0) {
+    if (pos > 0) mru.splice(pos, 1);
+    mru.unshift(activeWorktree.id);
+    if (mru.length > KEEPALIVE_WORKTREES) mru.length = KEEPALIVE_WORKTREES;
+  }
   const terminalSlots = useMemo<
     Array<{ tab: TerminalTab; worktree: Worktree }>
   >(() => {
     const out: Array<{ tab: TerminalTab; worktree: Worktree }> = [];
-    for (const tabId of activeWorktree.tabIds) {
-      const t = state.tabs[tabId];
-      if (!t || t.kind !== "terminal") continue;
-      out.push({ tab: t, worktree: activeWorktree });
+    for (const wid of mruRef.current) {
+      // Archived worktrees drop out of state — skip, which also lets
+      // their slots unmount on the next render.
+      const w =
+        wid === activeWorktree.id ? activeWorktree : state.worktrees[wid];
+      if (!w || w.missing === true) continue;
+      for (const tabId of w.tabIds) {
+        const t = state.tabs[tabId];
+        if (!t || t.kind !== "terminal") continue;
+        out.push({ tab: t, worktree: w });
+      }
     }
     return out;
-  }, [activeWorktree, state.tabs]);
+  }, [activeWorktree, state.worktrees, state.tabs]);
 
   return (
     <>
@@ -1021,22 +1046,26 @@ function playCompletionSound(kind: "subtle" | "bell") {
 }
 
 function DiffTabContent({
+  tabId,
   cwd,
   filePath,
   staged,
 }: {
+  tabId: string;
   cwd: string;
   filePath: string;
   staged: boolean;
 }) {
+  const dispatch = useAppDispatch();
+  // The header ✕ and Escape close the tab — previously this was a
+  // no-op, leaving a close button that did nothing and a global
+  // Escape handler that preventDefaulted for no benefit.
   return (
     <DiffView
       projectPath={cwd}
       filePath={filePath}
       staged={staged}
-      onClose={() => {
-        /* main-column DiffView is embedded; close handled via tab close */
-      }}
+      onClose={() => dispatch({ type: "close-tab", id: tabId })}
     />
   );
 }

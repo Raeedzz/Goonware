@@ -301,6 +301,13 @@ function ProjectGroup({
   const onRowDragOver = useCallback(
     (e: DragEvent, id: string) => {
       if (!e.dataTransfer.types.includes(dragMime)) return;
+      // Hovering the row being dragged: dropping there is a no-op, so
+      // don't preventDefault (no drop affordance) or draw a line that
+      // implies a move.
+      if (id === dragIdRef.current) {
+        setDropTarget(null);
+        return;
+      }
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
       const edge = rowEdge(e);
@@ -499,7 +506,17 @@ function ProjectGroup({
         )}
       </div>
 
-      <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+      <ul
+        style={{ listStyle: "none", margin: 0, padding: 0 }}
+        // Clear the drop line when the drag exits the row list (over
+        // the project header, History, outside the sidebar…) instead
+        // of leaving it stuck on the last row hovered.
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+            setDropTarget(null);
+          }
+        }}
+      >
         {worktrees.map((w) => (
           // `isRunning` is derived INSIDE WorktreeRow via the
           // singleton `agentActivityStore` (Claude transcript-mtime
@@ -1063,7 +1080,11 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   return (
     <li
       ref={rowRef}
-      draggable
+      // The icon-picker dialog renders inline inside this li (it does
+      // not portal) — a draggable ancestor turns its text-selection
+      // drags into row drags in WebKit, so suspend dragging while the
+      // dialog is open.
+      draggable={!pickerOpen}
       onDragStart={(e) => {
         // A drag kills hover intent — never pop the hover card mid-drag.
         cancelTimers();

@@ -185,7 +185,13 @@ function BranchActionButton({ worktree }: { worktree: Worktree | null }) {
   useEffect(() => {
     void refresh();
     if (!canQuery) return;
-    const t = window.setInterval(() => void refresh(), PR_POLL_MS);
+    // Skip ambient ticks while the window is hidden/minimized — the
+    // goonware-git-refresh listener still fires for app-driven pushes,
+    // and the next visible tick catches anything missed.
+    const t = window.setInterval(() => {
+      if (document.visibilityState === "hidden") return;
+      void refresh();
+    }, PR_POLL_MS);
     const onGitRefresh = (e: Event) => {
       const detail = (e as CustomEvent<{ cwd?: string }>).detail;
       if (!detail?.cwd || detail.cwd === path) void refresh();
@@ -780,13 +786,25 @@ function DiffTrigger({ worktree }: { worktree: Worktree | null }) {
           insertions: number;
           deletions: number;
         }>("git_diff_stat", { cwd: path });
-        if (!cancelled) setStat(s);
+        if (cancelled) return;
+        // Same numbers → same object identity → no re-render.
+        setStat((prev) =>
+          prev &&
+          prev.files === s.files &&
+          prev.insertions === s.insertions &&
+          prev.deletions === s.deletions
+            ? prev
+            : s,
+        );
       } catch {
         if (!cancelled) setStat(null);
       }
     };
     void poll();
-    const t = window.setInterval(poll, DIFF_STAT_POLL_MS);
+    const t = window.setInterval(() => {
+      if (document.visibilityState === "hidden") return;
+      void poll();
+    }, DIFF_STAT_POLL_MS);
     const onRefresh = (e: Event) => {
       const detail = (e as CustomEvent<{ cwd?: string }>).detail;
       if (!detail?.cwd || detail.cwd === path) void poll();

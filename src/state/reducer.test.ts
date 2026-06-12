@@ -88,16 +88,44 @@ describe("open-tab dedup", () => {
   test("reused editor tab keeps its state but takes the new jump target", () => {
     let s = seed([worktree("w1", "p1")]);
     s = open(s, markdownTab("t1", "w1", "README.md"));
-    // Simulate unsaved edits on the open tab.
+    // Simulate unsaved edits, and another tab being active so the
+    // reused tab will remount (and consume openAt) on activation.
     s = {
       ...s,
       tabs: { ...s.tabs, t1: { ...s.tabs.t1, content: "dirty" } as Tab },
     };
+    s = open(s, commitTab("tc", "w1", "abc123"));
     s = open(s, markdownTab("t2", "w1", "README.md", { line: 7, column: 2 }));
     const t1 = s.tabs.t1 as MarkdownTab;
-    expect(s.worktrees.w1.tabIds).toEqual(["t1"]);
+    expect(s.worktrees.w1.tabIds).toEqual(["t1", "tc"]);
+    expect(s.worktrees.w1.activeTabId).toBe("t1");
     expect(t1.content).toBe("dirty");
     expect(t1.openAt).toEqual({ line: 7, column: 2 });
+  });
+
+  test("openAt is NOT carried onto the already-active tab", () => {
+    // The active tab's editor consumed openAt at mount; patching it on
+    // would never jump and the stale target would persist.
+    let s = seed([worktree("w1", "p1")]);
+    s = open(s, markdownTab("t1", "w1", "README.md"));
+    s = open(s, markdownTab("t2", "w1", "README.md", { line: 7, column: 2 }));
+    expect((s.tabs.t1 as MarkdownTab).openAt).toBeUndefined();
+  });
+
+  test("clean reused tab adopts freshly-read content; dirty keeps edits", () => {
+    let s = seed([worktree("w1", "p1")]);
+    s = open(s, {
+      ...markdownTab("t1", "w1", "README.md"),
+      content: "old",
+      savedContent: "old",
+    });
+    s = open(s, {
+      ...markdownTab("t2", "w1", "README.md"),
+      content: "fresh",
+      savedContent: "fresh",
+    });
+    expect((s.tabs.t1 as MarkdownTab).content).toBe("fresh");
+    expect((s.tabs.t1 as MarkdownTab).savedContent).toBe("fresh");
   });
 
   test("terminals never dedupe — each is its own session", () => {
@@ -164,6 +192,43 @@ describe("reorder-worktree", () => {
       edge: "above",
     });
     expect(out).toBe(s);
+  });
+
+  test("no-op dispatches return the same state object (render bail-out)", () => {
+    const s = seed([worktree("a", "p1")]);
+    const withActive: AppState = {
+      ...s,
+      activeProjectId: "p1",
+      activeWorktreeByProject: { p1: "a" },
+    };
+    expect(
+      reducer(withActive, { type: "set-active-project", id: "p1" }),
+    ).toBe(withActive);
+    expect(
+      reducer(withActive, {
+        type: "set-active-worktree",
+        projectId: "p1",
+        worktreeId: "a",
+      }),
+    ).toBe(withActive);
+    expect(
+      reducer(s, { type: "set-change-count", worktreeId: "a", count: 0 }),
+    ).toBe(s);
+    expect(
+      reducer(s, {
+        type: "set-agent-status",
+        worktreeId: "a",
+        status: "idle",
+        cli: null,
+      }),
+    ).toBe(s);
+    // …and a real change still lands.
+    const changed = reducer(s, {
+      type: "set-change-count",
+      worktreeId: "a",
+      count: 3,
+    });
+    expect(changed.worktrees.a.changeCount).toBe(3);
   });
 
   test("reordering inside one project leaves other projects' rows alone", () => {

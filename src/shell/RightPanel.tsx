@@ -473,6 +473,32 @@ interface WorktreeStatusState {
   refresh: () => Promise<void>;
 }
 
+/** Last successful status per worktree — lets a worktree switch paint
+    the previous result instantly while the fresh poll runs. Module-
+    level so it survives pane/panel remounts; entries are tiny. */
+const statusCache = new Map<
+  string,
+  {
+    entries: StatusEntry[];
+    ahead: number;
+    behind: number;
+    branch: string | null;
+  }
+>();
+
+function sameStatusEntries(a: StatusEntry[], b: StatusEntry[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (
+      a[i].path !== b[i].path ||
+      a[i].kind !== b[i].kind ||
+      a[i].staged !== b[i].staged
+    )
+      return false;
+  }
+  return true;
+}
+
 function useWorktreeStatus(
   worktreeId: string,
   worktreePath: string,
@@ -502,7 +528,19 @@ function useWorktreeStatus(
       // switch in flight) — the next effect will fire a fresh poll
       // against the new path.
       if (path !== pathRef.current) return;
-      setEntries(result.entries);
+      statusCache.set(worktreeId, {
+        entries: result.entries,
+        ahead: result.ahead,
+        behind: result.behind,
+        branch: result.branch,
+      });
+      // Keep the previous array identity when the entries are
+      // equivalent — the 4s poll usually returns the same status, and
+      // a fresh identity would re-render ChangesView's file rows for
+      // nothing.
+      setEntries((prev) =>
+        sameStatusEntries(prev, result.entries) ? prev : result.entries,
+      );
       setAhead(result.ahead);
       setBehind(result.behind);
       setBranch(result.branch);
@@ -532,12 +570,15 @@ function useWorktreeStatus(
       if (cancelled) return;
       await refresh();
     };
-    // Blank stale state on worktree change so the user never sees
-    // the previous worktree's entries for a frame.
-    setEntries([]);
-    setAhead(0);
-    setBehind(0);
-    setBranch(null);
+    // Seed from the last-known status for this worktree so a switch
+    // paints real data immediately (refreshed in the background by
+    // the tick below) instead of flashing an empty pane. Worktrees
+    // we've never polled start blank as before.
+    const cached = statusCache.get(worktreeId);
+    setEntries(cached?.entries ?? []);
+    setAhead(cached?.ahead ?? 0);
+    setBehind(cached?.behind ?? 0);
+    setBranch(cached?.branch ?? null);
     setError(null);
     void tick();
     const t = window.setInterval(() => void tick(), 4000);

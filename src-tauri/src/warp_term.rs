@@ -807,7 +807,16 @@ fn build_row(spans: &[Span], cursor_col: Option<u16>, mono: FamilyId) -> Box<dyn
         runs.push(plain_run(" ".to_string(), mono));
     }
 
-    Flex::row().with_spacing(0.0).with_children(runs).finish()
+    // `without_selection_separators`: the runs are contiguous slices of ONE
+    // grid line, so Flex's implicit " " between children's selection fragments
+    // injected a phantom space at every style boundary into copied text
+    // (the "copy doesn't preserve exact spacing" bug). The real spaces are
+    // already present in the span text (blank cells serialize as ' ').
+    Flex::row()
+        .without_selection_separators()
+        .with_spacing(0.0)
+        .with_children(runs)
+        .finish()
 }
 
 /// Collapse a leading `$HOME` to `~` for compact block-header cwds.
@@ -891,6 +900,23 @@ fn live_row_count(rows: &[RowSnapshot], cursor_on: bool, cursor_row: usize) -> u
         end = end.max(cursor_row.min(rows.len() - 1));
     }
     end + 1
+}
+
+/// Normalize extracted selection text before caching it for Cmd+C.
+///
+/// Grid rows serialize EVERY column — a line's tail of blank cells comes
+/// through as a run of real spaces padding the row to the terminal width.
+/// Copying that padding makes every line end in invisible whitespace (and
+/// blank rows render a single ' ' for height), so trim each line's trailing
+/// whitespace. Leading/interior spacing is untouched — that's the user's
+/// actual indentation and alignment, preserved exactly.
+fn clean_selection_text(s: Option<String>) -> Option<String> {
+    s.map(|s| {
+        s.split('\n')
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
 }
 
 /// A fixed-height transparent box — the stand-in for content the virtualizer
@@ -1166,7 +1192,8 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
         let selectable = SelectableArea::new(
             p.sel.clone(),
             move |args, _ctx, _app| {
-                *p.selection.lock().unwrap_or_else(|e| e.into_inner()) = args.selection;
+                *p.selection.lock().unwrap_or_else(|e| e.into_inner()) =
+                    clean_selection_text(args.selection);
             },
             grid,
         );
@@ -1377,7 +1404,8 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             let selectable = SelectableArea::new(
                 p.sel.clone(),
                 move |args, _ctx, _app| {
-                    *p.selection.lock().unwrap_or_else(|e| e.into_inner()) = args.selection;
+                    *p.selection.lock().unwrap_or_else(|e| e.into_inner()) =
+                        clean_selection_text(args.selection);
                 },
                 content,
             );
@@ -1952,6 +1980,24 @@ pub fn term_native_mouse(
     }
 }
 
+/// Tauri command: the alt-screen agent's content scrolled by `delta_lines`
+/// (the same signed line count just sent through `term_native_wheel`;
+/// positive = toward newer/down). The app repaints its grid in place, so a
+/// selection anchored to grid coordinates would highlight whatever text
+/// scrolled under it. Shift the stored selection bounds by the distance the
+/// content moved (scrolling up by N lines moves the text DOWN N rows →
+/// +N·LINE_PX) so the highlight stays glued to the text it was started on,
+/// Warp-style. Best-effort: assumes the app scrolls one row per wheel line
+/// (true for claude/codex and every pager we route here).
+#[tauri::command]
+pub fn term_native_selection_scrolled(pane_key: String, delta_lines: i32) {
+    let p = pane(&pane_key);
+    p.sel.shift_relative_y(-(delta_lines as f32) * LINE_PX);
+    if let Some(app) = APP_HANDLE.get() {
+        let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
+    }
+}
+
 /// Tauri command: the latest selected transcript text (cached by the
 /// `SelectableArea` selection handler), or `None` if nothing is selected. React
 /// reads this on Cmd+C in the shell and writes it to the clipboard via the
@@ -2101,5 +2147,19 @@ mod link_tests {
     fn link_rects_empty_when_no_url() {
         let row = RowSnapshot { spans: vec![span("no links here")] };
         assert!(link_rects_for_rows(std::slice::from_ref(&row), 0.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn clean_selection_trims_row_padding_only() {
+        // Grid rows arrive padded to the terminal width with spaces; that
+        // trailing pad is stripped per line. Leading + interior spacing (the
+        // user's real indentation/alignment) survives byte-for-byte, and
+        // blank rows stay as empty lines.
+        let raw = "    fn main() {      \n\n        body   x      ".to_string();
+        assert_eq!(
+            clean_selection_text(Some(raw)).as_deref(),
+            Some("    fn main() {\n\n        body   x")
+        );
+        assert_eq!(clean_selection_text(None), None);
     }
 }

@@ -110,6 +110,10 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     state.rightPanelCollapsed,
     state.sidebarWidth,
     state.rightPanelWidth,
+    // `pickPersistent` saves settings, so a settings change must
+    // schedule a save — without this dep a toggle only reached disk
+    // when some other persisted slice happened to change too.
+    state.settings,
   ]);
 
   return (

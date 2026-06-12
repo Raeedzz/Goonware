@@ -49,6 +49,13 @@ export function reducer(state: AppState, action: AppAction): AppState {
     /* Projects ---------------------------------------------------- */
 
     case "set-active-project":
+      // No-op dispatches return the SAME state object so React skips
+      // re-rendering every context subscriber — clicking the already
+      // active row costs nothing. The polling actions further down
+      // (change-count, agent-status, tab-summary) use the same guard
+      // to keep their 4–10s ticks from re-rendering the app when
+      // nothing actually changed.
+      if (state.activeProjectId === action.id) return state;
       return { ...state, activeProjectId: action.id };
 
     case "add-project": {
@@ -215,6 +222,8 @@ export function reducer(state: AppState, action: AppAction): AppState {
     }
 
     case "set-active-worktree":
+      if (state.activeWorktreeByProject[action.projectId] === action.worktreeId)
+        return state;
       return {
         ...state,
         activeWorktreeByProject: {
@@ -351,13 +360,23 @@ export function reducer(state: AppState, action: AppAction): AppState {
         rightSplitPct: action.pct,
       }));
 
-    case "set-agent-status":
+    case "set-agent-status": {
+      const cur = state.worktrees[action.worktreeId];
+      const nextCli = action.cli ?? cur?.agentCli ?? null;
+      if (cur && cur.agentStatus === action.status && cur.agentCli === nextCli)
+        return state;
       return updateWorktree(state, action.worktreeId, () => ({
         agentStatus: action.status,
-        agentCli: action.cli ?? state.worktrees[action.worktreeId]?.agentCli ?? null,
+        agentCli: nextCli,
       }));
+    }
 
     case "set-change-count":
+      // The 4s status poll dispatches this unconditionally; bailing on
+      // an unchanged count also stops the debounced saveState from
+      // rewriting the whole persisted blob every poll tick.
+      if (state.worktrees[action.worktreeId]?.changeCount === action.count)
+        return state;
       return updateWorktree(state, action.worktreeId, () => ({
         changeCount: action.count,
       }));
@@ -378,13 +397,32 @@ export function reducer(state: AppState, action: AppAction): AppState {
           .map((id) => state.tabs[id])
           .find((cur): cur is Tab => !!cur && sameTabTarget(cur, t));
         if (existing) {
-          // Carry a one-shot navigation target (search-hit jump) onto
-          // the reused editor tab; everything else — unsaved content,
-          // view mode — stays as the user left it.
-          const reused: Tab =
-            existing.kind === "markdown" && t.kind === "markdown" && t.openAt
-              ? { ...existing, openAt: t.openAt }
-              : existing;
+          let reused: Tab = existing;
+          if (existing.kind === "markdown" && t.kind === "markdown") {
+            const patch: Partial<typeof existing> = {};
+            // Carry a one-shot navigation target (search-hit jump) onto
+            // the reused editor tab — but only when that tab is NOT the
+            // one currently mounted. The editor consumes `openAt` at
+            // mount; patching it onto the already-active tab would
+            // never jump and the stale target would survive into
+            // persistence, teleporting the user on a later remount.
+            if (t.openAt && existing.id !== w.activeTabId) {
+              patch.openAt = t.openAt;
+            }
+            // A clean tab (no unsaved edits) adopts freshly-read file
+            // content shipped by the caller (search overlay reads from
+            // disk); a dirty tab keeps the user's edits untouched.
+            if (
+              t.content != null &&
+              existing.content === existing.savedContent
+            ) {
+              patch.content = t.content;
+              patch.savedContent = t.savedContent ?? t.content;
+            }
+            if (Object.keys(patch).length > 0) {
+              reused = { ...existing, ...patch };
+            }
+          }
           return {
             ...state,
             tabs:
@@ -452,7 +490,7 @@ export function reducer(state: AppState, action: AppAction): AppState {
 
     case "set-tab-summary": {
       const cur = state.tabs[action.id];
-      if (!cur) return state;
+      if (!cur || cur.summary === action.summary) return state;
       return {
         ...state,
         tabs: {
