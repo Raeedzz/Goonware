@@ -1,9 +1,11 @@
 import {
   memo,
+  useCallback,
   useEffect,
   useRef,
   useState,
   type CSSProperties,
+  type DragEvent,
   type MouseEvent,
   type ReactNode,
 } from "react";
@@ -271,6 +273,68 @@ function ProjectGroup({
     null,
   );
 
+  // Drag-reorder plumbing. The MIME type carries this project's id, so
+  // rows in OTHER repo groups never accept the drag — worktrees can
+  // only be rearranged within their own repository. Handlers are
+  // useCallback-stable so they don't defeat WorktreeRow's memo.
+  const dragMime = `application/x-goonware-worktree-${project.id}`.toLowerCase();
+  const dragIdRef = useRef<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{
+    id: string;
+    edge: "above" | "below";
+  } | null>(null);
+
+  const onRowDragStart = useCallback(
+    (e: DragEvent, id: string) => {
+      dragIdRef.current = id;
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData(dragMime, id);
+    },
+    [dragMime],
+  );
+
+  const rowEdge = (e: DragEvent): "above" | "below" => {
+    const r = e.currentTarget.getBoundingClientRect();
+    return e.clientY < r.top + r.height / 2 ? "above" : "below";
+  };
+
+  const onRowDragOver = useCallback(
+    (e: DragEvent, id: string) => {
+      if (!e.dataTransfer.types.includes(dragMime)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      const edge = rowEdge(e);
+      setDropTarget((cur) =>
+        cur?.id === id && cur.edge === edge ? cur : { id, edge },
+      );
+    },
+    [dragMime],
+  );
+
+  const onRowDrop = useCallback(
+    (e: DragEvent, id: string) => {
+      if (!e.dataTransfer.types.includes(dragMime)) return;
+      e.preventDefault();
+      const dragged = dragIdRef.current ?? e.dataTransfer.getData(dragMime);
+      if (dragged && dragged !== id) {
+        dispatch({
+          type: "reorder-worktree",
+          id: dragged,
+          targetId: id,
+          edge: rowEdge(e),
+        });
+      }
+      dragIdRef.current = null;
+      setDropTarget(null);
+    },
+    [dragMime, dispatch],
+  );
+
+  const onRowDragEnd = useCallback(() => {
+    dragIdRef.current = null;
+    setDropTarget(null);
+  }, []);
+
   const state = useAppState();
   const onCreate = async () => {
     const base = nextAutoBranch(project.id, state);
@@ -455,6 +519,11 @@ function ProjectGroup({
             isActive={activeWorktreeId === w.id}
             archiveBehavior={state.settings.archiveBehavior}
             deleteBranchOnArchive={state.settings.deleteBranchOnArchive}
+            onRowDragStart={onRowDragStart}
+            onRowDragOver={onRowDragOver}
+            onRowDrop={onRowDrop}
+            onRowDragEnd={onRowDragEnd}
+            dropEdge={dropTarget?.id === w.id ? dropTarget.edge : null}
           />
         ))}
       </ul>
@@ -731,6 +800,11 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   isActive,
   archiveBehavior,
   deleteBranchOnArchive,
+  onRowDragStart,
+  onRowDragOver,
+  onRowDrop,
+  onRowDragEnd,
+  dropEdge,
 }: {
   worktree: Worktree;
   project: Project;
@@ -745,6 +819,15 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   archiveBehavior: "ask" | "stash" | "force";
   /** Per-Git-settings tab. Drilled in for the same memo reasons. */
   deleteBranchOnArchive: boolean;
+  /** Drag-reorder hooks from the owning ProjectGroup — stable
+      (useCallback) so they don't defeat the memo above. */
+  onRowDragStart: (e: DragEvent, id: string) => void;
+  onRowDragOver: (e: DragEvent, id: string) => void;
+  onRowDrop: (e: DragEvent, id: string) => void;
+  onRowDragEnd: () => void;
+  /** Where the in-flight drag would land relative to this row — drawn
+      as a 2px accent line. Null when this row isn't the drop target. */
+  dropEdge: "above" | "below" | null;
 }) {
   // Live "is Claude doing something in this worktree" flag, sourced
   // from the singleton agentActivityStore which polls Claude's
@@ -980,6 +1063,18 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   return (
     <li
       ref={rowRef}
+      draggable
+      onDragStart={(e) => {
+        // A drag kills hover intent — never pop the hover card mid-drag.
+        cancelTimers();
+        setCardAnchor(null);
+        setHovering(false);
+        onRowDragStart(e, worktree.id);
+      }}
+      onDragOver={(e) => onRowDragOver(e, worktree.id)}
+      onDrop={(e) => onRowDrop(e, worktree.id)}
+      onDragEnd={onRowDragEnd}
+      style={{ position: "relative" }}
       onMouseEnter={() => {
         setHovering(true);
         openCard();
@@ -989,6 +1084,22 @@ const WorktreeRow = memo(function WorktreeRowImpl({
         scheduleClose();
       }}
     >
+      {dropEdge && (
+        <span
+          aria-hidden
+          style={{
+            position: "absolute",
+            left: 8,
+            right: 8,
+            height: 2,
+            borderRadius: 1,
+            backgroundColor: "var(--accent-bright)",
+            pointerEvents: "none",
+            zIndex: 1,
+            ...(dropEdge === "above" ? { top: -1 } : { bottom: -1 }),
+          }}
+        />
+      )}
       <button
         type="button"
         onClick={onSelect}

@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { git, type CommitDetail } from "@/lib/git";
 import { FileBlock, sliceByFile, type FileSection } from "./AllChangesView";
-import { AuthorDot } from "./HistoryView";
+import { AuthorAvatar } from "./Avatar";
+import { DiffAskOverlay, reconstructDiffContext } from "./DiffAsk";
 import { useAppDispatch } from "@/state/AppState";
 import { IconCopy } from "@/design/icons";
 import { useToast } from "@/primitives/Toast";
@@ -28,6 +29,7 @@ export function CommitDetailView({
   const [detail, setDetail] = useState<CommitDetail | null>(null);
   const [raw, setRaw] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -164,6 +166,7 @@ export function CommitDetailView({
       </div>
 
       <div
+        ref={scrollRef}
         style={{ flex: 1, minHeight: 0, overflow: "auto" }}
         className="allow-select"
       >
@@ -190,6 +193,29 @@ export function CommitDetailView({
           </>
         )}
       </div>
+      {raw !== null && sections.length > 0 && (
+        <DiffAskOverlay
+          containerRef={scrollRef}
+          resolve={(range) => {
+            // Same per-file resolution the all-changes view uses: find
+            // which file block the selection landed in and hand that
+            // file's reconstructed diff to the ask card as context.
+            const node: Node | null = range.commonAncestorContainer;
+            const el =
+              node instanceof HTMLElement ? node : node?.parentElement ?? null;
+            const fileEl = el?.closest<HTMLElement>("[data-diff-file]");
+            const path = fileEl?.dataset.diffFile;
+            const section = path
+              ? sections.find((s) => s.path === path)
+              : undefined;
+            if (!section) return null;
+            return {
+              path: section.path,
+              diff: reconstructDiffContext(section.lines),
+            };
+          }}
+        />
+      )}
     </motion.div>
   );
 }
@@ -221,7 +247,7 @@ function CommitHeader({
           gap: "var(--space-3)",
         }}
       >
-        <AuthorDot name={detail.author} size={32} />
+        <AuthorAvatar name={detail.author} email={detail.email} size={32} />
         <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
           <span
             style={{

@@ -104,4 +104,59 @@ describe("computeGraphLayout", () => {
     expect(layout.rows).toEqual([]);
     expect(layout.laneCount).toBe(0);
   });
+
+  test("rows connect edge-to-edge and every in-window parent is reached", () => {
+    // Forks, a 3-parent octopus merge, and a parent truncated out of
+    // the window (x) — the shapes that break naive lane algorithms.
+    const commits = [
+      commit("h", ["g"]),
+      commit("m2", ["g", "e"]),
+      commit("g", ["f", "d", "e2"]),
+      commit("e", ["d"]),
+      commit("f", ["c"]),
+      commit("e2", ["d"]),
+      commit("d", ["c"]),
+      commit("c", ["b", "x"]),
+      commit("b", ["a"]),
+      commit("a", []),
+    ];
+    const layout = computeGraphLayout(commits);
+
+    for (let i = 0; i < layout.rows.length; i++) {
+      const row = layout.rows[i];
+      // No line may pass straight through a node's dot.
+      expect(row.passes.map((p) => p.lane)).not.toContain(row.lane);
+
+      // Lanes leaving the bottom of this row must be exactly the lanes
+      // entering the top of the next — lines never dangle or teleport.
+      const next = layout.rows[i + 1];
+      if (next) {
+        const bottom = [
+          ...row.passes.map((s) => s.lane),
+          ...row.outs.map((s) => s.lane),
+        ].sort();
+        const top = [
+          ...next.passes.map((s) => s.lane),
+          ...next.ins.map((s) => s.lane),
+        ].sort();
+        expect(top).toEqual(bottom);
+      }
+    }
+
+    // Every parent edge inside the window is actually drawn: one of the
+    // child's out-lanes arrives at the parent's node.
+    const rowByHash = new Map(layout.rows.map((r) => [r.hash, r]));
+    for (let i = 0; i < commits.length; i++) {
+      for (const parent of commits[i].parents) {
+        const parentRow = rowByHash.get(parent);
+        if (!parentRow) continue; // truncated (x)
+        const arrivals = new Set([
+          parentRow.lane,
+          ...parentRow.ins.map((s) => s.lane),
+        ]);
+        const reached = layout.rows[i].outs.some((o) => arrivals.has(o.lane));
+        expect(reached).toBe(true);
+      }
+    }
+  });
 });

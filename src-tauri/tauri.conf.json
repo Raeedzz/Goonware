@@ -31,7 +31,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob: asset: http://asset.localhost http://127.0.0.1:*; media-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://localhost:* http://127.0.0.1:* https://generativelanguage.googleapis.com https://github.com https://*.githubusercontent.com https://api.github.com",
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob: asset: http://asset.localhost http://127.0.0.1:* https://avatars.githubusercontent.com https://github.com https://www.gravatar.com; media-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://localhost:* http://127.0.0.1:* https://generativelanguage.googleapis.com https://github.com https://*.githubusercontent.com https://api.github.com",
       "assetProtocol": {
         "enable": true,
         "scope": ["**"]
