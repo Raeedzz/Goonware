@@ -432,17 +432,23 @@ function CommitRow({
   const isHead = commit.refs.some((r) => r.kind === "head");
   const shown = commit.refs.slice(0, 2);
   const extra = commit.refs.length - shown.length;
+
+  // Content starts right after the node dot for this specific row's lane,
+  // not at a fixed gutter width — so each row hugs its own node position.
+  const nodeX = row ? Math.min(row.lane, MAX_LANES - 1) * LANE_W + 5 : 0;
+  const contentLeft = nodeX + 14; // node radius (3) + 11px breathing room
+
   return (
     <li>
       <div
         onClick={onOpen}
         title={`${commit.subject}\n${commit.author} <${commit.email}>\n${commit.short}`}
         style={{
+          position: "relative",
           display: "flex",
           alignItems: "center",
-          gap: 6,
-          height: ROW_H,
-          padding: "0 var(--space-3) 0 var(--space-2)",
+          minHeight: ROW_H,
+          padding: "0 var(--space-3) 0 0",
           cursor: "pointer",
           backgroundColor: "transparent",
           transition:
@@ -455,60 +461,87 @@ function CommitRow({
           (e.currentTarget.style.backgroundColor = "transparent")
         }
       >
-        {row && <GraphCell row={row} width={gutterW} head={isHead} />}
-        {shown.map((r) => (
-          <RefChip key={`${r.kind}:${r.name}`} r={r} />
-        ))}
-        {extra > 0 && (
+        {/* Graph SVG draws behind the content */}
+        {row && (
+          <div
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              width: gutterW,
+              height: ROW_H,
+              pointerEvents: "none",
+            }}
+          >
+            <GraphCell row={row} width={gutterW} head={isHead} />
+          </div>
+        )}
+
+        {/* All text/chip content starts right at this row's node position */}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 3,
+            paddingLeft: contentLeft,
+            flex: 1,
+            minWidth: 0,
+          }}
+        >
+          {shown.map((r) => (
+            <RefChip key={`${r.kind}:${r.name}`} r={r} />
+          ))}
+          {extra > 0 && (
+            <span
+              style={{
+                fontSize: 9,
+                color: "var(--text-tertiary)",
+                flexShrink: 0,
+              }}
+            >
+              +{extra}
+            </span>
+          )}
+          <span
+            style={{
+              flex: 1,
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              fontSize: "var(--text-xs)",
+              color: isHead ? "var(--text-primary)" : "var(--text-secondary)",
+              fontWeight: isHead
+                ? "var(--weight-medium)"
+                : "var(--weight-regular)",
+            }}
+          >
+            {commit.subject}
+          </span>
+          <AuthorDot name={commit.author} />
+          <span
+            className="tabular"
+            style={{
+              fontFamily: "var(--font-mono)",
+              fontSize: 9,
+              color: "var(--text-disabled)",
+              flexShrink: 0,
+            }}
+          >
+            {commit.short.slice(0, 7)}
+          </span>
           <span
             style={{
               fontSize: 9,
               color: "var(--text-tertiary)",
               flexShrink: 0,
+              minWidth: 44,
+              textAlign: "right",
             }}
           >
-            +{extra}
+            {formatCommitTime(commit.timestamp)}
           </span>
-        )}
-        <span
-          style={{
-            flex: 1,
-            minWidth: 0,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            fontSize: "var(--text-xs)",
-            color: isHead ? "var(--text-primary)" : "var(--text-secondary)",
-            fontWeight: isHead
-              ? "var(--weight-medium)"
-              : "var(--weight-regular)",
-          }}
-        >
-          {commit.subject}
-        </span>
-        <AuthorDot name={commit.author} />
-        <span
-          className="tabular"
-          style={{
-            fontFamily: "var(--font-mono)",
-            fontSize: 9,
-            color: "var(--text-disabled)",
-            flexShrink: 0,
-          }}
-        >
-          {commit.short.slice(0, 7)}
-        </span>
-        <span
-          style={{
-            fontSize: 9,
-            color: "var(--text-tertiary)",
-            flexShrink: 0,
-            minWidth: 44,
-            textAlign: "right",
-          }}
-        >
-          {formatCommitTime(commit.timestamp)}
-        </span>
+        </div>
       </div>
     </li>
   );
@@ -626,6 +659,9 @@ function refChipStyle(kind: CommitRef["kind"]): CSSProperties {
 function RefChip({ r }: { r: CommitRef }) {
   return (
     <span style={refChipStyle(r.kind)} title={r.name}>
+      {r.kind === "remote" && (
+        <IconGithub size={9} style={{ flexShrink: 0, marginRight: 2, opacity: 0.7 }} />
+      )}
       <span
         style={{
           overflow: "hidden",
