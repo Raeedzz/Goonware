@@ -9,6 +9,7 @@ import {
   IconRevert,
   IconSparkles,
 } from "@/design/icons";
+import { ArrowSquareOut, CaretRight } from "@phosphor-icons/react";
 import {
   useActiveWorktree,
   useAppDispatch,
@@ -2064,7 +2065,7 @@ function PreviewUrlButton({ worktree }: { worktree: Worktree }) {
         e.currentTarget.style.color = "var(--text-secondary)";
       }}
     >
-      Open ↗
+      Open <ArrowSquareOut size={11} />
     </button>
   );
 }
@@ -2191,7 +2192,7 @@ function ScriptPanel({
           }}
           title={`Run ${kind} script in the active terminal`}
         >
-          ▶ Run
+          <CaretRight size={10} weight="fill" /> Run
         </button>
         <span style={{ flex: 1 }} />
         <button

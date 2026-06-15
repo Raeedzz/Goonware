@@ -1,5 +1,12 @@
 import { motion } from "motion/react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  ArrowClockwise,
+  ArrowsClockwise,
+  ArrowSquareOut,
+} from "@phosphor-icons/react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { connectionsViewVariants } from "@/design/motion";
 import {
@@ -598,9 +605,9 @@ function UrlBar({
         backgroundColor: "var(--surface-1)",
       }}
     >
-      <NavBtn label="◀" onClick={onBack} disabled={!health?.ok} title="back" />
-      <NavBtn label="▶" onClick={onForward} disabled={!health?.ok} title="forward" />
-      <NavBtn label="↻" onClick={onReload} disabled={!status?.ready} title="reload" />
+      <NavBtn label={<ArrowLeft size={12} />} onClick={onBack} disabled={!health?.ok} title="back" />
+      <NavBtn label={<ArrowRight size={12} />} onClick={onForward} disabled={!health?.ok} title="forward" />
+      <NavBtn label={<ArrowClockwise size={12} />} onClick={onReload} disabled={!status?.ready} title="reload" />
 
       <Dot
         color={
@@ -654,13 +661,13 @@ function UrlBar({
 
       {health?.ok && (
         <NavBtn
-          label="⟳"
+          label={<ArrowsClockwise size={12} />}
           onClick={onRestart}
           title="restart browser session (kills the headless Chrome process)"
         />
       )}
       {health?.ok && (
-        <NavBtn label="↗" onClick={onOpen} title="open in real browser" />
+        <NavBtn label={<ArrowSquareOut size={12} />} onClick={onOpen} title="open in real browser" />
       )}
       {!embedded && (
         <NavBtn label="×" onClick={onClose} title="close (esc)" />
@@ -675,7 +682,7 @@ function NavBtn({
   title,
   disabled,
 }: {
-  label: string;
+  label: ReactNode;
   onClick: () => void;
   title?: string;
   disabled?: boolean;

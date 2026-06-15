@@ -9,6 +9,7 @@ import {
 import { AnimatePresence, motion } from "motion/react";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import { IconBranch, IconClose, IconGithub, IconRefresh } from "@/design/icons";
+import { ArrowLineDown } from "@phosphor-icons/react";
 import { git, type CommitRef, type GraphCommit } from "@/lib/git";
 import { computeGraphLayout, type GraphRow } from "./history-graph";
 import { BranchSwitcher } from "@/shell/BranchSwitcher";
@@ -326,20 +327,8 @@ export function HistoryView({
   );
 }
 
-/** Down-arrow-into-tray pull glyph, drawn inline — the icon set has
-    push (up) but no pull counterpart. Same 1.5px stroke language. */
 function PullGlyph() {
-  return (
-    <svg width={12} height={12} viewBox="0 0 16 16" fill="none" aria-hidden>
-      <path
-        d="M8 2.5v8M4.5 7 8 10.5 11.5 7M3 13.5h10"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
+  return <ArrowLineDown size={12} />;
 }
 
 function ToolbarButton({
