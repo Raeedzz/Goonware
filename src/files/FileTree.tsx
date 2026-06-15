@@ -10,6 +10,7 @@ import {
 import { paneSlotScrollChildStyle } from "@/shell/paneSlotLayout";
 import { ContextMenu, type ContextMenuItem } from "@/shell/ContextMenu";
 import { IconCopy, IconEdit, IconFolder, IconTrash } from "@/design/icons";
+import { CaretRight } from "@phosphor-icons/react";
 import { FileTypeIcon } from "./FileTypeIcon";
 
 interface Props {
@@ -666,14 +667,13 @@ function Row({
           alignItems: "center",
           justifyContent: "center",
           color: "var(--text-tertiary)",
-          fontFamily: "var(--font-mono)",
-          fontSize: 10,
-          lineHeight: 1,
           opacity: node.isDir ? 0.7 : 0,
+          transition: "transform var(--motion-instant) var(--ease-out-quart)",
+          transform: node.expanded ? "rotate(90deg)" : "rotate(0deg)",
         }}
         aria-hidden
       >
-        {node.isDir ? (node.expanded ? "▾" : "▸") : ""}
+        <CaretRight size={10} weight="bold" />
       </span>
       <FileTypeIcon
         name={node.name}
