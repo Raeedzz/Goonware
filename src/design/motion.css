@@ -12,6 +12,11 @@
    Opacity-only — never scale (scale on a status dot reads as alarm).
    ------------------------------------------------------------------ */
 
+@keyframes goonware-caret-blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0; }
+}
+
 @keyframes goonware-pulse {
   0%, 100% { opacity: 0.55; }
   50%      { opacity: 1; }

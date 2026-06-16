@@ -392,6 +392,14 @@ struct Session {
     /// frontend never sees the running→idle transition that follows a
     /// Ctrl+C kill (zsh's empty PROMPT doesn't repaint anything).
     last_command_running: bool,
+    /// Cursor position at the last flush. A cursor-only move (typing a
+    /// space onto an already-blank cell advances the cursor but changes
+    /// no cell content, so `diff_rows` returns empty) must still emit a
+    /// frame so the native renderer repaints the cursor block at its new
+    /// column. Without this, the cursor appears frozen whenever a
+    /// character is typed into a blank area of the input grid.
+    last_cursor_row: i32,
+    last_cursor_col: u16,
     segmenter: BlockSegmenter,
     /// Monotonic frame counter. Increments on every emit (regardless
     /// of whether the frame had dirty rows). Frontend uses this to
@@ -2421,6 +2429,8 @@ pub fn term_start(
         last_flush: Instant::now() - FRAME_THROTTLE_VISIBLE,
         visible: true,
         last_command_running: false,
+        last_cursor_row: -1,
+        last_cursor_col: 0,
         segmenter: BlockSegmenter::new(),
         next_frame_seq: 0,
         frame_channel,
@@ -3000,12 +3010,14 @@ fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
         }
         s.last_history_size = current_history_size;
     }
+    let cursor = s.term.grid().cursor.point;
+    let cursor_changed = cursor.line.0 != s.last_cursor_row
+        || cursor.column.0 as u16 != s.last_cursor_col;
     if dirty.is_empty() && scrollback_appended.is_empty() && !cmd_running_changed
-        && !scrollback_reset
+        && !scrollback_reset && !cursor_changed
     {
         return;
     }
-    let cursor = s.term.grid().cursor.point;
     let seq = s.next_frame_seq;
     s.next_frame_seq = s.next_frame_seq.saturating_add(1);
     let frame = RenderFrame {
@@ -3033,6 +3045,8 @@ fn maybe_flush(s: &mut Session, app: &AppHandle<Wry>, id: &str) {
     s.last_snapshot = snapshot;
     s.last_flush = Instant::now();
     s.last_command_running = cmd_running;
+    s.last_cursor_row = cursor.line.0;
+    s.last_cursor_col = cursor.column.0 as u16;
     let _ = (app, id);
 }
 
