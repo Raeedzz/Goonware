@@ -275,7 +275,7 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
       // normally so onInput can strip it and avoid double-sending.
       // The isComposing guard preserves CJK IME where space confirms a
       // character selection rather than inserting 0x20.
-      if (e.key === " " && !e.isComposing && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      if (e.key === " " && !e.nativeEvent.isComposing && !e.ctrlKey && !e.altKey && !e.metaKey) {
         spacePreSentRef.current += 1;
         onSendBytes(new Uint8Array([0x20]));
         return;
