@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "motion/react";
+import { CaretDown } from "@phosphor-icons/react";
 import { git } from "@/lib/git";
 import { DiffBody } from "./DiffView";
 import { DiffAskOverlay, reconstructDiffContext } from "./DiffAsk";
@@ -239,15 +240,15 @@ export function FileBlock({ section }: { section: FileSection }) {
         <span
           aria-hidden
           style={{
-            display: "inline-block",
-            width: 8,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
             color: "var(--text-tertiary)",
-            fontSize: "var(--text-2xs)",
             transition: "transform var(--motion-fast) var(--ease-out-quart)",
             transform: collapsed ? "rotate(-90deg)" : "rotate(0deg)",
           }}
         >
-          ▾
+          <CaretDown size={10} />
         </span>
         <span
           style={{

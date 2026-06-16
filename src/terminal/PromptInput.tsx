@@ -446,6 +446,13 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
     // float in place while the textarea content scrolled underneath.
     const highlightRef = useRef<HTMLPreElement>(null);
     const [value, setValue] = useState("");
+    // Custom cursor: position in the value string and focus state. We draw
+    // the caret ourselves in PromptHighlight instead of relying on caretColor
+    // because WKWebView does not visually advance caret-color past transparent
+    // characters (spaces rendered with color:transparent), so the cursor
+    // appears frozen whenever the user presses space.
+    const [caretPos, setCaretPos] = useState(0);
+    const [focused, setFocused] = useState(false);
     // Index into history. -1 = composing a new line; 0 = most recent
     // committed entry; N-1 = oldest.
     const [historyCursor, setHistoryCursor] = useState(-1);
@@ -475,17 +482,20 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
       focus: () => textareaRef.current?.focus(),
       insertText: (text: string) => {
         const ta = textareaRef.current;
-        const start = ta?.selectionStart ?? value.length;
-        const end = ta?.selectionEnd ?? value.length;
-        const before = value.slice(0, start);
-        const after = value.slice(end);
+        const cur = ta?.value ?? value;
+        const start = ta?.selectionStart ?? cur.length;
+        const end = ta?.selectionEnd ?? cur.length;
+        const before = cur.slice(0, start);
+        const after = cur.slice(end);
         const next = before + text + after;
+        const cursor = before.length + text.length;
+        if (ta) ta.value = next;
         setValue(next);
+        setCaretPos(cursor);
         requestAnimationFrame(() => {
           const t = textareaRef.current;
           if (!t) return;
           t.focus();
-          const cursor = before.length + text.length;
           t.setSelectionRange(cursor, cursor);
         });
       },
@@ -543,13 +553,14 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
     }, [value]);
 
     const submit = () => {
-      const text = value;
+      const ta = textareaRef.current;
+      const text = ta?.value ?? value;
+      if (ta) ta.value = "";
       setValue("");
+      setCaretPos(0);
       setCompletions([]);
       setHistoryCursor(-1);
       onSubmit(text);
-      // Height resets to MIN via the auto-grow layout effect when
-      // `value` becomes "".
     };
 
     /**
@@ -568,20 +579,22 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
       try {
         const path = await system.saveImageToTemp(buf, ext);
         const quoted = shellQuotePath(path);
-        const before = value.slice(0, selStart);
-        const after = value.slice(selEnd);
+        const cur = textareaRef.current?.value ?? value;
+        const before = cur.slice(0, selStart);
+        const after = cur.slice(selEnd);
         const needLeading = before.length > 0 && !/\s$/.test(before);
         const needTrailing = after.length > 0 && !/^\s/.test(after);
         const insert = `${needLeading ? " " : ""}${quoted}${needTrailing ? " " : ""}`;
         const next = before + insert + after;
+        const cursor = before.length + insert.length;
+        const t = textareaRef.current;
+        if (t) t.value = next;
         setValue(next);
-        // Move the caret to right after the inserted path so the user
-        // can immediately keep typing (or Enter to submit).
+        setCaretPos(cursor);
         requestAnimationFrame(() => {
           const ta = textareaRef.current;
           if (!ta) return;
           ta.focus();
-          const cursor = before.length + insert.length;
           ta.setSelectionRange(cursor, cursor);
         });
       } catch (err) {
@@ -592,14 +605,15 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
     };
 
     const applyCompletion = (entry: DirEntry) => {
-      const arg = parseCdInput(value);
+      const arg = parseCdInput(textareaRef.current?.value ?? value);
       if (arg === null) return;
       const { parent } = splitPath(arg);
       const next = `cd ${parent}${entry.name}/`;
+      const ta = textareaRef.current;
+      if (ta) ta.value = next;
       setValue(next);
+      setCaretPos(next.length);
       setCompletionIndex(0);
-      // Keep focus + position the cursor at the end so the user can
-      // either Tab again to descend or Enter to run.
       requestAnimationFrame(() => {
         const ta = textareaRef.current;
         if (!ta) return;
@@ -685,7 +699,10 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
         } else {
           onSendBytes(new Uint8Array([0x03]));
         }
+        const taCtrlC = textareaRef.current;
+        if (taCtrlC) taCtrlC.value = "";
         setValue("");
+        setCaretPos(0);
         setCompletions([]);
         return;
       }
@@ -729,7 +746,7 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
         const ta = textareaRef.current;
         const snapshotStart = ta?.selectionStart ?? value.length;
         const snapshotEnd = ta?.selectionEnd ?? value.length;
-        const snapshotValue = value;
+        const snapshotValue = ta?.value ?? value;
         void (async () => {
           // Image branch first: ask Rust to peek at the pasteboard
           // for an image item and spool it. If there's no image, the
@@ -746,13 +763,16 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
               const needTrailing = after.length > 0 && !/^\s/.test(after);
               const insert = `${needLeading ? " " : ""}${quoted}${needTrailing ? " " : ""}`;
               const next = before + insert + after;
+              const imgCursor = before.length + insert.length;
+              const elImg = textareaRef.current;
+              if (elImg) elImg.value = next;
               setValue(next);
+              setCaretPos(imgCursor);
               requestAnimationFrame(() => {
                 const el = textareaRef.current;
                 if (!el) return;
                 el.focus();
-                const cursor = before.length + insert.length;
-                el.setSelectionRange(cursor, cursor);
+                el.setSelectionRange(imgCursor, imgCursor);
               });
               return;
             }
@@ -770,11 +790,15 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
             snapshotValue.slice(0, snapshotStart) +
             text +
             snapshotValue.slice(snapshotEnd);
+          const txtCursor = snapshotStart + text.length;
+          const elTxt = textareaRef.current;
+          if (elTxt) elTxt.value = next;
           setValue(next);
+          setCaretPos(txtCursor);
           requestAnimationFrame(() => {
             const el = textareaRef.current;
             if (!el) return;
-            el.selectionStart = el.selectionEnd = snapshotStart + text.length;
+            el.selectionStart = el.selectionEnd = txtCursor;
           });
         })();
         return;
@@ -813,7 +837,10 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
           e.preventDefault();
           const picked = historyEntries[historyIndex];
           if (picked != null) {
+            const taHist = textareaRef.current;
+            if (taHist) taHist.value = picked;
             setValue(picked);
+            setCaretPos(picked.length);
             setHistoryCursor(historyIndex);
             requestAnimationFrame(() => {
               const ta = textareaRef.current;
@@ -868,15 +895,17 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
           // new directory automatically.
           e.preventDefault();
           const entry = completions[completionIndex];
-          const arg = parseCdInput(value);
+          const arg = parseCdInput(textareaRef.current?.value ?? value);
           if (arg !== null) {
             const { parent } = splitPath(arg);
             const completed = `cd ${parent}${entry.name}/`;
+            const taComp = textareaRef.current;
+            if (taComp) taComp.value = "";
             setValue("");
+            setCaretPos(0);
             setCompletions([]);
             setHistoryCursor(-1);
             onSubmit(completed);
-            // Height resets via the auto-grow layout effect on clear.
           }
           return;
         }
@@ -914,12 +943,18 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
         const next = historyCursor - 1;
         if (next < 0) {
           setHistoryCursor(-1);
+          const taDown = textareaRef.current;
+          if (taDown) taDown.value = "";
           setValue("");
+          setCaretPos(0);
         } else {
           const entry = historyAt(next);
           if (entry !== null) {
             setHistoryCursor(next);
+            const taDown = textareaRef.current;
+            if (taDown) taDown.value = entry;
             setValue(entry);
+            setCaretPos(entry.length);
           }
         }
         return;
@@ -1116,20 +1151,24 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
             </div>
           </div>
         )}
-        <PromptHighlight value={value} preRef={highlightRef}>
+        <PromptHighlight value={value} caretPos={caretPos} showCursor={focused} preRef={highlightRef}>
           <textarea
             ref={textareaRef}
-            value={value}
+            defaultValue=""
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
+            onSelect={(e) => {
+              // Keep our tracked position in sync for arrow/click navigation.
+              setCaretPos(e.currentTarget.selectionStart);
+            }}
             onScroll={(e) => {
               const pre = highlightRef.current;
               if (pre) pre.scrollTop = e.currentTarget.scrollTop;
             }}
             onChange={(e) => {
               setValue(e.target.value);
+              setCaretPos(e.target.selectionStart);
               if (historyCursor >= 0) setHistoryCursor(-1);
-              // Height is handled by the auto-grow layout effect keyed
-              // on `value` — it covers typed, pasted, and wrapped text
-              // uniformly, so there's no per-path resize to do here.
             }}
             onPaste={(e: ClipboardEvent<HTMLTextAreaElement>) => {
               // Image paste: macOS Cmd+Shift+Ctrl+4, web-page image copy,
@@ -1193,7 +1232,7 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
               resize: "none",
               width: "100%",
               color: "transparent",
-              caretColor: "var(--accent-bright)",
+              caretColor: "transparent",
               maxHeight: MAX_INPUT_HEIGHT_PX,
               // Internal scroll once the box hits MAX. The scrollbar is
               // hidden via the `.goonware-prompt-input` CSS rule so its
@@ -1240,37 +1279,57 @@ export const PromptInput = memo(forwardRef<PromptInputHandle, Props>(
 /**
  * Layered syntax-highlight overlay. Renders a `<pre>` underneath the
  * textarea with the same content tokenized into colored spans. The
- * textarea above has transparent text so the user sees the colored
- * tokens but interacts with the textarea normally — selection, IME,
- * caret, undo, paste all keep working without us re-implementing
- * any of it.
+ * textarea above has transparent text + caret so the user sees the
+ * colored tokens and our custom cursor, while interacting with the
+ * native textarea for selection, IME, undo, and paste.
  *
- * Both layers must use identical font metrics (family, size, line
- * height, ligature setting) and zero padding/margin so character
- * positions align exactly. A trailing zero-width-space space gets
- * appended to the highlight so a final newline gets a row to render
- * into (otherwise `pre`'s last line collapses to height 0).
+ * We render the cursor here rather than relying on caretColor because
+ * WKWebView does not visually advance caret-color past characters
+ * rendered with color:transparent — pressing space appears to freeze
+ * the cursor even though the logical selectionStart is correct.
  */
 function PromptHighlight({
   value,
+  caretPos,
+  showCursor,
   children,
   preRef,
 }: {
   value: string;
+  caretPos: number;
+  showCursor: boolean;
   children: React.ReactNode;
   preRef?: React.RefObject<HTMLPreElement | null>;
 }) {
   const tokens = tokenize(value);
+
+  // Split tokens at caretPos and interleave the cursor element.
+  const nodes: React.ReactNode[] = [];
+  let pos = 0;
+  let cursorPlaced = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    const end = pos + t.text.length;
+    const color = tokenColor(t.kind);
+    if (showCursor && !cursorPlaced && caretPos >= pos && caretPos <= end) {
+      const cut = caretPos - pos;
+      if (cut > 0) nodes.push(<span key={`${i}a`} style={{ color }}>{t.text.slice(0, cut)}</span>);
+      nodes.push(<PromptCursor key="cur" />);
+      if (cut < t.text.length) nodes.push(<span key={`${i}b`} style={{ color }}>{t.text.slice(cut)}</span>);
+      cursorPlaced = true;
+    } else {
+      nodes.push(<span key={i} style={{ color }}>{t.text}</span>);
+    }
+    pos = end;
+  }
+  if (showCursor && !cursorPlaced) nodes.push(<PromptCursor key="cur" />);
+
   return (
     <div style={{ position: "relative", width: "100%" }}>
       <pre
         ref={preRef}
         aria-hidden
         style={{
-          // Same shared metrics as the textarea — see EDITOR_TEXT_STYLE.
-          // This is the half the user actually sees; it must lay out
-          // character-for-character like the (transparent) textarea
-          // above it.
           ...EDITOR_TEXT_STYLE,
           position: "absolute",
           inset: 0,
@@ -1279,17 +1338,31 @@ function PromptHighlight({
           overflow: "hidden",
         }}
       >
-        {tokens.map((t, i) => (
-          <span key={i} style={{ color: tokenColor(t.kind) }}>
-            {t.text}
-          </span>
-        ))}
-        {/* Trailing space so a value ending in \n gets a rendered row,
-            keeping the textarea and overlay heights in lockstep. */}
+        {nodes}
+        {/* Trailing zero-width space so a value ending in \n gets a
+            rendered row, keeping the textarea and overlay heights in lockstep. */}
         {"​"}
       </pre>
       {children}
     </div>
+  );
+}
+
+function PromptCursor() {
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        width: 2,
+        height: "1.15em",
+        backgroundColor: "var(--accent-bright)",
+        verticalAlign: "text-bottom",
+        marginLeft: -1,
+        marginRight: -1,
+        animation: "goonware-caret-blink 1s step-end infinite",
+        willChange: "opacity",
+      }}
+    />
   );
 }
 

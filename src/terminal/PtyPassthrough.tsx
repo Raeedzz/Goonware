@@ -112,6 +112,11 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
     // clipboard data (which the browser only exposes on the paste
     // event itself).
     const pendingPasteRef = useRef<string | null>(null);
+    // Count of spaces dispatched early in onKeyDown (see below).
+    // onInput strips that many leading spaces from whatever the browser
+    // inserted to avoid double-sending them, since WKWebView still fires
+    // the input event even when we return early from onKeyDown.
+    const spacePreSentRef = useRef(0);
 
     useImperativeHandle(ref, () => ({
       focus: () => inputRef.current?.focus(),
@@ -259,6 +264,23 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
         // SIGINT path falls through to keyToBytes below so the byte
         // (0x03) lands on the PTY through the normal encoding.
       }
+      // Space: dispatch at keydown time so the byte reaches the agent
+      // before WKWebView's word-boundary text processing delays the
+      // input event. Without this, space arrives a few ms late relative
+      // to other printable chars — enough to miss the agent's current
+      // render cycle — causing the cursor to appear frozen until the
+      // next character triggers a redraw. We intentionally do NOT call
+      // preventDefault: WKWebView fires input anyway (ignoring it for
+      // space), and omitting it lets the browser insert the space
+      // normally so onInput can strip it and avoid double-sending.
+      // The isComposing guard preserves CJK IME where space confirms a
+      // character selection rather than inserting 0x20.
+      if (e.key === " " && !e.nativeEvent.isComposing && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        spacePreSentRef.current += 1;
+        onSendBytes(new Uint8Array([0x20]));
+        return;
+      }
+
       const seq = keyToBytes(e, appCursor);
       if (seq) {
         e.preventDefault();
@@ -277,8 +299,33 @@ export const PtyPassthrough = memo(forwardRef<PtyPassthroughHandle, Props>(
     };
 
     const onInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      const value = e.target.value;
+      let value = e.target.value;
       if (value.length === 0) return;
+      // If space was pre-sent at keydown, strip the leading space from
+      // whatever the browser inserted so we don't send 0x20 twice.
+      // WKWebView inserts the space into the textarea even when we
+      // return early from onKeyDown without calling preventDefault, so
+      // value here is either " " (just the space, normal case) or " X"
+      // (space + next char, when WKWebView batched the input events).
+      // In both cases we peel off the leading space; any remainder is
+      // sent normally below.
+      if (spacePreSentRef.current > 0) {
+        // Strip as many leading spaces as were pre-sent at keydown.
+        // Handles three WKWebView cases: (1) input fires once per space
+        // ("  " → 2 separate events each with " "), (2) events are batched
+        // ("  " lands as one event), (3) a space is batched with the next
+        // typed char (" a" in one event). In all cases we peel off only
+        // the spaces we already sent and pass the remainder through the
+        // normal send path below.
+        while (spacePreSentRef.current > 0 && value.startsWith(" ")) {
+          value = value.slice(1);
+          spacePreSentRef.current -= 1;
+        }
+        if (value.length === 0) {
+          e.target.value = "";
+          return;
+        }
+      }
       const pasted = pendingPasteRef.current;
       pendingPasteRef.current = null;
       // Only wrap when (a) the agent has bracketed-paste enabled, and
