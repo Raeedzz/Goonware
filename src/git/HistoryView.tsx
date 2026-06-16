@@ -433,10 +433,19 @@ function CommitRow({
   const shown = commit.refs.slice(0, 2);
   const extra = commit.refs.length - shown.length;
 
-  // Content starts right after the node dot for this specific row's lane,
-  // not at a fixed gutter width — so each row hugs its own node position.
-  const nodeX = row ? Math.min(row.lane, MAX_LANES - 1) * LANE_W + 5 : 0;
-  const contentLeft = nodeX + 14; // node radius (3) + 11px breathing room
+  // Content must clear all lines drawn in this row, not just the node's lane.
+  // Pass-through lines in lanes to the right of the node would overlap text
+  // if we only measured the node's own position.
+  const allRowLanes = row
+    ? [
+        row.lane,
+        ...row.passes.map((p) => p.lane),
+        ...row.ins.map((s) => s.lane),
+        ...row.outs.map((s) => s.lane),
+      ]
+    : [0];
+  const rightmostLane = Math.min(Math.max(...allRowLanes), MAX_LANES - 1);
+  const contentLeft = rightmostLane * LANE_W + 5 + 14; // x of rightmost line + breathing room
 
   return (
     <li>
