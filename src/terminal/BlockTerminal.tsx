@@ -963,12 +963,10 @@ export function BlockTerminal({
       invoke("term_native_wheel", { id: ptyId, deltaLines: lines, col, row }).catch(
         () => {},
       );
-      // Keep any native selection glued to its text: the app repaints its grid
-      // in place when it scrolls, so shift the stored selection anchors by the
-      // distance the content moved. No-op when nothing is selected.
-      invoke("term_native_selection_scrolled", { paneKey, deltaLines: lines }).catch(
-        () => {},
-      );
+      // Any native selection stays glued to its text without our help: the Rust
+      // frame sink measures how far the app actually scrolled (content match)
+      // and shifts the selection anchors to match. We used to guess the distance
+      // here from `lines`, which drifted whenever the app scrolled ≠1 row/notch.
       // Drain a fast flick across subsequent frames (momentum) rather than one
       // big jump — smooth deceleration.
       if (Math.abs(accumPx) >= LINE_PX) raf = requestAnimationFrame(flush);
@@ -1103,11 +1101,12 @@ export function BlockTerminal({
       if (delta === 0) return; // back inside the safe zone — stop the loop
       if (altScreen) {
         // Alt-screen AGENT (claude/codex on the alt screen): the app owns its
-        // scroll-back, so page it with the same wheel encoding the wheel
-        // bridge uses, then shift the native selection anchors by the distance
-        // the content moved (term_native_selection_scrolled) so the highlight
-        // stays glued to the text it was started on instead of whatever
-        // scrolled under it. Whole lines only; the px remainder carries.
+        // scroll-back, so page it with the same wheel encoding the wheel bridge
+        // uses. The selection stays glued on its own — the Rust frame sink
+        // measures how far the app actually scrolled (content match) and shifts
+        // the anchors to match, so the highlight tracks the text it was started
+        // on instead of whatever scrolled under it. Whole lines only; the px
+        // remainder carries.
         wheelAccumPx += delta;
         const lines = Math.trunc(wheelAccumPx / DRAG_LINE_PX);
         if (lines !== 0) {
@@ -1115,9 +1114,6 @@ export function BlockTerminal({
           const col = Math.max(1, Math.floor((lastX - r.left) / CELL_W) + 1);
           const row = Math.max(1, Math.floor((edgeY - r.top) / CELL_H) + 1);
           invoke("term_native_wheel", { id: ptyId, deltaLines: lines, col, row }).catch(
-            () => {},
-          );
-          invoke("term_native_selection_scrolled", { paneKey, deltaLines: lines }).catch(
             () => {},
           );
         }

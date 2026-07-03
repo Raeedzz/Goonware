@@ -200,6 +200,18 @@ impl SelectionHandle {
             .is_selecting
     }
 
+    /// Whether a selection currently exists (a head anchor has been set) —
+    /// whether or not it is still being actively dragged. Used by the terminal
+    /// to skip the alt-screen scroll-glue bookkeeping entirely when there is
+    /// nothing selected.
+    pub fn has_selection(&self) -> bool {
+        self.selection
+            .lock()
+            .expect("Should not be poisoned.")
+            .head
+            .is_some()
+    }
+
     pub fn clear(&self) {
         self.selection
             .lock()

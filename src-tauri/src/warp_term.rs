@@ -871,6 +871,87 @@ fn is_zsh_eol_marker(row: &RowSnapshot) -> bool {
     seen
 }
 
+/// Concatenated glyph text of a row with trailing blanks trimmed — the identity
+/// we match on when measuring how far an alt-screen app scrolled. We compare
+/// TEXT (not the full styled spans) so a pager re-coloring a line (e.g. moving
+/// its highlighted current line, or a cursor landing on it) doesn't defeat the
+/// match.
+fn row_text(row: &RowSnapshot) -> String {
+    let mut s = String::new();
+    for sp in &row.spans {
+        s.push_str(&sp.text);
+    }
+    s.trim_end().to_string()
+}
+
+/// Measure how many rows an alt-screen app scrolled between two consecutive grid
+/// snapshots, by content matching. Returns `k` such that the new grid shows, at
+/// row `i`, what the old grid had at row `i + k`:
+///   - `k > 0` → content moved UP by k rows (scrolled toward newer / down)
+///   - `k < 0` → content moved DOWN by k rows (scrolled toward older / up)
+///   - `0`     → no clear scroll (partial repaint, spinner tick, cursor blink,
+///                a page swap, or genuinely nothing moved)
+///
+/// This is the source of truth for gluing a selection to alt-screen text, and it
+/// replaces the old "assume the app scrolls one row per wheel notch" guess —
+/// which drifts on any app that scrolls several rows per notch (vim's default,
+/// most pagers). Because it reads the app's ACTUAL response it's correct
+/// regardless of the app's wheel-to-rows ratio.
+///
+/// Deliberately conservative: it reports a non-zero shift only when a clear
+/// majority of the NON-BLANK rows line up at exactly one offset AND that offset
+/// explains more rows than staying put (k = 0). A one-line spinner update or a
+/// single streamed character leaves k = 0 unbeaten, so a completed selection is
+/// never nudged by a non-scroll repaint — the exact "jumpy / stuck selection"
+/// artifact a naive always-shift approach produces.
+fn detect_scroll_shift(old: &[RowSnapshot], new: &[RowSnapshot]) -> i32 {
+    let n = old.len().min(new.len());
+    if n < 4 {
+        return 0; // too little signal to be confident
+    }
+    let o: Vec<String> = old.iter().take(n).map(row_text).collect();
+    let e: Vec<String> = new.iter().take(n).map(row_text).collect();
+
+    // Count indices where new[i] equals old[i + k], ignoring blank rows (a blank
+    // line matches every other blank line and would inflate every offset).
+    let score = |k: i32| -> usize {
+        let mut c = 0usize;
+        for i in 0..n {
+            let j = i as i32 + k;
+            if j < 0 || j as usize >= n {
+                continue;
+            }
+            if !e[i].is_empty() && e[i] == o[j as usize] {
+                c += 1;
+            }
+        }
+        c
+    };
+
+    let base = score(0); // non-blank rows still in place
+    let mut best_k = 0i32;
+    let mut best = base;
+    let range = (n as i32) - 1;
+    for k in -range..=range {
+        if k == 0 {
+            continue;
+        }
+        let s = score(k);
+        if s > best {
+            best = s;
+            best_k = k;
+        }
+    }
+
+    // Require the winning offset to be genuinely dominant: it must line up a solid
+    // block of rows and clearly beat the in-place score, else treat it as noise.
+    if best_k != 0 && best >= 3 && best > base + 1 {
+        best_k
+    } else {
+        0
+    }
+}
+
 /// How many leading rows of the live grid to render: trims trailing blank rows
 /// (keeping through the cursor row) so an idle / just-finished shell screen sits
 /// compactly above the input instead of padding the transcript with blanks.
@@ -1580,7 +1661,26 @@ pub fn attach(app: &tauri::AppHandle) {
         // Route the frame to whichever pane mirrors this pty (main or side).
         if let Some(p) = pane_for_pty(pty_id) {
             let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
+            // Alt-screen scroll-glue: an alt-screen app (git log / less / man /
+            // vim / htop) repaints its grid in place when it scrolls, so a
+            // completed selection anchored to fixed grid coordinates would slide
+            // off the text it was started on. Measure how far the grid ACTUALLY
+            // scrolled (content match — robust to the app's rows-per-wheel-notch,
+            // which the old React-side line-count guess got wrong) and shift the
+            // selection to track it. Gated to when something is actually selected
+            // AND the app owns the screen: the normal shell/inline-agent
+            // transcript glues for free (its SelectableArea lives inside the
+            // ClippedScrollable, whose scroll translation already moves the
+            // selection with the content), so we must NOT double-shift it here.
+            let detect = frame.alt_screen && p.sel.has_selection();
+            let old_rows = if detect { g.rows.clone() } else { Vec::new() };
             g.apply_frame(frame);
+            if detect {
+                let k = detect_scroll_shift(&old_rows, &g.rows);
+                if k != 0 {
+                    p.sel.shift_relative_y(-(k as f32) * LINE_PX);
+                }
+            }
         }
         let _ = app_for_sink.run_on_main_thread(|| {
             warpui::platform::poke_embedded_redraw();
@@ -1980,24 +2080,6 @@ pub fn term_native_mouse(
     }
 }
 
-/// Tauri command: the alt-screen agent's content scrolled by `delta_lines`
-/// (the same signed line count just sent through `term_native_wheel`;
-/// positive = toward newer/down). The app repaints its grid in place, so a
-/// selection anchored to grid coordinates would highlight whatever text
-/// scrolled under it. Shift the stored selection bounds by the distance the
-/// content moved (scrolling up by N lines moves the text DOWN N rows →
-/// +N·LINE_PX) so the highlight stays glued to the text it was started on,
-/// Warp-style. Best-effort: assumes the app scrolls one row per wheel line
-/// (true for claude/codex and every pager we route here).
-#[tauri::command]
-pub fn term_native_selection_scrolled(pane_key: String, delta_lines: i32) {
-    let p = pane(&pane_key);
-    p.sel.shift_relative_y(-(delta_lines as f32) * LINE_PX);
-    if let Some(app) = APP_HANDLE.get() {
-        let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
-    }
-}
-
 /// Tauri command: the latest selected transcript text (cached by the
 /// `SelectableArea` selection handler), or `None` if nothing is selected. React
 /// reads this on Cmd+C in the shell and writes it to the clipboard via the
@@ -2051,6 +2133,125 @@ pub fn term_native_set_viewport(pane_key: String, top: f64, height: f64) {
     }
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
+    }
+}
+
+#[cfg(test)]
+mod scroll_shift_tests {
+    use super::*;
+
+    fn plain_span(text: &str) -> Span {
+        Span {
+            text: text.to_string(),
+            fg: "var(--text-primary)".into(),
+            bg: "var(--surface-0)".into(),
+            bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+            dim: false,
+            strikeout: false,
+            link: None,
+        }
+    }
+    fn rows(lines: &[&str]) -> Vec<RowSnapshot> {
+        lines
+            .iter()
+            .map(|l| RowSnapshot {
+                spans: vec![plain_span(l)],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scroll_down_shifts_content_up() {
+        // Ten distinct rows; the app scrolls DOWN by 3 (content moves up 3, three
+        // fresh rows appear at the bottom). new[i] == old[i+3] for the retained
+        // rows, so the measured shift is +3.
+        let old = rows(&[
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9",
+        ]);
+        let new = rows(&[
+            "r3", "r4", "r5", "r6", "r7", "r8", "r9", "n7", "n8", "n9",
+        ]);
+        assert_eq!(detect_scroll_shift(&old, &new), 3);
+    }
+
+    #[test]
+    fn scroll_up_shifts_content_down() {
+        // The app scrolls UP by 2 (content moves down 2, two older rows appear at
+        // the top). new[i] == old[i-2] → measured shift is -2.
+        let old = rows(&[
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9",
+        ]);
+        let new = rows(&[
+            "p0", "p1", "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+        ]);
+        assert_eq!(detect_scroll_shift(&old, &new), -2);
+    }
+
+    #[test]
+    fn identical_grids_report_no_scroll() {
+        let g = rows(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        assert_eq!(detect_scroll_shift(&g, &g), 0);
+    }
+
+    #[test]
+    fn spinner_tick_reports_no_scroll() {
+        // Only one row changes (a spinner glyph / streamed char). Staying put
+        // explains far more rows than any shift, so no shift is reported — this
+        // is what keeps a completed selection from jumping on a non-scroll frame.
+        let old = rows(&["a", "b", "c", "d", "e", "f", "g", "loading |"]);
+        let new = rows(&["a", "b", "c", "d", "e", "f", "g", "loading /"]);
+        assert_eq!(detect_scroll_shift(&old, &new), 0);
+    }
+
+    #[test]
+    fn full_page_swap_reports_no_scroll() {
+        // A page jump replaces every row with unrelated content — no offset lines
+        // anything up, so we conservatively report no scroll rather than guess.
+        let old = rows(&["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"]);
+        let new = rows(&["z0", "z1", "z2", "z3", "z4", "z5", "z6", "z7"]);
+        assert_eq!(detect_scroll_shift(&old, &new), 0);
+    }
+
+    #[test]
+    fn blank_rows_do_not_inflate_a_false_shift() {
+        // A grid that is mostly blank with a couple of content rows must not
+        // report a shift just because the blank rows "match" at every offset.
+        let old = rows(&["", "", "hello", "world", "", "", "", ""]);
+        let new = rows(&["", "", "hello", "world", "", "", "", ""]);
+        assert_eq!(detect_scroll_shift(&old, &new), 0);
+    }
+
+    #[test]
+    fn ignores_color_only_changes() {
+        // A pager re-coloring its current line (same text, different style) is not
+        // a scroll. row_text compares glyphs only, so this stays at 0.
+        let old = vec![
+            RowSnapshot { spans: vec![plain_span("line one")] },
+            RowSnapshot { spans: vec![plain_span("line two")] },
+            RowSnapshot { spans: vec![plain_span("line three")] },
+            RowSnapshot { spans: vec![plain_span("line four")] },
+            RowSnapshot { spans: vec![plain_span("line five")] },
+        ];
+        let mut recolored = plain_span("line three");
+        recolored.inverse = true;
+        let new = vec![
+            RowSnapshot { spans: vec![plain_span("line one")] },
+            RowSnapshot { spans: vec![plain_span("line two")] },
+            RowSnapshot { spans: vec![recolored] },
+            RowSnapshot { spans: vec![plain_span("line four")] },
+            RowSnapshot { spans: vec![plain_span("line five")] },
+        ];
+        assert_eq!(detect_scroll_shift(&old, &new), 0);
+    }
+
+    #[test]
+    fn tiny_grids_bail_out() {
+        let old = rows(&["a", "b", "c"]);
+        let new = rows(&["b", "c", "d"]);
+        assert_eq!(detect_scroll_shift(&old, &new), 0);
     }
 }
 
