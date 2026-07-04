@@ -501,7 +501,7 @@ export function DiffFixBar() {
             position: "absolute",
             left: 0,
             right: 0,
-            bottom: 0,
+            bottom: "var(--space-4)",
             display: "flex",
             justifyContent: "center",
             padding: "var(--space-3)",
