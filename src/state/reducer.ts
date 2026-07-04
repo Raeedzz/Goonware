@@ -36,6 +36,7 @@ export const INITIAL_STATE: AppState = {
   settingsOpen: false,
   settingsSection: { kind: "general" },
   prDialogOpen: null,
+  createWorktreeProjectId: null,
   settings: DEFAULT_SETTINGS,
   markdownView: "rich",
 };
@@ -175,6 +176,10 @@ export function reducer(state: AppState, action: AppAction): AppState {
       return updateWorktree(state, action.worktreeId, () => ({
         iconName: action.iconName,
       }));
+
+    case "set-create-worktree-open":
+      if (state.createWorktreeProjectId === action.projectId) return state;
+      return { ...state, createWorktreeProjectId: action.projectId };
 
     /* Worktrees --------------------------------------------------- */
 

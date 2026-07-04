@@ -42,7 +42,6 @@ import {
   useProjectWorktrees,
 } from "@/state/AppState";
 import {
-  applyBranchPrefix,
   projectSettings,
   type ArchiveRecord,
   type Project,
@@ -52,10 +51,8 @@ import {
 import { openProjectDialog } from "@/lib/projectDialog";
 import {
   collectWorktreePtyIds,
-  nextAutoBranch,
   worktreeArchive,
   primaryTerminalTab,
-  worktreeCreate,
   worktreeRestore,
 } from "@/lib/worktrees";
 import { forgetPtys } from "@/terminal/sessionMemory";
@@ -270,7 +267,6 @@ function ProjectGroup({
   activeWorktreeId: string | null;
 }) {
   const dispatch = useAppDispatch();
-  const toast = useToast();
   const [hovering, setHovering] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [menuAnchor, setMenuAnchor] = useState<{ x: number; y: number } | null>(
@@ -337,32 +333,10 @@ function ProjectGroup({
   }, []);
 
   const state = useAppState();
-  const onCreate = async () => {
-    const base = nextAutoBranch(project.id, state);
-    const branch = applyBranchPrefix(
-      base,
-      state.settings.branchPrefixMode,
-      state.settings.githubUsername,
-      state.settings.customBranchPrefix,
-    );
-    const cfg = projectSettings(project);
-    try {
-      const w = await worktreeCreate(
-        project.id,
-        project.path,
-        branch,
-        base,
-        {
-          baseRef: cfg.baseBranch,
-          filesToCopy: cfg.filesToCopy,
-          setupScript: cfg.setupScript,
-        },
-      );
-      dispatch({ type: "add-worktree", worktree: w });
-      dispatch({ type: "open-tab", tab: primaryTerminalTab(w) });
-    } catch (err) {
-      toast.show({ message: `Worktree creation failed: ${err}` });
-    }
+  // Opens the "New worktree" dialog (name / color / icon) instead of
+  // creating directly — the dialog owns the worktreeCreate call.
+  const onCreate = () => {
+    dispatch({ type: "set-create-worktree-open", projectId: project.id });
   };
 
   const onOpenSettings = () => {

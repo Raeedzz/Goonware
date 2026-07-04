@@ -4,6 +4,7 @@ import { Sidebar } from "./Sidebar";
 import { MainColumn } from "./MainColumn";
 import { RightPanel } from "./RightPanel";
 import { CreatePRDialog } from "./CreatePRDialog";
+import { CreateWorktreeDialog } from "./CreateWorktreeDialog";
 import { SettingsView } from "./SettingsView";
 import { UpdaterToast } from "./UpdaterToast";
 import { SearchOverlay } from "@/palette/SearchOverlay";
@@ -242,6 +243,7 @@ export function AppShell() {
 
       <SearchOverlay />
       <CreatePRDialog />
+      <CreateWorktreeDialog />
       <SettingsView />
       <UpdaterToast />
     </div>

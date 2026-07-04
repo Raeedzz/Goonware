@@ -560,6 +560,9 @@ export interface AppState {
      */
     mode: "manual" | "auto";
   } | null;
+  /** Project the "New worktree" dialog is creating into; null = closed.
+      Transient — stripped by persistence like the other dialog flags. */
+  createWorktreeProjectId: ProjectId | null;
 
   settings: Settings;
   markdownView: "rich" | "source";
@@ -594,6 +597,7 @@ export type AppAction =
       worktreeId: WorktreeId;
       iconName: string | undefined;
     }
+  | { type: "set-create-worktree-open"; projectId: ProjectId | null }
 
   // Worktrees
   | { type: "add-worktree"; worktree: Worktree }

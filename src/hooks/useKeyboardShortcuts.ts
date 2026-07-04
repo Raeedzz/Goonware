@@ -6,13 +6,7 @@ import {
   useAppState,
 } from "@/state/AppState";
 import { openProjectDialog } from "@/lib/projectDialog";
-import {
-  nextAutoBranch,
-  primaryTerminalTab,
-  worktreeCreate,
-} from "@/lib/worktrees";
 import { forgetPtys } from "@/terminal/sessionMemory";
-import { applyBranchPrefix, projectSettings } from "@/state/types";
 
 /**
  * Match a digit press regardless of modifier-induced char shifting.
@@ -172,38 +166,15 @@ export function useKeyboardShortcuts() {
         return;
       }
 
-      // ⌘N — auto-create a new worktree in the active project. No
-      // prompt: the branch is named via the random landmark pool.
+      // ⌘N — open the "New worktree" dialog for the active project.
+      // The dialog suggests a landmark name and lets the user rename
+      // it / pick a color and icon before creation.
       if (cmd && !shift && !e.altKey && e.key.toLowerCase() === "n" && project) {
         e.preventDefault();
-        const base = nextAutoBranch(project.id, state);
-        const branch = applyBranchPrefix(
-          base,
-          state.settings.branchPrefixMode,
-          state.settings.githubUsername,
-          state.settings.customBranchPrefix,
-        );
-        const proj = project;
-        const cfg = projectSettings(proj);
-        void (async () => {
-          try {
-            const w = await worktreeCreate(
-              proj.id,
-              proj.path,
-              branch,
-              base,
-              {
-                baseRef: cfg.baseBranch,
-                filesToCopy: cfg.filesToCopy,
-                setupScript: cfg.setupScript,
-              },
-            );
-            dispatch({ type: "add-worktree", worktree: w });
-            dispatch({ type: "open-tab", tab: primaryTerminalTab(w) });
-          } catch (err) {
-            window.alert(`Worktree creation failed: ${err}`);
-          }
-        })();
+        dispatch({
+          type: "set-create-worktree-open",
+          projectId: project.id,
+        });
         return;
       }
 
