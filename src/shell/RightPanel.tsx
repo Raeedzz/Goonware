@@ -44,6 +44,7 @@ import { forgetPtys } from "@/terminal/sessionMemory";
  */
 export function RightPanel() {
   const worktree = useActiveWorktree();
+  const { rightPanelCollapsed } = useAppState();
   if (!worktree) return null;
   const splitPct = Math.min(80, Math.max(20, worktree.rightSplitPct));
   const collapsed = worktree.secondaryCollapsed === true;
@@ -62,7 +63,16 @@ export function RightPanel() {
       }}
     >
       <UpperPanel worktree={worktree} />
-      <SecondaryPanel worktree={worktree} collapsed={collapsed} />
+      <SecondaryPanel
+        worktree={worktree}
+        collapsed={collapsed}
+        // The whole right panel collapsing to 0 width must hide the native
+        // side terminal explicitly: the panel's min-content DOM overflows
+        // the 0-width column (layout-wise — overflow:hidden only clips
+        // paint), so a merely-clipped tracker would still measure a real
+        // box hanging off the window's right edge.
+        panelHidden={rightPanelCollapsed}
+      />
     </div>
   );
 }
@@ -1625,9 +1635,13 @@ function ChecksView() {
 function SecondaryPanel({
   worktree,
   collapsed,
+  panelHidden,
 }: {
   worktree: Worktree;
   collapsed: boolean;
+  /** True while the whole right panel is collapsed to 0 width — the
+   *  native side pane must report hidden (zero rect + pty detach). */
+  panelHidden: boolean;
 }) {
   const dispatch = useAppDispatch();
   return (
@@ -1734,7 +1748,9 @@ function SecondaryPanel({
       >
         <WarpSurfaceTracker
           paneKey="side"
-          visible={!collapsed && worktree.secondaryTab === "terminal"}
+          visible={
+            !collapsed && !panelHidden && worktree.secondaryTab === "terminal"
+          }
         />
         <AnimatePresence initial={false}>
           {!collapsed && (

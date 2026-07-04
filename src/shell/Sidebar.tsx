@@ -5,7 +5,6 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type DragEvent,
   type MouseEvent,
   type ReactNode,
 } from "react";
@@ -60,6 +59,11 @@ import {
   worktreeRestore,
 } from "@/lib/worktrees";
 import { forgetPtys } from "@/terminal/sessionMemory";
+import {
+  beginPointerDrag,
+  DragGhost,
+  pointerDragActive,
+} from "@/lib/pointerDrag";
 import { useToast } from "@/primitives/Toast";
 import { useTrackAgentActivity } from "@/state/agentActivityStore";
 
@@ -273,69 +277,59 @@ function ProjectGroup({
     null,
   );
 
-  // Drag-reorder plumbing. The MIME type carries this project's id, so
-  // rows in OTHER repo groups never accept the drag — worktrees can
-  // only be rearranged within their own repository. Handlers are
-  // useCallback-stable so they don't defeat WorktreeRow's memo.
-  const dragMime = `application/x-goonware-worktree-${project.id}`.toLowerCase();
+  // Pointer-tracked drag-reorder plumbing (NOT HTML5 drag-and-drop —
+  // see lib/pointerDrag.tsx for why that can't work in this webview).
+  // The drop target is resolved by hit-testing the cursor against the
+  // rows' `data-wt-row` markers, and only ids belonging to THIS repo
+  // group are accepted — worktrees can only be rearranged within their
+  // own repository. Handlers are ref-backed and useCallback-stable so
+  // they don't defeat WorktreeRow's memo.
   const dragIdRef = useRef<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{
     id: string;
     edge: "above" | "below";
   } | null>(null);
+  const dropTargetRef = useRef(dropTarget);
+  dropTargetRef.current = dropTarget;
+  const rowIdsRef = useRef<Set<string>>(new Set());
+  rowIdsRef.current = new Set(worktrees.map((w) => w.id));
 
-  const onRowDragStart = useCallback(
-    (e: DragEvent, id: string) => {
-      dragIdRef.current = id;
-      e.dataTransfer.effectAllowed = "move";
-      e.dataTransfer.setData(dragMime, id);
-    },
-    [dragMime],
-  );
+  const onRowDragStart = useCallback((id: string) => {
+    dragIdRef.current = id;
+  }, []);
 
-  const rowEdge = (e: DragEvent): "above" | "below" => {
-    const r = e.currentTarget.getBoundingClientRect();
-    return e.clientY < r.top + r.height / 2 ? "above" : "below";
-  };
-
-  const onRowDragOver = useCallback(
-    (e: DragEvent, id: string) => {
-      if (!e.dataTransfer.types.includes(dragMime)) return;
-      // Hovering the row being dragged: dropping there is a no-op, so
-      // don't preventDefault (no drop affordance) or draw a line that
-      // implies a move.
-      if (id === dragIdRef.current) {
-        setDropTarget(null);
-        return;
-      }
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      const edge = rowEdge(e);
-      setDropTarget((cur) =>
-        cur?.id === id && cur.edge === edge ? cur : { id, edge },
-      );
-    },
-    [dragMime],
-  );
-
-  const onRowDrop = useCallback(
-    (e: DragEvent, id: string) => {
-      if (!e.dataTransfer.types.includes(dragMime)) return;
-      e.preventDefault();
-      const dragged = dragIdRef.current ?? e.dataTransfer.getData(dragMime);
-      if (dragged && dragged !== id) {
-        dispatch({
-          type: "reorder-worktree",
-          id: dragged,
-          targetId: id,
-          edge: rowEdge(e),
-        });
-      }
-      dragIdRef.current = null;
+  const onRowDragMove = useCallback((x: number, y: number) => {
+    // The DragGhost is offset from the cursor and pointer-transparent,
+    // so elementFromPoint lands on the real row under the pointer.
+    const li = document
+      .elementFromPoint(x, y)
+      ?.closest<HTMLElement>("[data-wt-row]");
+    const id = li?.dataset.wtRow ?? null;
+    // Hovering the row being dragged (or a row of another repo, or
+    // empty space): no line — dropping there is a no-op.
+    if (!id || id === dragIdRef.current || !rowIdsRef.current.has(id)) {
       setDropTarget(null);
-    },
-    [dragMime, dispatch],
-  );
+      return;
+    }
+    const r = li!.getBoundingClientRect();
+    const edge = y < r.top + r.height / 2 ? "above" : "below";
+    setDropTarget((cur) =>
+      cur?.id === id && cur.edge === edge ? cur : { id, edge },
+    );
+  }, []);
+
+  const onRowDrop = useCallback(() => {
+    const dragged = dragIdRef.current;
+    const target = dropTargetRef.current;
+    if (dragged && target && dragged !== target.id) {
+      dispatch({
+        type: "reorder-worktree",
+        id: dragged,
+        targetId: target.id,
+        edge: target.edge,
+      });
+    }
+  }, [dispatch]);
 
   const onRowDragEnd = useCallback(() => {
     dragIdRef.current = null;
@@ -506,17 +500,7 @@ function ProjectGroup({
         )}
       </div>
 
-      <ul
-        style={{ listStyle: "none", margin: 0, padding: 0 }}
-        // Clear the drop line when the drag exits the row list (over
-        // the project header, History, outside the sidebar…) instead
-        // of leaving it stuck on the last row hovered.
-        onDragLeave={(e) => {
-          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
-            setDropTarget(null);
-          }
-        }}
-      >
+      <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
         {worktrees.map((w) => (
           // `isRunning` is derived INSIDE WorktreeRow via the
           // singleton `agentActivityStore` (Claude transcript-mtime
@@ -537,7 +521,7 @@ function ProjectGroup({
             archiveBehavior={state.settings.archiveBehavior}
             deleteBranchOnArchive={state.settings.deleteBranchOnArchive}
             onRowDragStart={onRowDragStart}
-            onRowDragOver={onRowDragOver}
+            onRowDragMove={onRowDragMove}
             onRowDrop={onRowDrop}
             onRowDragEnd={onRowDragEnd}
             dropEdge={dropTarget?.id === w.id ? dropTarget.edge : null}
@@ -818,7 +802,7 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   archiveBehavior,
   deleteBranchOnArchive,
   onRowDragStart,
-  onRowDragOver,
+  onRowDragMove,
   onRowDrop,
   onRowDragEnd,
   dropEdge,
@@ -836,11 +820,11 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   archiveBehavior: "ask" | "stash" | "force";
   /** Per-Git-settings tab. Drilled in for the same memo reasons. */
   deleteBranchOnArchive: boolean;
-  /** Drag-reorder hooks from the owning ProjectGroup — stable
+  /** Pointer drag-reorder hooks from the owning ProjectGroup — stable
       (useCallback) so they don't defeat the memo above. */
-  onRowDragStart: (e: DragEvent, id: string) => void;
-  onRowDragOver: (e: DragEvent, id: string) => void;
-  onRowDrop: (e: DragEvent, id: string) => void;
+  onRowDragStart: (id: string) => void;
+  onRowDragMove: (x: number, y: number) => void;
+  onRowDrop: () => void;
   onRowDragEnd: () => void;
   /** Where the in-flight drag would land relative to this row — drawn
       as a 2px accent line. Null when this row isn't the drop target. */
@@ -855,6 +839,11 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   // rerender (the others stay memoized).
   const isRunning = useTrackAgentActivity(worktree.id, worktree.path);
   const dispatch = useAppDispatch();
+  // Cursor position of an in-flight reorder drag (null = not dragging).
+  // Doubles as the mount flag for the floating DragGhost label.
+  const [dragGhost, setDragGhost] = useState<{ x: number; y: number } | null>(
+    null,
+  );
   // Subscribed to state so the archive handler can look up the
   // worktree's terminal-tab pty_ids and feed them to `forgetPtys`.
   // The earlier memo discipline (drill `archiveBehavior` /
@@ -1080,23 +1069,15 @@ const WorktreeRow = memo(function WorktreeRowImpl({
   return (
     <li
       ref={rowRef}
-      // The icon-picker dialog renders inline inside this li (it does
-      // not portal) — a draggable ancestor turns its text-selection
-      // drags into row drags in WebKit, so suspend dragging while the
-      // dialog is open.
-      draggable={!pickerOpen}
-      onDragStart={(e) => {
-        // A drag kills hover intent — never pop the hover card mid-drag.
-        cancelTimers();
-        setCardAnchor(null);
-        setHovering(false);
-        onRowDragStart(e, worktree.id);
-      }}
-      onDragOver={(e) => onRowDragOver(e, worktree.id)}
-      onDrop={(e) => onRowDrop(e, worktree.id)}
-      onDragEnd={onRowDragEnd}
+      // Drop-target marker for the pointer drag's elementFromPoint
+      // hit-test (see ProjectGroup.onRowDragMove).
+      data-wt-row={worktree.id}
       style={{ position: "relative" }}
       onMouseEnter={() => {
+        // Rows swept over during a reorder drag must not light up or
+        // arm the hover card — pointer drags don't suppress mouseenter
+        // the way a native drag session did.
+        if (pointerDragActive()) return;
         setHovering(true);
         openCard();
       }}
@@ -1121,11 +1102,44 @@ const WorktreeRow = memo(function WorktreeRowImpl({
           }}
         />
       )}
+      {dragGhost && (
+        <DragGhost x={dragGhost.x} y={dragGhost.y} label={worktree.name} />
+      )}
       <button
         type="button"
         onClick={onSelect}
         onDoubleClick={onDoubleClick}
         onContextMenu={onContextMenu}
+        // Pointer-tracked reorder drag. A plain click never crosses the
+        // movement threshold, so select/double-click keep working; once
+        // the threshold IS crossed, beginPointerDrag swallows the
+        // trailing click so a drop doesn't also activate this row.
+        onMouseDown={(e) => {
+          if (pickerOpen) return;
+          // Only arm from the row surface itself, not the inline action
+          // buttons that appear on hover (archive, settings, …).
+          if ((e.target as HTMLElement).closest("button") !== e.currentTarget)
+            return;
+          beginPointerDrag(e, {
+            onStart: (x, y) => {
+              // A drag kills hover intent — never pop the card mid-drag.
+              cancelTimers();
+              setCardAnchor(null);
+              setHovering(false);
+              onRowDragStart(worktree.id);
+              setDragGhost({ x, y });
+            },
+            onMove: (x, y) => {
+              setDragGhost({ x, y });
+              onRowDragMove(x, y);
+            },
+            onDrop: () => onRowDrop(),
+            onEnd: () => {
+              onRowDragEnd();
+              setDragGhost(null);
+            },
+          });
+        }}
         style={rowStyle}
         // Active rows lock to `activeBg` — hover does NOT override.
         // Without this guard the row visibly flickers when the user

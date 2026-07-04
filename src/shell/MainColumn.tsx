@@ -19,7 +19,7 @@ import { projectSettings } from "@/state/types";
 import { collectWorktreePtyIds, worktreeArchive } from "@/lib/worktrees";
 import { forgetPtys } from "@/terminal/sessionMemory";
 import { useToast } from "@/primitives/Toast";
-import { FolderDashedIcon } from "@phosphor-icons/react";
+import { ArrowsOutSimpleIcon, FolderDashedIcon } from "@phosphor-icons/react";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
@@ -29,6 +29,11 @@ import { CommitDetailView } from "@/git/CommitDetailView";
 import { Editor } from "@/editor/Editor";
 import { MarkdownView } from "@/editor/MarkdownView";
 import { fs } from "@/lib/fs";
+import {
+  beginPointerDrag,
+  DragGhost,
+  pointerDragActive,
+} from "@/lib/pointerDrag";
 import { RepositorySettingsView } from "./RepositorySettingsView";
 
 /**
@@ -46,6 +51,18 @@ export function MainColumn() {
   // file has unsaved edits, we hold the tab in this state and render
   // the modal. Clean tabs close immediately and never set this.
   const [pendingClose, setPendingClose] = useState<Tab | null>(null);
+  // Tab id currently being dragged out of the strip (HTML5 drag). While
+  // set, TabContent renders the split drop overlay. Cleared on dragend.
+  const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
+
+  // Second pane of the 50/50 split, resolved defensively: the reducer
+  // enforces splitTabId ≠ activeTabId and clears it on close, but stale
+  // persisted state must degrade to "no split", not a broken layout.
+  const splitTab =
+    (worktree?.splitTabId &&
+      worktree.splitTabId !== activeTab?.id &&
+      tabs.find((t) => t.id === worktree.splitTabId)) ||
+    null;
 
   if (!project || !worktree) {
     return (
@@ -117,13 +134,17 @@ export function MainColumn() {
       <TabStrip
         tabs={tabs}
         activeTabId={activeTab?.id ?? null}
+        splitTabId={splitTab?.id ?? null}
         worktreeId={worktree.id}
         onCloseTab={requestCloseTab}
+        onTabDragChange={setDraggingTabId}
       />
       <TabContent
         worktree={worktree}
         tab={activeTab}
+        splitTab={splitTab}
         cwd={worktree.path}
+        draggingTabId={draggingTabId}
       />
       <CloseTabConfirmDialog
         tab={pendingClose}
@@ -179,13 +200,18 @@ export function MainColumn() {
 function TabStrip({
   tabs,
   activeTabId,
+  splitTabId,
   worktreeId,
   onCloseTab,
+  onTabDragChange,
 }: {
   tabs: Tab[];
   activeTabId: string | null;
+  splitTabId: string | null;
   worktreeId: string;
   onCloseTab: (tab: Tab) => void;
+  /** Fires with the tab id on dragstart, null on dragend. */
+  onTabDragChange: (id: string | null) => void;
 }) {
   const dispatch = useAppDispatch();
 
@@ -242,8 +268,10 @@ function TabStrip({
             key={tab.id}
             tab={tab}
             active={tab.id === activeTabId}
+            inSplit={tab.id === splitTabId}
             worktreeId={worktreeId}
             onCloseTab={onCloseTab}
+            onTabDragChange={onTabDragChange}
           />
         ))}
         <button
@@ -317,13 +345,20 @@ function TabStrip({
 function TabButton({
   tab,
   active,
+  inSplit,
   worktreeId,
   onCloseTab,
+  onTabDragChange,
 }: {
   tab: Tab;
   active: boolean;
+  /** True when this tab occupies the split (right) pane — tinted like
+   *  the active tab but without the accent underline, so the strip
+   *  shows both on-screen tabs at a glance. */
+  inSplit: boolean;
   worktreeId: string;
   onCloseTab: (tab: Tab) => void;
+  onTabDragChange: (id: string | null) => void;
 }) {
   const dispatch = useAppDispatch();
   // Hover tooltip exposes the tab's full live summary — the same
@@ -334,12 +369,49 @@ function TabButton({
     useTooltipAnchor<HTMLDivElement>();
   const tooltipLabel = fullTabSummary(tab);
 
+  // Pointer-tracked drag out of the strip (NOT HTML5 drag-and-drop —
+  // see lib/pointerDrag.tsx for why that can't work in this webview).
+  // The ghost position doubles as the "is dragging" flag.
+  const [ghost, setGhost] = useState<{ x: number; y: number } | null>(null);
+
+  const onTabMouseDown = (e: React.MouseEvent) => {
+    // Not from the close button — that's a click affordance, and a
+    // drag from it would close-or-split ambiguously.
+    if ((e.target as HTMLElement).closest("button")) return;
+    beginPointerDrag(e, {
+      onStart: (x, y) => {
+        cancelShow();
+        onTabDragChange(tab.id);
+        setGhost({ x, y });
+      },
+      onMove: (x, y) => setGhost({ x, y }),
+      onDrop: (x, y) => {
+        const zone = document.querySelector("[data-tab-drop-zone]");
+        const r = zone?.getBoundingClientRect();
+        if (!r || x < r.left || x > r.right || y < r.top || y > r.bottom) {
+          return;
+        }
+        dispatch({
+          type: "split-tab",
+          worktreeId,
+          id: tab.id,
+          side: x < r.left + r.width / 2 ? "left" : "right",
+        });
+      },
+      onEnd: () => {
+        onTabDragChange(null);
+        setGhost(null);
+      },
+    });
+  };
+
   return (
     <>
     <motion.div
       ref={ref}
       role="tab"
       aria-selected={active}
+      onMouseDown={onTabMouseDown}
       // `layout="position"` (not `layout`) — we want neighbours to
       // slide when a tab is opened, closed, or reordered, but we
       // *don't* want motion to animate the tab's own width when its
@@ -355,7 +427,10 @@ function TabButton({
         cancelShow();
         dispatch({ type: "select-tab", worktreeId, id: tab.id });
       }}
-      onMouseEnter={beginShow}
+      onMouseEnter={() => {
+        // No tooltips on tabs swept over mid-drag.
+        if (!pointerDragActive()) beginShow();
+      }}
       onMouseLeave={cancelShow}
       style={{
         position: "relative",
@@ -370,8 +445,10 @@ function TabButton({
         maxWidth: 240,
         padding: "0 var(--space-2) 0 10px",
         cursor: "pointer",
-        backgroundColor: active ? "var(--surface-2)" : "transparent",
-        color: active ? "var(--text-primary)" : "var(--text-secondary)",
+        backgroundColor:
+          active || inSplit ? "var(--surface-2)" : "transparent",
+        color:
+          active || inSplit ? "var(--text-primary)" : "var(--text-secondary)",
         borderTopLeftRadius: 6,
         borderTopRightRadius: 6,
         transition:
@@ -443,6 +520,7 @@ function TabButton({
         />
       )}
     </AnimatePresence>
+    {ghost && <DragGhost x={ghost.x} y={ghost.y} label={tabLabel(tab)} />}
     </>
   );
 }
@@ -648,20 +726,64 @@ function isTabDirty(tab: Tab): boolean {
    Tab content router
    ------------------------------------------------------------------ */
 
+/** Width of the black seam between the two split halves. */
+const SPLIT_DIVIDER_W = 1;
+
+/**
+ * Geometry of one content pane. `full` (no split) is the whole content
+ * area; `left`/`right` are the two halves of the 50/50 split with a
+ * SPLIT_DIVIDER_W seam between them. Shared by the half containers AND
+ * the terminal keepalive slots so a terminal's DOM slot, its
+ * WarpSurfaceTracker rect, and its non-terminal siblings always agree
+ * on the same box.
+ */
+function paneBox(side: "full" | "left" | "right"): React.CSSProperties {
+  if (side === "left") {
+    return {
+      position: "absolute",
+      top: 0,
+      bottom: 0,
+      left: 0,
+      width: `calc(50% - ${SPLIT_DIVIDER_W}px)`,
+    };
+  }
+  if (side === "right") {
+    return { position: "absolute", top: 0, bottom: 0, left: "50%", right: 0 };
+  }
+  return { position: "absolute", inset: 0 };
+}
+
 function TabContent({
   worktree,
   tab,
+  splitTab,
   cwd,
+  draggingTabId,
 }: {
   worktree: Worktree;
   tab: Tab | null;
+  /** Occupant of the split (right) pane, or null when unsplit. */
+  splitTab: Tab | null;
   // `cwd` is the WORKTREE path, not the project root. Git commands
   // (`git_diff`, `git_diff_all`) must run inside the active worktree
   // — running them at the project root would silently report the
   // wrong directory's diff (which can be empty even when the
   // worktree has changes).
   cwd: string;
+  /** Tab id mid-drag from the strip; renders the split drop overlay. */
+  draggingTabId: string | null;
 }) {
+  const split = !!splitTab;
+  // TEMP DEBUG — remove before commit (live-state mirror for the render
+  // investigation; a module-level interval at the bottom of this file
+  // posts it to a local diagnostics listener).
+  (window as unknown as Record<string, unknown>).__paneState = {
+    wt: worktree.id,
+    splitTabIdRaw: worktree.splitTabId ?? null,
+    activeTabId: worktree.activeTabId ?? null,
+    active: tab ? { id: tab.id, kind: tab.kind } : null,
+    split: splitTab ? { id: splitTab.id, kind: splitTab.kind } : null,
+  };
   // Terminal-kind tabs go through the always-mounted keepalive
   // layer; non-terminal kinds (diff, markdown, all-changes,
   // project-settings) mount on demand. The keepalive layer is
@@ -678,71 +800,254 @@ function TabContent({
   // already-mounted terminals — no re-listen, no re-term_start,
   // no React commit cascade for the BlockTerminal subtree.
   return (
-    <div style={{ minHeight: 0, minWidth: 0, position: "relative", overflow: "hidden" }}>
-      {/* Reports this pane's rect to the native warpui terminal surface so it
-          composites over exactly the terminal region. */}
-      <WarpSurfaceTracker visible={!!tab && tab.kind === "terminal"} />
+    <div
+      data-tab-drop-zone
+      style={{ minHeight: 0, minWidth: 0, position: "relative", overflow: "hidden" }}
+    >
       <ErrorBoundary>
         <TerminalKeepaliveLayer
           activeTerminalTabId={
             tab && tab.kind === "terminal" ? tab.id : null
           }
+          splitTerminalTabId={
+            splitTab && splitTab.kind === "terminal" ? splitTab.id : null
+          }
+          split={split}
           activeWorktree={worktree}
         />
-        {!tab && (
-          <div
-            style={{
-              position: "absolute",
-              inset: 0,
-              display: "grid",
-              placeItems: "center",
-              color: "var(--text-tertiary)",
-              fontSize: "var(--text-xs)",
-              backgroundColor: "var(--surface-2)",
-            }}
-          >
-            No tab open. Press <Kbd>+</Kbd> to start a terminal.
-          </div>
+        <HalfPane side={split ? "left" : "full"} tab={tab} cwd={cwd} />
+        {splitTab && (
+          <>
+            <div
+              aria-hidden
+              style={{
+                position: "absolute",
+                top: 0,
+                bottom: 0,
+                left: `calc(50% - ${SPLIT_DIVIDER_W}px)`,
+                width: SPLIT_DIVIDER_W,
+                backgroundColor: "var(--border-default)",
+                zIndex: 2,
+              }}
+            />
+            <HalfPane side="right" tab={splitTab} cwd={cwd} />
+            <ExpandPaneButton side="left" worktreeId={worktree.id} />
+            <ExpandPaneButton side="right" worktreeId={worktree.id} />
+          </>
         )}
-        {tab && tab.kind !== "terminal" && (
-          <div
-            style={{
-              position: "absolute",
-              inset: 0,
-              display: "flex",
-              flexDirection: "column",
-              backgroundColor: "var(--surface-2)",
-              minHeight: 0,
-            }}
-          >
-            {tab.kind === "diff" ? (
-              <DiffTabContent
-                key={tab.id}
-                tabId={tab.id}
-                cwd={cwd}
-                filePath={tab.filePath}
-                staged={tab.staged}
-              />
-            ) : tab.kind === "all-changes" ? (
-              <AllChangesView key={tab.id} projectPath={cwd} />
-            ) : tab.kind === "commit" ? (
-              <CommitDetailView
-                key={tab.id}
-                cwd={cwd}
-                hash={tab.hash}
-                worktreeId={tab.worktreeId}
-              />
-            ) : tab.kind === "project-settings" ? (
-              <RepositorySettingsView
-                key={tab.id}
-                projectId={tab.projectId}
-              />
-            ) : (
-              <MarkdownTabContent key={tab.id} tab={tab} />
-            )}
-          </div>
-        )}
+        {draggingTabId && <TabDropOverlay />}
       </ErrorBoundary>
+    </div>
+  );
+}
+
+/**
+ * One content pane (the whole area, or one half of the split). Hosts
+ * the pane's WarpSurfaceTracker (native terminal rect reporting) and
+ * the non-terminal tab views. Terminal tabs render NOTHING here — they
+ * live in the keepalive layer underneath, which positions the matching
+ * slot over this same paneBox — so the container is pointer-transparent
+ * to let clicks fall through to the terminal.
+ */
+function HalfPane({
+  side,
+  tab,
+  cwd,
+}: {
+  side: "full" | "left" | "right";
+  tab: Tab | null;
+  cwd: string;
+}) {
+  const isTerminal = !!tab && tab.kind === "terminal";
+  return (
+    <div style={{ ...paneBox(side), pointerEvents: "none", zIndex: 1 }}>
+      {/* Reports this pane's rect to the native warpui terminal surface
+          so it composites over exactly the terminal region. The main
+          pane (full/left) keeps reporting its box even when hidden so
+          the retained Rust-side rect tracks split-layout changes that
+          happen while a non-terminal tab is showing; the right half
+          zeroes instead (its pane should vanish when not a terminal). */}
+      <WarpSurfaceTracker
+        visible={isTerminal}
+        paneKey={side === "right" ? "main2" : "main"}
+        reportWhenHidden={side !== "right"}
+      />
+      {!tab && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "grid",
+            placeItems: "center",
+            color: "var(--text-tertiary)",
+            fontSize: "var(--text-xs)",
+            backgroundColor: "var(--surface-2)",
+            pointerEvents: "auto",
+          }}
+        >
+          No tab open. Press <Kbd>+</Kbd> to start a terminal.
+        </div>
+      )}
+      {tab && tab.kind !== "terminal" && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            flexDirection: "column",
+            backgroundColor: "var(--surface-2)",
+            minHeight: 0,
+            pointerEvents: "auto",
+          }}
+        >
+          {tab.kind === "diff" ? (
+            <DiffTabContent
+              key={tab.id}
+              tabId={tab.id}
+              cwd={cwd}
+              filePath={tab.filePath}
+              staged={tab.staged}
+            />
+          ) : tab.kind === "all-changes" ? (
+            <AllChangesView key={tab.id} projectPath={cwd} />
+          ) : tab.kind === "commit" ? (
+            <CommitDetailView
+              key={tab.id}
+              cwd={cwd}
+              hash={tab.hash}
+              worktreeId={tab.worktreeId}
+            />
+          ) : tab.kind === "project-settings" ? (
+            <RepositorySettingsView
+              key={tab.id}
+              projectId={tab.projectId}
+            />
+          ) : (
+            <MarkdownTabContent key={tab.id} tab={tab} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Floating "make this half full screen again" affordance, one per half
+ * while split. Collapses the split keeping this half's tab as the
+ * active full-width tab.
+ */
+function ExpandPaneButton({
+  side,
+  worktreeId,
+}: {
+  side: "left" | "right";
+  worktreeId: string;
+}) {
+  const dispatch = useAppDispatch();
+  return (
+    <button
+      type="button"
+      title={`Expand ${side} pane · full screen`}
+      onClick={() => dispatch({ type: "unsplit", worktreeId, keep: side })}
+      style={{
+        position: "absolute",
+        top: 6,
+        ...(side === "left"
+          ? { right: `calc(50% + ${SPLIT_DIVIDER_W + 6}px)` }
+          : { right: 6 }),
+        zIndex: 6,
+        width: 24,
+        height: 24,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        color: "var(--text-tertiary)",
+        backgroundColor: "var(--surface-2)",
+        border: "var(--border-1)",
+        borderRadius: "var(--radius-sm)",
+        opacity: 0.75,
+        transition:
+          "opacity var(--motion-instant) var(--ease-out-quart)," +
+          "color var(--motion-instant) var(--ease-out-quart)",
+      }}
+      onMouseOver={(e) => {
+        e.currentTarget.style.opacity = "1";
+        e.currentTarget.style.color = "var(--text-primary)";
+      }}
+      onMouseOut={(e) => {
+        e.currentTarget.style.opacity = "0.75";
+        e.currentTarget.style.color = "var(--text-tertiary)";
+      }}
+    >
+      <ArrowsOutSimpleIcon size={13} />
+    </button>
+  );
+}
+
+/**
+ * Purely visual drop hint, mounted only while a tab is being pointer-
+ * dragged from the strip. Tracks the cursor via window mousemove and
+ * highlights whichever half of the content area it's over. The actual
+ * drop is dispatched by the drag source (TabButton) on mouseup, hit-
+ * testing against the `data-tab-drop-zone` root — this layer stays
+ * `pointerEvents: none` so it can never eat the interaction.
+ */
+function TabDropOverlay() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [hoverSide, setHoverSide] = useState<"left" | "right" | null>(null);
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const r = ref.current?.getBoundingClientRect();
+      if (!r) return;
+      const inside =
+        e.clientX >= r.left &&
+        e.clientX <= r.right &&
+        e.clientY >= r.top &&
+        e.clientY <= r.bottom;
+      const side = !inside
+        ? null
+        : e.clientX < r.left + r.width / 2
+          ? "left"
+          : "right";
+      setHoverSide((cur) => (cur === side ? cur : side));
+    };
+    // Capture phase, same as beginPointerDrag's tracker, so panes that
+    // stopPropagation mousemove can't hide the hint.
+    window.addEventListener("mousemove", onMove, true);
+    return () => window.removeEventListener("mousemove", onMove, true);
+  }, []);
+
+  return (
+    <div
+      ref={ref}
+      style={{ position: "absolute", inset: 0, zIndex: 40, pointerEvents: "none" }}
+    >
+      {hoverSide && (
+        <div
+          aria-hidden
+          style={{
+            position: "absolute",
+            top: 4,
+            bottom: 4,
+            ...(hoverSide === "left"
+              ? { left: 4, right: "calc(50% + 2px)" }
+              : { left: "calc(50% + 2px)", right: 4 }),
+            borderRadius: "var(--radius-md)",
+            border: "1px solid var(--accent)",
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              backgroundColor: "var(--accent)",
+              opacity: 0.12,
+            }}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -770,9 +1075,17 @@ const KEEPALIVE_WORKTREES = 3;
 
 function TerminalKeepaliveLayer({
   activeTerminalTabId,
+  splitTerminalTabId,
+  split,
   activeWorktree,
 }: {
   activeTerminalTabId: string | null;
+  /** Terminal tab occupying the split (right) pane, if any. */
+  splitTerminalTabId: string | null;
+  /** True while the 50/50 split is open (regardless of tab kinds) —
+      the active terminal then renders into the LEFT half instead of
+      the full content box. */
+  split: boolean;
   activeWorktree: Worktree;
 }) {
   const state = useAppState();
@@ -809,7 +1122,19 @@ function TerminalKeepaliveLayer({
   return (
     <>
       {terminalSlots.map(({ tab, worktree }) => {
-        const visible = tab.id === activeTerminalTabId;
+        // Where this terminal renders: the full content box, one half
+        // of the split, or nowhere (kept alive but hidden). Placement
+        // shares paneBox() with the HalfPane containers so the slot,
+        // its tracker rect, and any sibling non-terminal half line up.
+        const placement: "full" | "left" | "right" | null =
+          tab.id === activeTerminalTabId
+            ? split
+              ? "left"
+              : "full"
+            : tab.id === splitTerminalTabId
+              ? "right"
+              : null;
+        const visible = placement !== null;
         return (
           <div
             key={tab.id}
@@ -834,8 +1159,7 @@ function TerminalKeepaliveLayer({
             // useTerminalSession — which gates React state updates,
             // not GPU work.
             style={{
-              position: "absolute",
-              inset: 0,
+              ...paneBox(placement ?? "full"),
               display: "flex",
               flexDirection: "column",
               minHeight: 0,
@@ -852,6 +1176,7 @@ function TerminalKeepaliveLayer({
               worktree={worktree}
               tab={tab}
               isVisible={visible}
+              paneKey={placement === "right" ? "main2" : "main"}
             />
           </div>
         );
@@ -864,10 +1189,14 @@ function TerminalTabContent({
   worktree,
   tab,
   isVisible,
+  paneKey,
 }: {
   worktree: Worktree;
   tab: TerminalTab;
   isVisible: boolean;
+  /** Native pane this slot drives: "main" (full / left half) or
+   *  "main2" (the split's right half). */
+  paneKey: "main" | "main2";
 }) {
   const dispatch = useAppDispatch();
   const { settings } = useAppState();
@@ -883,6 +1212,7 @@ function TerminalTabContent({
       // Main-column terminals drive the native warpui surface; right-panel
       // agent terminals do not (single surface until multi-pane, M6).
       nativeSurface
+      paneKey={paneKey}
       // Re-seed agent state on remount so an in-flight claude/codex
       // session doesn't briefly drop back to shell mode (which paints
       // PromptInput under the agent's own UI) when the user navigates
@@ -1491,3 +1821,41 @@ function MissingWorktreeView({
   );
 }
 
+
+
+// TEMP DEBUG — remove before commit. Posts a 2s heartbeat of the pane
+// layout (state mirror + drop-zone children boxes + visibility) to a
+// local diagnostics listener so pane-rendering failures can be caught
+// in the exact moment they happen.
+{
+  const g = window as unknown as { __paneDump?: number; __paneState?: unknown };
+  if (g.__paneDump) window.clearInterval(g.__paneDump);
+  g.__paneDump = window.setInterval(() => {
+    const z = document.querySelector("[data-tab-drop-zone]");
+    const kids = z
+      ? Array.from(z.children).map((c) => {
+          const e = c as HTMLElement;
+          const r = e.getBoundingClientRect();
+          const cs = getComputedStyle(e);
+          return {
+            rect: { x: r.x, y: r.y, w: r.width, h: r.height },
+            vis: cs.visibility,
+            z: cs.zIndex,
+            kidCount: e.children.length,
+            text: (e.textContent ?? "").slice(0, 40),
+          };
+        })
+      : null;
+    const zr = z?.getBoundingClientRect();
+    fetch("http://localhost:8787/dump", {
+      method: "POST",
+      body: JSON.stringify({
+        t: new Date().toISOString(),
+        win: { w: window.innerWidth, h: window.innerHeight },
+        zone: zr ? { x: zr.x, y: zr.y, w: zr.width, h: zr.height } : null,
+        state: g.__paneState ?? null,
+        kids,
+      }),
+    }).catch(() => {});
+  }, 2000);
+}

@@ -231,8 +231,8 @@ export function HunkCommentBox({
         minHeight: 96,
         borderRadius: "var(--radius-md)",
         border:
-          "1px solid color-mix(in oklch, var(--border-strong), var(--accent) 20%)",
-        backgroundColor: "var(--surface-accent-soft)",
+          "1px solid color-mix(in oklch, var(--border-strong), var(--accent) 60%)",
+        backgroundColor: "var(--surface-2)",
         padding: "var(--space-2)",
       }}
     >
@@ -244,7 +244,7 @@ export function HunkCommentBox({
           position: "absolute",
           top: "calc(var(--space-2) + 2px)",
           left: "var(--space-2)",
-          color: "color-mix(in oklch, var(--text-tertiary), var(--accent) 45%)",
+          color: "var(--accent)",
           pointerEvents: "none",
         }}
       />

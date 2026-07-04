@@ -19,11 +19,24 @@ import { invoke } from "@tauri-apps/api/core";
 export function WarpSurfaceTracker({
   visible,
   paneKey = "main",
+  reportWhenHidden = false,
 }: {
   visible: boolean;
-  /** Which native pane this tracker reports for: "main" (main column) or "side"
-   *  (right panel). The surface covers the combined box of both. */
-  paneKey?: "main" | "side";
+  /** Which native pane this tracker reports for: "main" (main column, or the
+   *  left half of a main-column split), "main2" (the split's right half) or
+   *  "side" (right panel). The surface covers the combined box of all placed
+   *  panes. */
+  paneKey?: "main" | "side" | "main2";
+  /**
+   * Keep reporting the real measured rect even while `visible` is false
+   * (instead of the zero rect that hides the pane). Used by the MAIN pane in
+   * split layouts: its box must stay accurate when a non-terminal tab is
+   * showing, or the Rust side's retained rect goes stale (e.g. full-width
+   * from before the split opened) and paints over the neighbouring pane.
+   * The pty is still detached while hidden, so the pane renders black behind
+   * the opaque non-terminal DOM.
+   */
+  reportWhenHidden?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -36,37 +49,90 @@ export function WarpSurfaceTracker({
     }
   }, [visible, paneKey]);
 
+  // Unmount cleanup: zero the rect + detach so a pane whose tracker leaves
+  // the tree (the split's right half after an unsplit) doesn't keep a stale
+  // rect that would leave a dead column composited over the re-widened main
+  // pane. The main pane ignores zero-rect reports Rust-side (deliberate
+  // retention), so this is a no-op for it.
+  useEffect(() => {
+    return () => {
+      invoke("term_surface_set_rect", {
+        paneKey,
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+      }).catch(() => {});
+      invoke("term_native_detach", { paneKey }).catch(() => {});
+    };
+  }, [paneKey]);
+
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
 
     let raf = 0;
-    const report = () => {
-      const r = visible ? el.getBoundingClientRect() : null;
+    // Last rect actually sent, so the poll below can re-check cheaply
+    // without spamming IPC. Seeded to a sentinel so the first report
+    // always sends.
+    let sent = "";
+    const report = (force = false) => {
+      const r = visible || reportWhenHidden ? el.getBoundingClientRect() : null;
       // CSS px relative to the webview's top-left (== window content top-left);
       // Rust converts to a bottom-left screen frame for the child window.
-      const rect = r
-        ? { x: r.left, y: r.top, width: r.width, height: r.height }
-        : { x: 0, y: 0, width: 0, height: 0 };
+      //
+      // Clamp to the window box. The native surface composites BELOW the
+      // webview, so any part of a measured rect outside the window is
+      // meaningless — but reported as-is it walks the embedded child window
+      // (which macOS does NOT clip to its parent) out past the app's edge.
+      // The concrete case: collapsing the right panel to 0 width leaves the
+      // panel's min-content-sized DOM overflowing off the window's right
+      // edge (overflow:hidden clips paint, not layout), and this tracker
+      // would report that off-window box as a real pane — the side terminal
+      // then "shoots out" beyond the window. An off-window or fully-clipped
+      // rect clamps to zero, which hides the pane.
+      let rect = { x: 0, y: 0, width: 0, height: 0 };
+      if (r) {
+        const left = Math.max(r.left, 0);
+        const top = Math.max(r.top, 0);
+        const right = Math.min(r.right, window.innerWidth);
+        const bottom = Math.min(r.bottom, window.innerHeight);
+        if (right - left > 1 && bottom - top > 1) {
+          rect = { x: left, y: top, width: right - left, height: bottom - top };
+        }
+      }
+      const key = `${rect.x},${rect.y},${rect.width},${rect.height}`;
+      if (!force && key === sent) return;
+      sent = key;
       // No-op on non-macOS (command absent) — swallow.
       invoke("term_surface_set_rect", { paneKey, ...rect }).catch(() => {});
     };
     const schedule = () => {
       cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(report);
+      raf = requestAnimationFrame(() => report());
     };
 
-    schedule();
+    report(true);
     const ro = new ResizeObserver(schedule);
     ro.observe(el);
     window.addEventListener("resize", schedule);
+    // Self-healing backstop: the RO + single-rAF chain above can drop a
+    // report (WKWebView pauses rAF while the window is occluded, and a
+    // layout flip like split↔full racing a heavy commit has been seen
+    // to leave the native rect stale — terminal stuck at half width,
+    // the rest of the hole showing the black host window). Re-checking
+    // on a slow interval costs one getBoundingClientRect and sends
+    // nothing while the rect is unchanged, but guarantees the native
+    // surface converges to the real DOM box within ~300ms.
+    const poll = window.setInterval(() => report(), 300);
 
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
       window.removeEventListener("resize", schedule);
+      window.clearInterval(poll);
     };
-  }, [visible, paneKey]);
+  }, [visible, paneKey, reportWhenHidden]);
 
   return (
     <div

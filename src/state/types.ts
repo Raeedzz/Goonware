@@ -212,6 +212,14 @@ export interface Worktree {
   /** Tabs (terminal / diff / markdown) in the main column for this worktree. */
   tabIds: TabId[];
   activeTabId: TabId | null;
+  /**
+   * Second pane of the 50/50 main-column split. Null/undefined = no
+   * split (the active tab fills the column). Set by dropping a tab
+   * from the strip onto the right half of the content area. Invariant
+   * (reducer-enforced): never equal to `activeTabId` — the same tab
+   * can't render in both halves.
+   */
+  splitTabId?: TabId | null;
 
   /** Right-panel selected tab and split position. */
   rightPanel: RightPanelTab;
@@ -615,6 +623,19 @@ export type AppAction =
   | { type: "open-tab"; tab: Tab; activate?: boolean }
   | { type: "close-tab"; id: TabId }
   | { type: "select-tab"; worktreeId: WorktreeId; id: TabId }
+  /** Drop a tab onto one half of the content area. `side: "right"`
+      puts it in the split pane (creating the split); `side: "left"`
+      makes it the active tab. Either way the reducer preserves the
+      activeTabId ≠ splitTabId invariant (swapping when needed). */
+  | {
+      type: "split-tab";
+      worktreeId: WorktreeId;
+      id: TabId;
+      side: "left" | "right";
+    }
+  /** Collapse the split back to one full-width pane. `keep` names the
+      half whose tab stays visible (as the active tab). */
+  | { type: "unsplit"; worktreeId: WorktreeId; keep: "left" | "right" }
   | { type: "update-tab"; id: TabId; patch: Partial<Tab> }
   | { type: "set-tab-summary"; id: TabId; summary: string }
 

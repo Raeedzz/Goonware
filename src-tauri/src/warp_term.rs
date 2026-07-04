@@ -371,16 +371,22 @@ impl Pane {
     }
 }
 
-/// The panes: index 0 = main column, 1 = right-panel side terminal. Created
-/// lazily before attach so the sinks and the view share the same `Pane`s.
-static PANES: OnceLock<[Pane; 2]> = OnceLock::new();
-fn panes() -> &'static [Pane; 2] {
-    PANES.get_or_init(|| [Pane::new(), Pane::new()])
+/// The panes: index 0 = main column (or the LEFT half of a main-column
+/// split), 1 = right-panel side terminal, 2 = the RIGHT half of a
+/// main-column split. Created lazily before attach so the sinks and the
+/// view share the same `Pane`s.
+static PANES: OnceLock<[Pane; 3]> = OnceLock::new();
+fn panes() -> &'static [Pane; 3] {
+    PANES.get_or_init(|| [Pane::new(), Pane::new(), Pane::new()])
 }
-/// Resolve a React pane key to its `Pane`. Anything but "side" is the main pane
-/// (so a missing/legacy key maps safely to main).
+/// Resolve a React pane key to its `Pane`. Anything but "side" / "main2" is
+/// the main pane (so a missing/legacy key maps safely to main).
 fn pane(key: &str) -> &'static Pane {
-    &panes()[if key == "side" { 1 } else { 0 }]
+    &panes()[match key {
+        "side" => 1,
+        "main2" => 2,
+        _ => 0,
+    }]
 }
 /// The pane currently mirroring `pty_id`, if any (frame/block sink routing).
 fn pane_for_pty(pty_id: &str) -> Option<&'static Pane> {
@@ -1278,6 +1284,34 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             },
             grid,
         );
+        // Clip a wide alt grid to the pane. The narrow side pane pins a wide
+        // PTY (PAN_MIN_COLS) for shell layout, and an alt-screen TUI paints
+        // rows at that full grid width — ConstrainedBox only bounds layout,
+        // it doesn't clip painting — so without this the rows draw straight
+        // past the pane's right edge, over the neighbouring React panels
+        // ("terminal pokes out the side"). Same horizontal ClippedScrollable
+        // as the shell transcript below, gated on real overflow.
+        let grid_px = g.n_cols as f32 * CELL_ADVANCE;
+        let h_overflow = pane_w > 1.0 && grid_px > pane_w + 2.0;
+        let clipped: Box<dyn Element> = if h_overflow {
+            let max_hscroll = (grid_px - pane_w).max(0.0);
+            let hx = p.hscroll.scroll_start().as_f32().clamp(0.0, max_hscroll);
+            p.hscroll.scroll_to(Pixels::new(hx));
+            let bounded = ConstrainedBox::new(Box::new(selectable)).with_width(grid_px);
+            Box::new(
+                ClippedScrollable::horizontal(
+                    p.hscroll.clone(),
+                    Box::new(bounded),
+                    ScrollbarWidth::None,
+                    Fill::None,
+                    Fill::None,
+                    Fill::None,
+                )
+                .with_overlayed_scrollbar(),
+            )
+        } else {
+            Box::new(selectable)
+        };
         // Bound the full grid to the pane's height at its surface offset.
         // `pin_region`'s ConstrainedBox gives this MainAxisSize::Max grid a FINITE
         // height; nesting it raw under the side pane's column instead left it in
@@ -1286,9 +1320,9 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
         // (rect not reported yet — only the topmost pane, briefly) returns the raw
         // grid, which the Stack bounds.
         if pane_h > 1.0 {
-            pin_region(Box::new(selectable), surface_offset_y, pane_h)
+            pin_region(clipped, surface_offset_y, pane_h)
         } else {
-            Box::new(selectable)
+            clipped
         }
     } else {
         // Shell transcript AND inline agents (claude/codex): closed blocks
@@ -1564,62 +1598,82 @@ impl View for TerminalRootView {
     }
 
     fn render(&self, _: &AppContext) -> Box<dyn Element> {
-        let ps = panes();
-        let main = &ps[0];
-        let side = &ps[1];
+        // Every placed pane (non-trivial rect), laid out left-to-right by
+        // reported x: main (or the split's left half), the split's right
+        // half (main2), and the right-panel side terminal — any subset of
+        // which can be present. The surface covers the combined bounding
+        // box; the gaps between panes (React dividers) stay black.
+        //
+        // NOTE: the MAIN pane keeps its rect even when it's showing a
+        // non-terminal tab (editor/diff) — see `term_native_detach` /
+        // `term_surface_set_rect`, which detach the pty + clear the grid but
+        // DON'T zero the rect. So `main.rect()` is the real main-column box
+        // here and the combined surface size is unchanged when a main tab
+        // switch lands on an editor. That's what keeps the other terminals
+        // in place: the surface never resizes on a main tab switch, it just
+        // paints the main column empty/black behind the opaque editor DOM.
+        // (A detached main renders an empty grid, hidden.)
+        let mut placed: Vec<&'static Pane> =
+            panes().iter().filter(|p| p.active()).collect();
+        placed.sort_by(|a, b| {
+            a.rect()
+                .0
+                .partial_cmp(&b.rect().0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        let main_col = build_pane_column(main, self.mono);
-        let side_on = side.active();
-        let column: Box<dyn Element> = if side_on {
-            // Both panes placed (the right-panel split is open). The surface
-            // covers the combined bounding box; lay the panes side-by-side by
-            // width (they share the AppShell row's top + height), with the gap
-            // between them (the React divider) left black.
-            //
-            // NOTE: the MAIN pane keeps its rect even when it's showing a
-            // non-terminal tab (editor/diff) — see `term_native_detach` /
-            // `term_surface_set_rect`, which detach the pty + clear the grid but
-            // DON'T zero the rect. So `main.rect()` is the real main-column box
-            // here, the gap stays ~0 (not `side.x`), and the combined surface
-            // size is unchanged from the both-terminals layout. That's what keeps
-            // the side terminal in place: the surface never resizes on a main
-            // tab switch, it just paints the main column empty/black behind the
-            // opaque editor DOM. (A detached main renders an empty grid, hidden.)
-            let (mx, my, mw, mh) = main.rect();
-            let (sx, sy, sw, sh) = side.rect();
-            let gap = (sx - (mx + mw)).max(0.0);
-            // Combined surface height. BOTH columns must be height-bounded to it:
-            // each pane's column is a MainAxisSize::Max flex (it fills the surface,
-            // with a lower pane's content pushed down by surface_offset_y), and a
-            // Max flex PANICS under an unbounded/infinite max constraint — which
-            // is what a width-only ConstrainedBox left the side column with, so a
-            // claude/alt-screen full grid in the side pane aborted the app
-            // (flex/mod.rs "can't be rendered in an infinite max constraint").
-            let ch = ((my + mh).max(sy + sh) - my.min(sy)).max(1.0);
-            let side_col = build_pane_column(side, self.mono);
-            let mut kids: Vec<Box<dyn Element>> = Vec::new();
-            kids.push(Box::new(
-                ConstrainedBox::new(main_col)
-                    .with_width(mw.max(1.0))
-                    .with_height(ch),
-            ));
-            if gap > 0.5 {
-                kids.push(Box::new(
-                    ConstrainedBox::new(Rect::new().finish()).with_width(gap),
-                ));
+        let column: Box<dyn Element> = if placed.len() <= 1 {
+            // Single (or no) placed pane — degenerate to the plain column,
+            // exactly the pre-split single-pane layout. `pane("main")` keeps
+            // the startup path (no rect reported yet) painting the main grid.
+            let p = placed.first().copied().unwrap_or(pane("main"));
+            build_pane_column(p, self.mono)
+        } else {
+            // Combined surface height. EVERY column must be height-bounded to
+            // it: each pane's column is a MainAxisSize::Max flex (it fills the
+            // surface, with a lower pane's content pushed down by
+            // surface_offset_y), and a Max flex PANICS under an unbounded/
+            // infinite max constraint — which is what a width-only
+            // ConstrainedBox left the side column with, so a claude/alt-screen
+            // full grid in the side pane aborted the app (flex/mod.rs "can't
+            // be rendered in an infinite max constraint").
+            let mut top = f32::MAX;
+            let mut bot = 0.0f32;
+            for p in &placed {
+                let (_, y, _, h) = p.rect();
+                top = top.min(y);
+                bot = bot.max(y + h);
             }
-            kids.push(Box::new(
-                ConstrainedBox::new(side_col)
-                    .with_width(sw.max(1.0))
-                    .with_height(ch),
-            ));
+            let ch = (bot - top).max(1.0);
+            let mut kids: Vec<Box<dyn Element>> = Vec::new();
+            for (i, p) in placed.iter().enumerate() {
+                let (x, _, w, _) = p.rect();
+                // Clamp each column so it can't overlap the next pane — a
+                // stale retained main rect (e.g. full-width from before a
+                // split opened) must not push its neighbours off the surface.
+                let w = match placed.get(i + 1) {
+                    Some(n) => w.min((n.rect().0 - x).max(1.0)),
+                    None => w,
+                };
+                kids.push(Box::new(
+                    ConstrainedBox::new(build_pane_column(p, self.mono))
+                        .with_width(w.max(1.0))
+                        .with_height(ch),
+                ));
+                if let Some(n) = placed.get(i + 1) {
+                    let gap = n.rect().0 - (x + w);
+                    if gap > 0.5 {
+                        kids.push(Box::new(
+                            ConstrainedBox::new(Rect::new().finish()).with_width(gap),
+                        ));
+                    }
+                }
+            }
             Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                 .with_children(kids)
                 .finish()
-        } else {
-            main_col
         };
 
         Stack::new()
@@ -1875,8 +1929,11 @@ pub fn term_surface_set_rect(pane_key: String, x: f64, y: f64, width: f64, heigh
     // is what stops the right-panel side terminal from blanking / shrinking: the
     // shared GPU surface is fragile to resize, and a zeroed main both collapsed
     // the box AND broke the side's side-by-side gap math. The side pane is NOT
-    // retained — collapsing the right panel SHOULD shrink the surface.
-    let is_main = pane_key != "side";
+    // retained — collapsing the right panel SHOULD shrink the surface. Neither
+    // is main2 (the split's right half): closing the split zero-reports it,
+    // and retaining would leave a stale column painting over the re-widened
+    // main pane.
+    let is_main = pane_key != "side" && pane_key != "main2";
     if is_main && zero {
         // Drop the stale report; keep the prior rect.
     } else if let Ok(mut r) = p.rect.lock() {
@@ -1901,12 +1958,20 @@ pub fn term_native_attach(
     let p = pane(&pane_key);
     // Stop mirroring this pane's previous pty, then mirror the new one.
     let prev = p.pty_id();
-    if !prev.is_empty() && prev != id {
-        crate::term::clear_native_pty(&prev);
-    }
     if let Ok(mut g) = p.pty.lock() {
         g.clear();
         g.push_str(&id);
+    }
+    // Unregister the previous pty ONLY if no other pane mirrors it now.
+    // When two terminals swap halves (main ⇄ main2) the two attach calls
+    // land back-to-back, and the second pane's "previous" pty is exactly
+    // the one the first pane just claimed — clearing it unconditionally
+    // froze that pane (frames stopped reaching the sink).
+    if !prev.is_empty()
+        && prev != id
+        && panes().iter().all(|q| q.pty_id() != prev)
+    {
+        crate::term::clear_native_pty(&prev);
     }
     crate::term::set_native_pty(&id);
     {
@@ -1958,13 +2023,16 @@ pub fn term_native_attach(
 pub fn term_native_detach(pane_key: String) {
     let p = pane(&pane_key);
     let prev = p.pty_id();
-    if !prev.is_empty() {
-        crate::term::clear_native_pty(&prev);
-    }
     if let Ok(mut g) = p.pty.lock() {
         g.clear();
     }
-    if pane_key == "side" {
+    // Same other-pane guard as `term_native_attach`: during a half-swap the
+    // pty this pane is letting go of may have just been claimed by another
+    // pane — don't yank its frames.
+    if !prev.is_empty() && panes().iter().all(|q| q.pty_id() != prev) {
+        crate::term::clear_native_pty(&prev);
+    }
+    if pane_key == "side" || pane_key == "main2" {
         if let Ok(mut r) = p.rect.lock() {
             *r = (0.0, 0.0, 0.0, 0.0);
         }

@@ -48,12 +48,22 @@ export function useVisibleTerminalSet() {
         ids.push(tab.ptyId);
       }
     }
-    // Secondary terminal counts only when the right-panel secondary
-    // section is expanded AND showing the Terminal subtab. Other
-    // states (Setup, Run, collapsed) don't actually render a
+    // The split pane's tab renders alongside the active tab, so its
+    // PTY is just as on-screen as the active one.
+    if (worktree.splitTabId) {
+      const tab = state.tabs[worktree.splitTabId];
+      if (tab && tab.kind === "terminal") {
+        ids.push(tab.ptyId);
+      }
+    }
+    // Secondary terminal counts only when the right panel itself is
+    // shown AND the secondary section is expanded AND showing the
+    // Terminal subtab. Other states (panel collapsed to 0 width,
+    // Setup, Run, section collapsed) don't actually render a
     // BlockTerminal, so the PTY would be wasting full-cadence
     // emits on a non-visible surface.
     if (
+      !state.rightPanelCollapsed &&
       !worktree.secondaryCollapsed &&
       worktree.secondaryTab === "terminal" &&
       worktree.secondaryActiveTerminalId
@@ -61,7 +71,7 @@ export function useVisibleTerminalSet() {
       ids.push(worktree.secondaryActiveTerminalId);
     }
     return ids;
-  }, [worktree, state.tabs]);
+  }, [worktree, state.tabs, state.rightPanelCollapsed]);
 
   const lastSentRef = useRef<string>("");
 

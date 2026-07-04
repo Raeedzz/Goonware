@@ -89,10 +89,11 @@ interface Props {
    * unset so they don't hijack the single native surface (multi-pane is M6).
    */
   nativeSurface?: boolean;
-  /** Which native pane this terminal drives: "main" (main column) or "side"
-   *  (right-panel). Threaded into every native command so the two panes' grids
+  /** Which native pane this terminal drives: "main" (main column / left half
+   *  of a split), "main2" (right half of a main-column split) or "side"
+   *  (right-panel). Threaded into every native command so the panes' grids
    *  / scroll / selection stay independent on the one embedded surface. */
-  paneKey?: "main" | "side";
+  paneKey?: "main" | "side" | "main2";
   /** Command to spawn (e.g. "zsh", "claude", "codex"). */
   command: string;
   args?: string[];
@@ -1518,9 +1519,15 @@ export function BlockTerminal({
       // does it (a horizontal ClippedScrollable, gated on grid-wider-than-pane,
       // fed by `term_native_hscroll` — see warp_term.rs). Either way the PTY must
       // believe it's wide, so size it the same on both paths.
-      const cols = allowHorizontalScroll
-        ? Math.max(fitCols, PAN_MIN_COLS)
-        : fitCols;
+      // The wide-PTY pin is a SHELL affordance (`ls` in columns + pan).
+      // A foregrounded agent (claude/codex) re-wraps its whole TUI on
+      // SIGWINCH, so pinning it wide just paints lines past the narrow
+      // pane that then have to be clipped/panned — size agents to the
+      // real pane width so their text wraps to the space it actually has.
+      const cols =
+        allowHorizontalScroll && !agentMode && !foregroundIsAgent
+          ? Math.max(fitCols, PAN_MIN_COLS)
+          : fitCols;
       return { rows, cols };
     };
 
