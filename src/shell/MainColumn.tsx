@@ -362,13 +362,10 @@ function TabButton({
         display: "inline-flex",
         alignItems: "center",
         gap: 8,
-        // Fixed at 32 — leaves 4px breathing inside the 36px strip,
-        // and is tall enough to host the two-line label stack
-        // (title 12px / summary 10px = ~23px content) without ever
-        // growing further when the summary line appears. The tab no
-        // longer "stretches" on agent start; the second line just
-        // fills the space we already reserved.
-        height: 32,
+        // Single-line tab — sized to sit inside the 30px strip with a
+        // little breathing room. The live summary that used to ride a
+        // second line under the title is gone, so the tab stays short.
+        height: 26,
         minWidth: 120,
         maxWidth: 240,
         padding: "0 var(--space-2) 0 10px",
@@ -513,7 +510,6 @@ function TabLabelStack({ tab }: { tab: Tab }) {
   // appears/disappears within the same physical slot rather than
   // doubling the strip height the way it used to.
   const title = tabLabel(tab);
-  const summary = tabSummary(tab);
   return (
     <div
       style={{
@@ -538,50 +534,9 @@ function TabLabelStack({ tab }: { tab: Tab }) {
       >
         {title}
       </span>
-      {summary && (
-        <span
-          style={{
-            fontSize: 10,
-            color: "var(--text-tertiary)",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-          }}
-        >
-          {summary}
-        </span>
-      )}
     </div>
   );
 }
-
-/**
- * The live one-line summary that sits below the title inside the
- * tab. We trust `tab.summary` (set by BlockTerminal via the
- * helper-agent layer or the activeCommand fallback) for terminal
- * tabs, and fall back to the file path for file-backed tabs so the
- * line still carries information. CSS handles the visual ellipsis.
- */
-function tabSummary(tab: Tab): string {
-  // Hard cap at 80 chars defensively — the agent's activity-summary
-  // helper occasionally emits a runaway sentence, and tab labels are
-  // bounded by `maxWidth` anyway but we want predictable layout cost
-  // (CSS `text-overflow: ellipsis` is O(n) on text length when
-  // computing the truncation point).
-  const trim = (s: string | undefined | null): string => {
-    if (!s) return "";
-    const cleaned = s.replace(/\s+/g, " ").trim();
-    if (cleaned === "ready" || cleaned === "Untitled") return "";
-    return cleaned.length > 80 ? cleaned.slice(0, 80) : cleaned;
-  };
-  if (tab.kind === "terminal") return trim(tab.summary);
-  if (tab.kind === "diff" || tab.kind === "markdown") {
-    return trim(tab.filePath);
-  }
-  if (tab.kind === "all-changes") return "";
-  return trim(tab.summary);
-}
-
 
 /** Bare label for a tab — bare names only (no path, no subtitle).
  *  Terminal tabs only surface the CLI badge ("claude" / "codex" /

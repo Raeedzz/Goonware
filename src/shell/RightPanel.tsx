@@ -252,7 +252,7 @@ function PanelTab({
       onMouseLeave={() => setHover(false)}
       style={{
         position: "relative",
-        height: 28,
+        height: 24,
         padding: "0 var(--space-2)",
         backgroundColor: "transparent",
         color: active ? "var(--text-primary)" : "var(--text-secondary)",
