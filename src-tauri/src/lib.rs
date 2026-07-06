@@ -249,9 +249,10 @@ pub fn run() {
             pr::gh_username,
             // PRs tab (list / review / checkout / return)
             pr::pr_list,
-            pr::pr_diff,
             pr::pr_checkout,
             pr::pr_checkout_return,
+            pr::pr_review_enter,
+            pr::pr_review_restore,
             // Connections (Task #10)
             connections::connections_scan,
             // Search (Task #15)

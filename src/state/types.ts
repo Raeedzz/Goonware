@@ -218,6 +218,14 @@ export interface PrSession {
    * before the field existed.
    */
   baseBranch?: string;
+  /**
+   * The PR branch's real head sha, recorded at checkout. The branch is
+   * soft-reset to its merge-base with the PR's base so the whole diff
+   * reads as staged changes in the normal changes UI; this sha is what
+   * the Return flow resets back to. Absent when review state couldn't
+   * be established (or for sessions persisted before the field).
+   */
+  headSha?: string;
   /** True when pre-checkout dirty state was stashed (and must pop back). */
   stashed: boolean;
 }
@@ -361,17 +369,6 @@ export interface AllChangesTab extends TabBase {
 }
 
 /**
- * Tab variant rendering an open PR's full diff (via `gh pr diff`) in
- * the main column. Opened by clicking a row in the PRs panel. Only the
- * number is stored — the view fetches the diff live, so new pushes to
- * the PR fold in on the next refresh.
- */
-export interface PrDiffTab extends TabBase {
-  kind: "pr-diff";
-  number: number;
-}
-
-/**
  * Tab variant showing one commit from the history graph: metadata
  * (author, sha, parents, refs, message) plus the full diff the commit
  * introduced. Opened by clicking a row in the right panel's History
@@ -388,7 +385,6 @@ export type Tab =
   | MarkdownTab
   | ProjectSettingsTab
   | AllChangesTab
-  | PrDiffTab
   | CommitTab;
 
 /**

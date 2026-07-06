@@ -7,8 +7,9 @@ import {
   useTooltipAnchor,
 } from "@/primitives/Tooltip";
 import { useAppDispatch, useAppState } from "@/state/AppState";
-import { type Tab, type Worktree } from "@/state/types";
+import { type Worktree } from "@/state/types";
 import { pr, type PrListItem } from "@/lib/pr";
+import { git } from "@/lib/git";
 import { system } from "@/lib/fs";
 import { mergeBaseAndHandOff } from "./conflictAgent";
 import { useToast } from "@/primitives/Toast";
@@ -23,15 +24,18 @@ type Busy =
 
 /**
  * Right-panel PRs tab: every open PR on the repo, live from `gh pr
- * list`. A row click opens the PR's full diff in the main column; the
- * hover actions check the PR out into this worktree (stashing whatever
- * was in progress), merge it server-side, or open it on GitHub.
+ * list`. A row click checks the PR out into this worktree (stashing
+ * whatever was in progress) and soft-resets to the merge-base with the
+ * PR's base, so the whole PR reads as *staged changes* in the app's
+ * normal review surfaces — the Changes tab lists the files, the
+ * all-changes view is the total diff. No bespoke PR-diff tab.
  *
  * Checking a PR out flips the worktree into a review session — the
  * banner at the top names the PR, offers "Resolve conflicts" when
  * GitHub reports the PR conflicting, and a Return button that restores
- * the original branch plus the stashed work. The session record lives
- * on the worktree (persisted), so the way back survives restarts.
+ * the branch head, the original branch, and the stashed work. The
+ * session record lives on the worktree (persisted), so the way back
+ * survives restarts.
  */
 export function PrsView({
   worktree,
@@ -92,35 +96,61 @@ export function PrsView({
     );
   };
 
-  const openDiff = (item: PrListItem) => {
-    const tab: Tab = {
-      id: `t_pr_${item.number}_${Date.now().toString(36)}`,
+  // Put the review on screen using the app's normal surfaces: the
+  // right panel's Changes tab (the PR's files, staged) and the main
+  // column's all-changes tab (the total diff). The reducer dedupes
+  // all-changes per worktree, so repeat calls focus the existing tab.
+  const openChangesUi = () => {
+    dispatch({
+      type: "set-right-panel",
       worktreeId: worktree.id,
-      kind: "pr-diff",
-      number: item.number,
-      title: item.title,
-      summary: `PR #${item.number} · ${item.headRefName}`,
-      summaryUpdatedAt: Date.now(),
-    };
-    // The reducer dedupes on (kind, number) — re-clicking a row focuses
-    // the existing tab instead of stacking copies.
-    dispatch({ type: "open-tab", tab });
+      panel: "changes",
+    });
+    dispatch({
+      type: "open-tab",
+      tab: {
+        id: `t_changes_${Date.now().toString(36)}`,
+        worktreeId: worktree.id,
+        kind: "all-changes",
+        title: "Changes",
+        summary: "",
+        summaryUpdatedAt: Date.now(),
+      },
+    });
   };
 
   const checkout = async (item: PrListItem) => {
     if (busy) return;
     if (session) {
+      if (session.number === item.number) {
+        // Already reviewing this PR — just bring the review back up.
+        openChangesUi();
+        return;
+      }
       toast.show({
-        message:
-          session.number === item.number
-            ? `PR #${item.number} is already checked out here.`
-            : `Return to ${session.originalBranch} before checking out another PR.`,
+        message: `Return to ${session.originalBranch} before checking out another PR.`,
+      });
+      return;
+    }
+    // This worktree's own PR: its changes ARE the worktree. Checking
+    // it out would stash the user's WIP and soft-reset their working
+    // branch in place (the backend refuses too — this is the friendly
+    // early exit). Just show the changes that are already here.
+    if (item.headRefName === worktree.branch) {
+      openChangesUi();
+      toast.show({
+        message: `PR #${item.number} is this worktree's own branch — its changes are already here.`,
       });
       return;
     }
     setBusy({ kind: "checkout", number: item.number });
     try {
-      const result = await pr.checkout(path, item.number);
+      const result = await pr.checkout(
+        path,
+        item.number,
+        item.baseRefName,
+        item.headRefName,
+      );
       dispatch({
         type: "update-worktree",
         id: worktree.id,
@@ -131,18 +161,18 @@ export function PrsView({
             title: item.title,
             originalBranch: result.originalBranch,
             baseBranch: item.baseRefName,
+            headSha: result.headSha ?? undefined,
             stashed: result.stashed,
           },
         },
       });
       notifyGitRefresh();
-      // Reviewing means reading the changes — put the PR's diff on
-      // screen in the same gesture instead of hiding it behind a
-      // toast action the user has to catch before it fades.
-      openDiff(item);
+      // Reviewing means reading the changes — land on the staged-diff
+      // review (Changes tab + total diff) in the same gesture.
+      openChangesUi();
       toast.show({
-        message: `Checked out PR #${item.number} (${item.headRefName})${
-          result.stashed ? " — your changes are stashed" : ""
+        message: `Reviewing PR #${item.number} (${item.headRefName}) — its diff is staged in Changes${
+          result.stashed ? "; your work is stashed" : ""
         }.`,
       });
     } catch (e) {
@@ -156,7 +186,12 @@ export function PrsView({
   // stash, and clear the session record. Shared by the Return button
   // and the merged-the-reviewed-PR path in merge().
   const endSession = async (s: NonNullable<Worktree["prSession"]>) => {
-    const result = await pr.checkoutReturn(path, s.originalBranch, s.stashed);
+    const result = await pr.checkoutReturn(
+      path,
+      s.originalBranch,
+      s.stashed,
+      s.headSha ?? null,
+    );
     dispatch({
       type: "update-worktree",
       id: worktree.id,
@@ -242,6 +277,12 @@ export function PrsView({
     }
     setBusy({ kind: "conflicts" });
     try {
+      // The branch is soft-reset to its merge-base while under review
+      // (that's what makes the diff read as staged changes) — a merge
+      // can't run in that state, so restore the real head first.
+      if (session.headSha) {
+        await pr.reviewRestore(path, session.headSha);
+      }
       const result = await mergeBaseAndHandOff({
         path,
         base,
@@ -250,14 +291,36 @@ export function PrsView({
         tabs: state.tabs,
         project: state.projects[worktree.projectId],
       });
-      notifyGitRefresh();
       if (result.kind === "clean") {
+        // Push the merge commit so the PR actually updates on GitHub,
+        // then drop back into review state (staged diff) with the new
+        // head recorded on the session.
+        let pushNote = "";
+        if (!result.alreadyUpToDate) {
+          try {
+            await git.push(path, "origin", session.branch);
+          } catch (e) {
+            pushNote = ` Push failed — the merge commit is still local: ${e}`;
+          }
+        }
+        const newHead = await pr.reviewEnter(path, base).catch(() => null);
+        dispatch({
+          type: "update-worktree",
+          id: worktree.id,
+          patch: {
+            prSession: { ...session, headSha: newHead ?? session.headSha },
+          },
+        });
+        notifyGitRefresh();
         toast.show({
           message: result.alreadyUpToDate
             ? "PR branch is already up to date with its base."
-            : "Merged base into the PR branch — no conflicts. Push to update the PR.",
+            : `Merged ${base} into the PR branch — no conflicts.${
+                pushNote || " Pushed to update the PR."
+              }`,
         });
       } else {
+        notifyGitRefresh();
         const files = `${result.files} file${result.files === 1 ? "" : "s"}`;
         toast.show({
           message:
@@ -364,8 +427,9 @@ export function PrsView({
               key={item.number}
               item={item}
               checkedOut={session?.number === item.number}
+              isOwn={item.headRefName === worktree.branch}
               busy={busy}
-              onOpen={() => openDiff(item)}
+              onOpen={() => void checkout(item)}
               onCheckout={() => void checkout(item)}
               onMerge={() => void merge(item)}
               onOpenExternal={() => openExternal(item)}
@@ -507,6 +571,7 @@ function BannerButton({
 function PrRow({
   item,
   checkedOut,
+  isOwn,
   busy,
   onOpen,
   onCheckout,
@@ -515,6 +580,8 @@ function PrRow({
 }: {
   item: PrListItem;
   checkedOut: boolean;
+  /** True when the PR's head is the branch this worktree is on. */
+  isOwn: boolean;
   busy: Busy;
   onOpen: () => void;
   onCheckout: () => void;
@@ -577,6 +644,7 @@ function PrRow({
           {item.title}
         </span>
         {checkedOut && <Chip label="checked out" tone="accent" />}
+        {isOwn && !checkedOut && <Chip label="this worktree" tone="accent" />}
         {item.isDraft && <Chip label="draft" tone="muted" />}
         {conflicting && <Chip label="conflicts" tone="warning" />}
       </div>
@@ -618,10 +686,12 @@ function PrRow({
             <RowAction
               tip={
                 checkedOut
-                  ? "Already checked out"
-                  : "Check this PR out into the worktree (stashes current work)"
+                  ? "Checked out — open its review in Changes"
+                  : isOwn
+                    ? "This worktree's own PR — its changes are already here"
+                    : "Review: check out and stage the PR's diff in Changes (stashes current work)"
               }
-              disabled={anyBusy || checkedOut}
+              disabled={anyBusy}
               onClick={onCheckout}
             >
               <ArrowsLeftRight size={13} />
