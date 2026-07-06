@@ -691,6 +691,8 @@ function sameTabTarget(a: Tab, b: Tab): boolean {
       return a.kind === "project-settings" && a.projectId === b.projectId;
     case "all-changes":
       return true;
+    case "pr-diff":
+      return a.kind === "pr-diff" && a.number === b.number;
     case "commit":
       return a.kind === "commit" && a.hash === b.hash;
   }

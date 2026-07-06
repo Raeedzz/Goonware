@@ -247,6 +247,11 @@ pub fn run() {
             pr::pr_merge,
             pr::merge_base_into_branch,
             pr::gh_username,
+            // PRs tab (list / review / checkout / return)
+            pr::pr_list,
+            pr::pr_diff,
+            pr::pr_checkout,
+            pr::pr_checkout_return,
             // Connections (Task #10)
             connections::connections_scan,
             // Search (Task #15)

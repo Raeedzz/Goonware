@@ -191,8 +191,36 @@ export function projectSettings(project: Project | null | undefined): ProjectSet
    target, and a secondary terminal in the right panel.
    ------------------------------------------------------------------ */
 
-export type RightPanelTab = "files" | "changes" | "skills" | "browser";
+export type RightPanelTab = "files" | "changes" | "prs" | "skills" | "browser";
 export type SecondaryTab = "setup" | "run" | "terminal";
+
+/**
+ * A "reviewing a PR" session on a worktree. Set when the user checks
+ * a PR out from the PRs tab: their uncommitted work is stashed (tagged
+ * so nothing else can pop it by accident) and the PR's head branch is
+ * checked out in place. Cleared by the Return flow, which restores the
+ * original branch and pops the stash. Persisted with the worktree so
+ * the "go back" affordance survives restarts.
+ */
+export interface PrSession {
+  /** PR number checked out into the worktree. */
+  number: number;
+  /** PR head branch currently checked out. */
+  branch: string;
+  /** PR title, for the banner label. */
+  title: string;
+  /** Branch to return to when the session ends. */
+  originalBranch: string;
+  /**
+   * PR base branch (merge target), captured at checkout so conflict
+   * resolution never has to guess it from the (possibly truncated or
+   * still-loading) PR list. Optional only for sessions persisted
+   * before the field existed.
+   */
+  baseBranch?: string;
+  /** True when pre-checkout dirty state was stashed (and must pop back). */
+  stashed: boolean;
+}
 
 export interface Worktree {
   id: WorktreeId;
@@ -243,6 +271,8 @@ export interface Worktree {
   color?: TagId;
   /** User-picked HugeIcons component name (overrides project's choice). */
   iconName?: string;
+  /** Active PR-review session, if the worktree is checked out to a PR. */
+  prSession?: PrSession | null;
   /**
    * True when the backing directory on disk has gone missing between
    * launches (e.g. the user deleted it manually). Transient — set by a
@@ -331,6 +361,17 @@ export interface AllChangesTab extends TabBase {
 }
 
 /**
+ * Tab variant rendering an open PR's full diff (via `gh pr diff`) in
+ * the main column. Opened by clicking a row in the PRs panel. Only the
+ * number is stored — the view fetches the diff live, so new pushes to
+ * the PR fold in on the next refresh.
+ */
+export interface PrDiffTab extends TabBase {
+  kind: "pr-diff";
+  number: number;
+}
+
+/**
  * Tab variant showing one commit from the history graph: metadata
  * (author, sha, parents, refs, message) plus the full diff the commit
  * introduced. Opened by clicking a row in the right panel's History
@@ -347,6 +388,7 @@ export type Tab =
   | MarkdownTab
   | ProjectSettingsTab
   | AllChangesTab
+  | PrDiffTab
   | CommitTab;
 
 /**

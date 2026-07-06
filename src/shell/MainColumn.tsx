@@ -25,6 +25,7 @@ import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
 import { DiffView } from "@/git/DiffView";
 import { AllChangesView } from "@/git/AllChangesView";
+import { PrDiffView } from "@/git/PrDiffView";
 import { CommitDetailView } from "@/git/CommitDetailView";
 import { Editor } from "@/editor/Editor";
 import { MarkdownView } from "@/editor/MarkdownView";
@@ -565,6 +566,9 @@ function fullTabSummary(tab: Tab): string | null {
   if (tab.kind === "all-changes") {
     return trim(tab.title) || "All changes";
   }
+  if (tab.kind === "pr-diff") {
+    return trim(tab.title) || `PR #${tab.number}`;
+  }
   if (tab.kind === "commit") {
     return trim(tab.title) || trim(tab.hash) || "Commit";
   }
@@ -646,6 +650,9 @@ function tabLabel(tab: Tab): string {
   }
   if (tab.kind === "all-changes") {
     return tab.title || "Changes";
+  }
+  if (tab.kind === "pr-diff") {
+    return tab.title || `PR #${tab.number}`;
   }
   if (tab.kind === "commit") {
     // Subject line on top; the short sha rides the summary line below.
@@ -910,6 +917,13 @@ function HalfPane({
             />
           ) : tab.kind === "all-changes" ? (
             <AllChangesView key={tab.id} projectPath={cwd} />
+          ) : tab.kind === "pr-diff" ? (
+            <PrDiffView
+              key={tab.id}
+              projectPath={cwd}
+              number={tab.number}
+              title={tab.title}
+            />
           ) : tab.kind === "commit" ? (
             <CommitDetailView
               key={tab.id}

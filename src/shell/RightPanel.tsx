@@ -25,6 +25,7 @@ import { fs } from "@/lib/fs";
 import { git, type StatusEntry } from "@/lib/git";
 import { FileTree } from "@/files/FileTree";
 import { HistoryView } from "@/git/HistoryView";
+import { PrsView } from "@/git/PrsView";
 import { paneSlotStyle } from "./paneSlotLayout";
 import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
@@ -134,6 +135,12 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
         />
         <PanelTab
           worktreeId={worktree.id}
+          label="PRs"
+          tab="prs"
+          active={worktree.rightPanel === "prs"}
+        />
+        <PanelTab
+          worktreeId={worktree.id}
           label="Skills"
           tab="skills"
           active={worktree.rightPanel === "skills"}
@@ -175,6 +182,14 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
             branch={status.branch}
             error={status.error}
             refresh={status.refresh}
+          />
+        </PaneSlot>
+        <PaneSlot active={worktree.rightPanel === "prs"}>
+          <PrsView
+            worktree={worktree}
+            // Gates the gh-CLI polling — hidden panes stay quiet, same
+            // deal as BrowserPane's isVisible below.
+            isVisible={worktree.rightPanel === "prs"}
           />
         </PaneSlot>
         <PaneSlot active={worktree.rightPanel === "skills"}>

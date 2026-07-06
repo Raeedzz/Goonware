@@ -32,6 +32,39 @@ pub struct PrStatus {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PrListItem {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub head_ref_name: String,
+    pub base_ref_name: String,
+    pub author: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+    /// One of MERGEABLE, CONFLICTING, UNKNOWN.
+    pub mergeable: String,
+    pub is_draft: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrCheckoutResult {
+    pub original_branch: String,
+    pub stashed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrReturnResult {
+    /// False when a stash was expected but the tagged stash was gone —
+    /// the branch switch happened, but nothing was restored.
+    pub stash_restored: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConflictResult {
     pub conflicts: bool,
     pub files: Vec<String>,
@@ -574,6 +607,237 @@ pub async fn pr_status(cwd: String, branch: String) -> Result<PrStatus, String> 
         state: Some(parsed.state),
         mergeable: Some(parsed.mergeable),
     })
+}
+
+/// List every open PR on the repo via `gh pr list`. Drives the right
+/// panel's PRs tab. Author is flattened to the login string; draft PRs
+/// are included (the tab renders a Draft chip rather than hiding them).
+#[tauri::command]
+pub async fn pr_list(cwd: String) -> Result<Vec<PrListItem>, String> {
+    if !Path::new(&cwd).exists() {
+        return Err(format!("cwd does not exist: {cwd}"));
+    }
+    let out = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "50",
+            "--json",
+            "number,title,url,headRefName,baseRefName,author,additions,deletions,changedFiles,mergeable,isDraft,updatedAt",
+        ])
+        .current_dir(&cwd)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh: {e}. Is GitHub CLI installed? `brew install gh`"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh pr list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    #[derive(Deserialize)]
+    struct AuthorJson {
+        login: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RowJson {
+        number: u64,
+        title: String,
+        url: String,
+        head_ref_name: String,
+        base_ref_name: String,
+        author: Option<AuthorJson>,
+        additions: u64,
+        deletions: u64,
+        changed_files: u64,
+        mergeable: String,
+        is_draft: bool,
+        updated_at: String,
+    }
+    let rows: Vec<RowJson> = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("parse gh json: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| PrListItem {
+            number: r.number,
+            title: r.title,
+            url: r.url,
+            head_ref_name: r.head_ref_name,
+            base_ref_name: r.base_ref_name,
+            author: r.author.map(|a| a.login).unwrap_or_default(),
+            additions: r.additions,
+            deletions: r.deletions,
+            changed_files: r.changed_files,
+            mergeable: r.mergeable,
+            is_draft: r.is_draft,
+            updated_at: r.updated_at,
+        })
+        .collect())
+}
+
+/// Unified diff of a PR (`gh pr diff <number>`) — lets the PRs tab
+/// show the full review diff without checking the branch out.
+#[tauri::command]
+pub async fn pr_diff(cwd: String, number: u64) -> Result<String, String> {
+    if !Path::new(&cwd).exists() {
+        return Err(format!("cwd does not exist: {cwd}"));
+    }
+    let num = number.to_string();
+    let out = Command::new("gh")
+        .args(["pr", "diff", &num])
+        .current_dir(&cwd)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh: {e}. Is GitHub CLI installed? `brew install gh`"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh pr diff failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Message marker on the auto-stash created by `pr_checkout`, suffixed
+/// with the branch it was taken from so `pr_checkout_return` can find
+/// exactly this stash even if the user made others in between.
+const PR_STASH_MARKER: &str = "goonware-pr-checkout";
+
+/// Find the stash ref (e.g. `stash@{1}`) whose message carries our
+/// marker for `branch`. Newest match wins.
+async fn find_pr_stash(cwd: &str, branch: &str) -> Option<String> {
+    let raw = run_git(cwd, &["stash", "list", "--format=%gd\u{1f}%gs"])
+        .await
+        .ok()?;
+    let needle = format!("{PR_STASH_MARKER}:{branch}");
+    for line in raw.lines() {
+        let Some((gd, gs)) = line.split_once('\u{1f}') else {
+            continue;
+        };
+        // %gs renders as "On <branch>: <message>" — compare the message
+        // exactly, so returning to `feat` can never pop a stash tagged
+        // for `feature` (or any user stash that merely mentions the
+        // marker). Branch names can't contain spaces, so the first
+        // ": " is always git's own separator.
+        let msg = gs.split_once(": ").map_or(gs, |(_, m)| m);
+        if msg == needle {
+            return Some(gd.to_string());
+        }
+    }
+    None
+}
+
+/// Turn the worktree into a review environment for a PR: stash any
+/// uncommitted work (tagged so we can restore it later), then
+/// `gh pr checkout <number>`. Returns what the caller needs to offer a
+/// "go back" button — the original branch and whether a stash was made.
+///
+/// If the checkout itself fails the stash is popped back immediately so
+/// the user's work never silently disappears into the stash list.
+#[tauri::command]
+pub async fn pr_checkout(cwd: String, number: u64) -> Result<PrCheckoutResult, String> {
+    if !Path::new(&cwd).exists() {
+        return Err(format!("cwd does not exist: {cwd}"));
+    }
+    let original_branch = run_git_checked(&cwd, &["symbolic-ref", "--short", "HEAD"])
+        .await
+        .map_err(|_| "could not determine current branch (detached HEAD?)".to_string())?
+        .trim()
+        .to_string();
+    if original_branch.is_empty() {
+        return Err("could not determine current branch (detached HEAD?)".into());
+    }
+
+    let porcelain = run_git_checked(&cwd, &["status", "--porcelain"]).await?;
+    let dirty = porcelain.lines().any(|l| !l.trim().is_empty());
+    let mut stashed = false;
+    if dirty {
+        let msg = format!("{PR_STASH_MARKER}:{original_branch}");
+        run_git_checked(&cwd, &["stash", "push", "-u", "-m", &msg]).await?;
+        stashed = true;
+    }
+
+    let num = number.to_string();
+    let out = Command::new("gh")
+        .args(["pr", "checkout", &num])
+        .current_dir(&cwd)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh: {e}. Is GitHub CLI installed? `brew install gh`"))?;
+    if !out.status.success() {
+        let mut msg = format!(
+            "gh pr checkout failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        // Roll the stash back so a failed checkout is a clean no-op.
+        // gh isn't atomic — it can die after already switching branches
+        // — so make sure the pop lands on the original branch, and say
+        // so when the stash couldn't be restored rather than dropping
+        // the pop error on the floor.
+        if stashed {
+            let head = run_git_checked(&cwd, &["symbolic-ref", "--short", "HEAD"])
+                .await
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let on_original = head == original_branch
+                || run_git_checked(&cwd, &["checkout", &original_branch])
+                    .await
+                    .is_ok();
+            let popped = match find_pr_stash(&cwd, &original_branch).await {
+                Some(stash_ref) if on_original => {
+                    run_git_checked(&cwd, &["stash", "pop", &stash_ref])
+                        .await
+                        .is_ok()
+                }
+                _ => false,
+            };
+            if !popped {
+                msg.push_str(
+                    " — your uncommitted work is still saved in the stash list (`git stash list`)",
+                );
+            }
+        }
+        return Err(msg);
+    }
+    Ok(PrCheckoutResult {
+        original_branch,
+        stashed,
+    })
+}
+
+/// Undo `pr_checkout`: switch back to the original branch and pop the
+/// tagged stash if one was made. Fails loudly if the PR branch has
+/// uncommitted edits (git refuses the checkout) — the user decides
+/// whether to commit or discard those, we never do it for them.
+///
+/// `stash_restored` is false when `stashed` was set but the tagged
+/// stash no longer exists (e.g. the user popped it by hand) — the
+/// caller must not claim the work was restored.
+#[tauri::command]
+pub async fn pr_checkout_return(
+    cwd: String,
+    branch: String,
+    stashed: bool,
+) -> Result<PrReturnResult, String> {
+    if !Path::new(&cwd).exists() {
+        return Err(format!("cwd does not exist: {cwd}"));
+    }
+    if branch.is_empty() {
+        return Err("no branch to return to".into());
+    }
+    run_git_checked(&cwd, &["checkout", &branch]).await?;
+    let mut stash_restored = false;
+    if stashed {
+        if let Some(stash_ref) = find_pr_stash(&cwd, &branch).await {
+            run_git_checked(&cwd, &["stash", "pop", &stash_ref]).await?;
+            stash_restored = true;
+        }
+    }
+    Ok(PrReturnResult { stash_restored })
 }
 
 /// Merge a PR via `gh pr merge` — server-side merge using the user's
@@ -1207,5 +1471,105 @@ mod tests {
             .await
             .expect_err("missing cwd should error");
         assert!(!err.is_empty());
+    }
+
+    // ---- pr_checkout_return stash round-trip -----------------------------
+
+    #[tokio::test]
+    async fn checkout_return_restores_branch_and_pops_tagged_stash() {
+        // Simulate the state pr_checkout leaves behind: work stashed
+        // with the marker message on `feature/mine`, HEAD moved to a
+        // "PR branch". Return must land back on the original branch
+        // with the stashed file restored — and leave an unrelated,
+        // newer stash untouched.
+        let (clone, _bare) = build_repo_with_bare_remote("feature/mine");
+        let cwd = clone.path().to_str().unwrap();
+
+        std::fs::write(clone.path().join("wip.txt"), "my wip\n").unwrap();
+        run_sync(
+            clone.path(),
+            &[
+                "stash",
+                "push",
+                "-u",
+                "-m",
+                &format!("{PR_STASH_MARKER}:feature/mine"),
+            ],
+        );
+        run_sync(clone.path(), &["checkout", "-b", "pr-branch"]);
+
+        // A second, unrelated stash made "later" (stash@{0}) must survive.
+        std::fs::write(clone.path().join("other.txt"), "other\n").unwrap();
+        run_sync(clone.path(), &["stash", "push", "-u", "-m", "user stash"]);
+
+        let result = pr_checkout_return(cwd.to_string(), "feature/mine".to_string(), true)
+            .await
+            .expect("return succeeds");
+        assert!(result.stash_restored, "tagged stash should be reported restored");
+
+        let branch = run_sync(clone.path(), &["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(branch.trim(), "feature/mine");
+        assert!(
+            clone.path().join("wip.txt").exists(),
+            "stashed wip should be restored"
+        );
+        let stashes = run_sync(clone.path(), &["stash", "list"]);
+        assert!(
+            stashes.contains("user stash"),
+            "unrelated stash must survive: {stashes}"
+        );
+        assert!(
+            !stashes.contains(PR_STASH_MARKER),
+            "tagged stash should be consumed: {stashes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_return_without_stash_just_switches_branch() {
+        let (clone, _bare) = build_repo_with_bare_remote("feature/clean");
+        let cwd = clone.path().to_str().unwrap();
+        run_sync(clone.path(), &["checkout", "-b", "pr-branch"]);
+
+        let result = pr_checkout_return(cwd.to_string(), "feature/clean".to_string(), false)
+            .await
+            .expect("return succeeds");
+        assert!(!result.stash_restored, "no stash existed to restore");
+
+        let branch = run_sync(clone.path(), &["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(branch.trim(), "feature/clean");
+    }
+
+    #[tokio::test]
+    async fn checkout_return_ignores_stash_tagged_for_prefixed_branch() {
+        // Marker matching is exact: a stash tagged for `feature/mine-2`
+        // must not be popped when returning to `feature/mine`.
+        let (clone, _bare) = build_repo_with_bare_remote("feature/mine");
+        let cwd = clone.path().to_str().unwrap();
+
+        std::fs::write(clone.path().join("wip.txt"), "other branch wip\n").unwrap();
+        run_sync(
+            clone.path(),
+            &[
+                "stash",
+                "push",
+                "-u",
+                "-m",
+                &format!("{PR_STASH_MARKER}:feature/mine-2"),
+            ],
+        );
+        run_sync(clone.path(), &["checkout", "-b", "pr-branch"]);
+
+        let result = pr_checkout_return(cwd.to_string(), "feature/mine".to_string(), true)
+            .await
+            .expect("return succeeds");
+        assert!(
+            !result.stash_restored,
+            "stash tagged for a prefixed branch name must not match"
+        );
+        let stashes = run_sync(clone.path(), &["stash", "list"]);
+        assert!(
+            stashes.contains("feature/mine-2"),
+            "the other branch's stash must survive: {stashes}"
+        );
     }
 }
