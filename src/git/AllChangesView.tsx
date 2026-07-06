@@ -4,6 +4,7 @@ import { CaretDown } from "@phosphor-icons/react";
 import { git } from "@/lib/git";
 import { DiffBody } from "./DiffView";
 import { DiffAskOverlay, reconstructDiffContext } from "./DiffAsk";
+import { DiffFixBar, DiffFixProvider } from "./DiffFix";
 import { parseUnifiedDiff, type DiffLine } from "./diff-parse";
 
 /**
@@ -76,6 +77,7 @@ export function AllChangesView({ projectPath }: { projectPath: string }) {
   }, [sections]);
 
   return (
+    <DiffFixProvider cwd={projectPath}>
     <motion.div
       initial={{ opacity: 0, y: 4 }}
       animate={{ opacity: 1, y: 0 }}
@@ -180,7 +182,9 @@ export function AllChangesView({ projectPath }: { projectPath: string }) {
           }}
         />
       )}
+      <DiffFixBar />
     </motion.div>
+    </DiffFixProvider>
   );
 }
 

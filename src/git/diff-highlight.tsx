@@ -65,12 +65,18 @@ const HL = tagHighlighter([
   { tag: t.className, class: "color:var(--accent)" },
   { tag: t.namespace, class: "color:var(--accent)" },
 
-  { tag: t.function(t.variableName), class: "font-weight:500" },
-  { tag: t.function(t.propertyName), class: "font-weight:500" },
-  { tag: t.macroName, class: "font-weight:500" },
+  // Identifiers. Lezer tags bare variables AND function calls alike as
+  // `variableName`, so this rule is what colors the bulk of the code —
+  // without it everything here falls back to near-white --text-primary.
+  { tag: t.variableName, class: "color:var(--syntax-variable)" },
+  { tag: t.definition(t.variableName), class: "color:var(--syntax-variable)" },
+
+  { tag: t.function(t.variableName), class: "color:var(--syntax-function);font-weight:500" },
+  { tag: t.function(t.propertyName), class: "color:var(--syntax-function);font-weight:500" },
+  { tag: t.macroName, class: "color:var(--syntax-function);font-weight:500" },
 
   { tag: t.attributeName, class: "color:var(--state-info)" },
-  { tag: t.propertyName, class: "color:var(--text-primary)" },
+  { tag: t.propertyName, class: "color:var(--syntax-property)" },
 
   { tag: t.tagName, class: "color:var(--state-error)" },
   { tag: t.angleBracket, class: "color:var(--text-tertiary)" },

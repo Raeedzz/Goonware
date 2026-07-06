@@ -371,16 +371,22 @@ impl Pane {
     }
 }
 
-/// The panes: index 0 = main column, 1 = right-panel side terminal. Created
-/// lazily before attach so the sinks and the view share the same `Pane`s.
-static PANES: OnceLock<[Pane; 2]> = OnceLock::new();
-fn panes() -> &'static [Pane; 2] {
-    PANES.get_or_init(|| [Pane::new(), Pane::new()])
+/// The panes: index 0 = main column (or the LEFT half of a main-column
+/// split), 1 = right-panel side terminal, 2 = the RIGHT half of a
+/// main-column split. Created lazily before attach so the sinks and the
+/// view share the same `Pane`s.
+static PANES: OnceLock<[Pane; 3]> = OnceLock::new();
+fn panes() -> &'static [Pane; 3] {
+    PANES.get_or_init(|| [Pane::new(), Pane::new(), Pane::new()])
 }
-/// Resolve a React pane key to its `Pane`. Anything but "side" is the main pane
-/// (so a missing/legacy key maps safely to main).
+/// Resolve a React pane key to its `Pane`. Anything but "side" / "main2" is
+/// the main pane (so a missing/legacy key maps safely to main).
 fn pane(key: &str) -> &'static Pane {
-    &panes()[if key == "side" { 1 } else { 0 }]
+    &panes()[match key {
+        "side" => 1,
+        "main2" => 2,
+        _ => 0,
+    }]
 }
 /// The pane currently mirroring `pty_id`, if any (frame/block sink routing).
 fn pane_for_pty(pty_id: &str) -> Option<&'static Pane> {
@@ -871,6 +877,87 @@ fn is_zsh_eol_marker(row: &RowSnapshot) -> bool {
     seen
 }
 
+/// Concatenated glyph text of a row with trailing blanks trimmed — the identity
+/// we match on when measuring how far an alt-screen app scrolled. We compare
+/// TEXT (not the full styled spans) so a pager re-coloring a line (e.g. moving
+/// its highlighted current line, or a cursor landing on it) doesn't defeat the
+/// match.
+fn row_text(row: &RowSnapshot) -> String {
+    let mut s = String::new();
+    for sp in &row.spans {
+        s.push_str(&sp.text);
+    }
+    s.trim_end().to_string()
+}
+
+/// Measure how many rows an alt-screen app scrolled between two consecutive grid
+/// snapshots, by content matching. Returns `k` such that the new grid shows, at
+/// row `i`, what the old grid had at row `i + k`:
+///   - `k > 0` → content moved UP by k rows (scrolled toward newer / down)
+///   - `k < 0` → content moved DOWN by k rows (scrolled toward older / up)
+///   - `0`     → no clear scroll (partial repaint, spinner tick, cursor blink,
+///                a page swap, or genuinely nothing moved)
+///
+/// This is the source of truth for gluing a selection to alt-screen text, and it
+/// replaces the old "assume the app scrolls one row per wheel notch" guess —
+/// which drifts on any app that scrolls several rows per notch (vim's default,
+/// most pagers). Because it reads the app's ACTUAL response it's correct
+/// regardless of the app's wheel-to-rows ratio.
+///
+/// Deliberately conservative: it reports a non-zero shift only when a clear
+/// majority of the NON-BLANK rows line up at exactly one offset AND that offset
+/// explains more rows than staying put (k = 0). A one-line spinner update or a
+/// single streamed character leaves k = 0 unbeaten, so a completed selection is
+/// never nudged by a non-scroll repaint — the exact "jumpy / stuck selection"
+/// artifact a naive always-shift approach produces.
+fn detect_scroll_shift(old: &[RowSnapshot], new: &[RowSnapshot]) -> i32 {
+    let n = old.len().min(new.len());
+    if n < 4 {
+        return 0; // too little signal to be confident
+    }
+    let o: Vec<String> = old.iter().take(n).map(row_text).collect();
+    let e: Vec<String> = new.iter().take(n).map(row_text).collect();
+
+    // Count indices where new[i] equals old[i + k], ignoring blank rows (a blank
+    // line matches every other blank line and would inflate every offset).
+    let score = |k: i32| -> usize {
+        let mut c = 0usize;
+        for i in 0..n {
+            let j = i as i32 + k;
+            if j < 0 || j as usize >= n {
+                continue;
+            }
+            if !e[i].is_empty() && e[i] == o[j as usize] {
+                c += 1;
+            }
+        }
+        c
+    };
+
+    let base = score(0); // non-blank rows still in place
+    let mut best_k = 0i32;
+    let mut best = base;
+    let range = (n as i32) - 1;
+    for k in -range..=range {
+        if k == 0 {
+            continue;
+        }
+        let s = score(k);
+        if s > best {
+            best = s;
+            best_k = k;
+        }
+    }
+
+    // Require the winning offset to be genuinely dominant: it must line up a solid
+    // block of rows and clearly beat the in-place score, else treat it as noise.
+    if best_k != 0 && best >= 3 && best > base + 1 {
+        best_k
+    } else {
+        0
+    }
+}
+
 /// How many leading rows of the live grid to render: trims trailing blank rows
 /// (keeping through the cursor row) so an idle / just-finished shell screen sits
 /// compactly above the input instead of padding the transcript with blanks.
@@ -1197,6 +1284,34 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             },
             grid,
         );
+        // Clip a wide alt grid to the pane. The narrow side pane pins a wide
+        // PTY (PAN_MIN_COLS) for shell layout, and an alt-screen TUI paints
+        // rows at that full grid width — ConstrainedBox only bounds layout,
+        // it doesn't clip painting — so without this the rows draw straight
+        // past the pane's right edge, over the neighbouring React panels
+        // ("terminal pokes out the side"). Same horizontal ClippedScrollable
+        // as the shell transcript below, gated on real overflow.
+        let grid_px = g.n_cols as f32 * CELL_ADVANCE;
+        let h_overflow = pane_w > 1.0 && grid_px > pane_w + 2.0;
+        let clipped: Box<dyn Element> = if h_overflow {
+            let max_hscroll = (grid_px - pane_w).max(0.0);
+            let hx = p.hscroll.scroll_start().as_f32().clamp(0.0, max_hscroll);
+            p.hscroll.scroll_to(Pixels::new(hx));
+            let bounded = ConstrainedBox::new(Box::new(selectable)).with_width(grid_px);
+            Box::new(
+                ClippedScrollable::horizontal(
+                    p.hscroll.clone(),
+                    Box::new(bounded),
+                    ScrollbarWidth::None,
+                    Fill::None,
+                    Fill::None,
+                    Fill::None,
+                )
+                .with_overlayed_scrollbar(),
+            )
+        } else {
+            Box::new(selectable)
+        };
         // Bound the full grid to the pane's height at its surface offset.
         // `pin_region`'s ConstrainedBox gives this MainAxisSize::Max grid a FINITE
         // height; nesting it raw under the side pane's column instead left it in
@@ -1205,9 +1320,9 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
         // (rect not reported yet — only the topmost pane, briefly) returns the raw
         // grid, which the Stack bounds.
         if pane_h > 1.0 {
-            pin_region(Box::new(selectable), surface_offset_y, pane_h)
+            pin_region(clipped, surface_offset_y, pane_h)
         } else {
-            Box::new(selectable)
+            clipped
         }
     } else {
         // Shell transcript AND inline agents (claude/codex): closed blocks
@@ -1483,62 +1598,82 @@ impl View for TerminalRootView {
     }
 
     fn render(&self, _: &AppContext) -> Box<dyn Element> {
-        let ps = panes();
-        let main = &ps[0];
-        let side = &ps[1];
+        // Every placed pane (non-trivial rect), laid out left-to-right by
+        // reported x: main (or the split's left half), the split's right
+        // half (main2), and the right-panel side terminal — any subset of
+        // which can be present. The surface covers the combined bounding
+        // box; the gaps between panes (React dividers) stay black.
+        //
+        // NOTE: the MAIN pane keeps its rect even when it's showing a
+        // non-terminal tab (editor/diff) — see `term_native_detach` /
+        // `term_surface_set_rect`, which detach the pty + clear the grid but
+        // DON'T zero the rect. So `main.rect()` is the real main-column box
+        // here and the combined surface size is unchanged when a main tab
+        // switch lands on an editor. That's what keeps the other terminals
+        // in place: the surface never resizes on a main tab switch, it just
+        // paints the main column empty/black behind the opaque editor DOM.
+        // (A detached main renders an empty grid, hidden.)
+        let mut placed: Vec<&'static Pane> =
+            panes().iter().filter(|p| p.active()).collect();
+        placed.sort_by(|a, b| {
+            a.rect()
+                .0
+                .partial_cmp(&b.rect().0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-        let main_col = build_pane_column(main, self.mono);
-        let side_on = side.active();
-        let column: Box<dyn Element> = if side_on {
-            // Both panes placed (the right-panel split is open). The surface
-            // covers the combined bounding box; lay the panes side-by-side by
-            // width (they share the AppShell row's top + height), with the gap
-            // between them (the React divider) left black.
-            //
-            // NOTE: the MAIN pane keeps its rect even when it's showing a
-            // non-terminal tab (editor/diff) — see `term_native_detach` /
-            // `term_surface_set_rect`, which detach the pty + clear the grid but
-            // DON'T zero the rect. So `main.rect()` is the real main-column box
-            // here, the gap stays ~0 (not `side.x`), and the combined surface
-            // size is unchanged from the both-terminals layout. That's what keeps
-            // the side terminal in place: the surface never resizes on a main
-            // tab switch, it just paints the main column empty/black behind the
-            // opaque editor DOM. (A detached main renders an empty grid, hidden.)
-            let (mx, my, mw, mh) = main.rect();
-            let (sx, sy, sw, sh) = side.rect();
-            let gap = (sx - (mx + mw)).max(0.0);
-            // Combined surface height. BOTH columns must be height-bounded to it:
-            // each pane's column is a MainAxisSize::Max flex (it fills the surface,
-            // with a lower pane's content pushed down by surface_offset_y), and a
-            // Max flex PANICS under an unbounded/infinite max constraint — which
-            // is what a width-only ConstrainedBox left the side column with, so a
-            // claude/alt-screen full grid in the side pane aborted the app
-            // (flex/mod.rs "can't be rendered in an infinite max constraint").
-            let ch = ((my + mh).max(sy + sh) - my.min(sy)).max(1.0);
-            let side_col = build_pane_column(side, self.mono);
-            let mut kids: Vec<Box<dyn Element>> = Vec::new();
-            kids.push(Box::new(
-                ConstrainedBox::new(main_col)
-                    .with_width(mw.max(1.0))
-                    .with_height(ch),
-            ));
-            if gap > 0.5 {
-                kids.push(Box::new(
-                    ConstrainedBox::new(Rect::new().finish()).with_width(gap),
-                ));
+        let column: Box<dyn Element> = if placed.len() <= 1 {
+            // Single (or no) placed pane — degenerate to the plain column,
+            // exactly the pre-split single-pane layout. `pane("main")` keeps
+            // the startup path (no rect reported yet) painting the main grid.
+            let p = placed.first().copied().unwrap_or(pane("main"));
+            build_pane_column(p, self.mono)
+        } else {
+            // Combined surface height. EVERY column must be height-bounded to
+            // it: each pane's column is a MainAxisSize::Max flex (it fills the
+            // surface, with a lower pane's content pushed down by
+            // surface_offset_y), and a Max flex PANICS under an unbounded/
+            // infinite max constraint — which is what a width-only
+            // ConstrainedBox left the side column with, so a claude/alt-screen
+            // full grid in the side pane aborted the app (flex/mod.rs "can't
+            // be rendered in an infinite max constraint").
+            let mut top = f32::MAX;
+            let mut bot = 0.0f32;
+            for p in &placed {
+                let (_, y, _, h) = p.rect();
+                top = top.min(y);
+                bot = bot.max(y + h);
             }
-            kids.push(Box::new(
-                ConstrainedBox::new(side_col)
-                    .with_width(sw.max(1.0))
-                    .with_height(ch),
-            ));
+            let ch = (bot - top).max(1.0);
+            let mut kids: Vec<Box<dyn Element>> = Vec::new();
+            for (i, p) in placed.iter().enumerate() {
+                let (x, _, w, _) = p.rect();
+                // Clamp each column so it can't overlap the next pane — a
+                // stale retained main rect (e.g. full-width from before a
+                // split opened) must not push its neighbours off the surface.
+                let w = match placed.get(i + 1) {
+                    Some(n) => w.min((n.rect().0 - x).max(1.0)),
+                    None => w,
+                };
+                kids.push(Box::new(
+                    ConstrainedBox::new(build_pane_column(p, self.mono))
+                        .with_width(w.max(1.0))
+                        .with_height(ch),
+                ));
+                if let Some(n) = placed.get(i + 1) {
+                    let gap = n.rect().0 - (x + w);
+                    if gap > 0.5 {
+                        kids.push(Box::new(
+                            ConstrainedBox::new(Rect::new().finish()).with_width(gap),
+                        ));
+                    }
+                }
+            }
             Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
                 .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
                 .with_children(kids)
                 .finish()
-        } else {
-            main_col
         };
 
         Stack::new()
@@ -1580,7 +1715,26 @@ pub fn attach(app: &tauri::AppHandle) {
         // Route the frame to whichever pane mirrors this pty (main or side).
         if let Some(p) = pane_for_pty(pty_id) {
             let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
+            // Alt-screen scroll-glue: an alt-screen app (git log / less / man /
+            // vim / htop) repaints its grid in place when it scrolls, so a
+            // completed selection anchored to fixed grid coordinates would slide
+            // off the text it was started on. Measure how far the grid ACTUALLY
+            // scrolled (content match — robust to the app's rows-per-wheel-notch,
+            // which the old React-side line-count guess got wrong) and shift the
+            // selection to track it. Gated to when something is actually selected
+            // AND the app owns the screen: the normal shell/inline-agent
+            // transcript glues for free (its SelectableArea lives inside the
+            // ClippedScrollable, whose scroll translation already moves the
+            // selection with the content), so we must NOT double-shift it here.
+            let detect = frame.alt_screen && p.sel.has_selection();
+            let old_rows = if detect { g.rows.clone() } else { Vec::new() };
             g.apply_frame(frame);
+            if detect {
+                let k = detect_scroll_shift(&old_rows, &g.rows);
+                if k != 0 {
+                    p.sel.shift_relative_y(-(k as f32) * LINE_PX);
+                }
+            }
         }
         let _ = app_for_sink.run_on_main_thread(|| {
             warpui::platform::poke_embedded_redraw();
@@ -1775,8 +1929,11 @@ pub fn term_surface_set_rect(pane_key: String, x: f64, y: f64, width: f64, heigh
     // is what stops the right-panel side terminal from blanking / shrinking: the
     // shared GPU surface is fragile to resize, and a zeroed main both collapsed
     // the box AND broke the side's side-by-side gap math. The side pane is NOT
-    // retained — collapsing the right panel SHOULD shrink the surface.
-    let is_main = pane_key != "side";
+    // retained — collapsing the right panel SHOULD shrink the surface. Neither
+    // is main2 (the split's right half): closing the split zero-reports it,
+    // and retaining would leave a stale column painting over the re-widened
+    // main pane.
+    let is_main = pane_key != "side" && pane_key != "main2";
     if is_main && zero {
         // Drop the stale report; keep the prior rect.
     } else if let Ok(mut r) = p.rect.lock() {
@@ -1801,12 +1958,20 @@ pub fn term_native_attach(
     let p = pane(&pane_key);
     // Stop mirroring this pane's previous pty, then mirror the new one.
     let prev = p.pty_id();
-    if !prev.is_empty() && prev != id {
-        crate::term::clear_native_pty(&prev);
-    }
     if let Ok(mut g) = p.pty.lock() {
         g.clear();
         g.push_str(&id);
+    }
+    // Unregister the previous pty ONLY if no other pane mirrors it now.
+    // When two terminals swap halves (main ⇄ main2) the two attach calls
+    // land back-to-back, and the second pane's "previous" pty is exactly
+    // the one the first pane just claimed — clearing it unconditionally
+    // froze that pane (frames stopped reaching the sink).
+    if !prev.is_empty()
+        && prev != id
+        && panes().iter().all(|q| q.pty_id() != prev)
+    {
+        crate::term::clear_native_pty(&prev);
     }
     crate::term::set_native_pty(&id);
     {
@@ -1858,13 +2023,16 @@ pub fn term_native_attach(
 pub fn term_native_detach(pane_key: String) {
     let p = pane(&pane_key);
     let prev = p.pty_id();
-    if !prev.is_empty() {
-        crate::term::clear_native_pty(&prev);
-    }
     if let Ok(mut g) = p.pty.lock() {
         g.clear();
     }
-    if pane_key == "side" {
+    // Same other-pane guard as `term_native_attach`: during a half-swap the
+    // pty this pane is letting go of may have just been claimed by another
+    // pane — don't yank its frames.
+    if !prev.is_empty() && panes().iter().all(|q| q.pty_id() != prev) {
+        crate::term::clear_native_pty(&prev);
+    }
+    if pane_key == "side" || pane_key == "main2" {
         if let Ok(mut r) = p.rect.lock() {
             *r = (0.0, 0.0, 0.0, 0.0);
         }
@@ -1980,24 +2148,6 @@ pub fn term_native_mouse(
     }
 }
 
-/// Tauri command: the alt-screen agent's content scrolled by `delta_lines`
-/// (the same signed line count just sent through `term_native_wheel`;
-/// positive = toward newer/down). The app repaints its grid in place, so a
-/// selection anchored to grid coordinates would highlight whatever text
-/// scrolled under it. Shift the stored selection bounds by the distance the
-/// content moved (scrolling up by N lines moves the text DOWN N rows →
-/// +N·LINE_PX) so the highlight stays glued to the text it was started on,
-/// Warp-style. Best-effort: assumes the app scrolls one row per wheel line
-/// (true for claude/codex and every pager we route here).
-#[tauri::command]
-pub fn term_native_selection_scrolled(pane_key: String, delta_lines: i32) {
-    let p = pane(&pane_key);
-    p.sel.shift_relative_y(-(delta_lines as f32) * LINE_PX);
-    if let Some(app) = APP_HANDLE.get() {
-        let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
-    }
-}
-
 /// Tauri command: the latest selected transcript text (cached by the
 /// `SelectableArea` selection handler), or `None` if nothing is selected. React
 /// reads this on Cmd+C in the shell and writes it to the clipboard via the
@@ -2051,6 +2201,125 @@ pub fn term_native_set_viewport(pane_key: String, top: f64, height: f64) {
     }
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
+    }
+}
+
+#[cfg(test)]
+mod scroll_shift_tests {
+    use super::*;
+
+    fn plain_span(text: &str) -> Span {
+        Span {
+            text: text.to_string(),
+            fg: "var(--text-primary)".into(),
+            bg: "var(--surface-0)".into(),
+            bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+            dim: false,
+            strikeout: false,
+            link: None,
+        }
+    }
+    fn rows(lines: &[&str]) -> Vec<RowSnapshot> {
+        lines
+            .iter()
+            .map(|l| RowSnapshot {
+                spans: vec![plain_span(l)],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scroll_down_shifts_content_up() {
+        // Ten distinct rows; the app scrolls DOWN by 3 (content moves up 3, three
+        // fresh rows appear at the bottom). new[i] == old[i+3] for the retained
+        // rows, so the measured shift is +3.
+        let old = rows(&[
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9",
+        ]);
+        let new = rows(&[
+            "r3", "r4", "r5", "r6", "r7", "r8", "r9", "n7", "n8", "n9",
+        ]);
+        assert_eq!(detect_scroll_shift(&old, &new), 3);
+    }
+
+    #[test]
+    fn scroll_up_shifts_content_down() {
+        // The app scrolls UP by 2 (content moves down 2, two older rows appear at
+        // the top). new[i] == old[i-2] → measured shift is -2.
+        let old = rows(&[
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9",
+        ]);
+        let new = rows(&[
+            "p0", "p1", "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+        ]);
+        assert_eq!(detect_scroll_shift(&old, &new), -2);
+    }
+
+    #[test]
+    fn identical_grids_report_no_scroll() {
+        let g = rows(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        assert_eq!(detect_scroll_shift(&g, &g), 0);
+    }
+
+    #[test]
+    fn spinner_tick_reports_no_scroll() {
+        // Only one row changes (a spinner glyph / streamed char). Staying put
+        // explains far more rows than any shift, so no shift is reported — this
+        // is what keeps a completed selection from jumping on a non-scroll frame.
+        let old = rows(&["a", "b", "c", "d", "e", "f", "g", "loading |"]);
+        let new = rows(&["a", "b", "c", "d", "e", "f", "g", "loading /"]);
+        assert_eq!(detect_scroll_shift(&old, &new), 0);
+    }
+
+    #[test]
+    fn full_page_swap_reports_no_scroll() {
+        // A page jump replaces every row with unrelated content — no offset lines
+        // anything up, so we conservatively report no scroll rather than guess.
+        let old = rows(&["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"]);
+        let new = rows(&["z0", "z1", "z2", "z3", "z4", "z5", "z6", "z7"]);
+        assert_eq!(detect_scroll_shift(&old, &new), 0);
+    }
+
+    #[test]
+    fn blank_rows_do_not_inflate_a_false_shift() {
+        // A grid that is mostly blank with a couple of content rows must not
+        // report a shift just because the blank rows "match" at every offset.
+        let old = rows(&["", "", "hello", "world", "", "", "", ""]);
+        let new = rows(&["", "", "hello", "world", "", "", "", ""]);
+        assert_eq!(detect_scroll_shift(&old, &new), 0);
+    }
+
+    #[test]
+    fn ignores_color_only_changes() {
+        // A pager re-coloring its current line (same text, different style) is not
+        // a scroll. row_text compares glyphs only, so this stays at 0.
+        let old = vec![
+            RowSnapshot { spans: vec![plain_span("line one")] },
+            RowSnapshot { spans: vec![plain_span("line two")] },
+            RowSnapshot { spans: vec![plain_span("line three")] },
+            RowSnapshot { spans: vec![plain_span("line four")] },
+            RowSnapshot { spans: vec![plain_span("line five")] },
+        ];
+        let mut recolored = plain_span("line three");
+        recolored.inverse = true;
+        let new = vec![
+            RowSnapshot { spans: vec![plain_span("line one")] },
+            RowSnapshot { spans: vec![plain_span("line two")] },
+            RowSnapshot { spans: vec![recolored] },
+            RowSnapshot { spans: vec![plain_span("line four")] },
+            RowSnapshot { spans: vec![plain_span("line five")] },
+        ];
+        assert_eq!(detect_scroll_shift(&old, &new), 0);
+    }
+
+    #[test]
+    fn tiny_grids_bail_out() {
+        let old = rows(&["a", "b", "c"]);
+        let new = rows(&["b", "c", "d"]);
+        assert_eq!(detect_scroll_shift(&old, &new), 0);
     }
 }
 

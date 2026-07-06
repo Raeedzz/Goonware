@@ -25,6 +25,7 @@ import { fs } from "@/lib/fs";
 import { git, type StatusEntry } from "@/lib/git";
 import { FileTree } from "@/files/FileTree";
 import { HistoryView } from "@/git/HistoryView";
+import { PrsView } from "@/git/PrsView";
 import { paneSlotStyle } from "./paneSlotLayout";
 import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
@@ -44,6 +45,7 @@ import { forgetPtys } from "@/terminal/sessionMemory";
  */
 export function RightPanel() {
   const worktree = useActiveWorktree();
+  const { rightPanelCollapsed } = useAppState();
   if (!worktree) return null;
   const splitPct = Math.min(80, Math.max(20, worktree.rightSplitPct));
   const collapsed = worktree.secondaryCollapsed === true;
@@ -62,7 +64,16 @@ export function RightPanel() {
       }}
     >
       <UpperPanel worktree={worktree} />
-      <SecondaryPanel worktree={worktree} collapsed={collapsed} />
+      <SecondaryPanel
+        worktree={worktree}
+        collapsed={collapsed}
+        // The whole right panel collapsing to 0 width must hide the native
+        // side terminal explicitly: the panel's min-content DOM overflows
+        // the 0-width column (layout-wise — overflow:hidden only clips
+        // paint), so a merely-clipped tracker would still measure a real
+        // box hanging off the window's right edge.
+        panelHidden={rightPanelCollapsed}
+      />
     </div>
   );
 }
@@ -124,6 +135,12 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
         />
         <PanelTab
           worktreeId={worktree.id}
+          label="PRs"
+          tab="prs"
+          active={worktree.rightPanel === "prs"}
+        />
+        <PanelTab
+          worktreeId={worktree.id}
           label="Skills"
           tab="skills"
           active={worktree.rightPanel === "skills"}
@@ -165,6 +182,14 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
             branch={status.branch}
             error={status.error}
             refresh={status.refresh}
+          />
+        </PaneSlot>
+        <PaneSlot active={worktree.rightPanel === "prs"}>
+          <PrsView
+            worktree={worktree}
+            // Gates the gh-CLI polling — hidden panes stay quiet, same
+            // deal as BrowserPane's isVisible below.
+            isVisible={worktree.rightPanel === "prs"}
           />
         </PaneSlot>
         <PaneSlot active={worktree.rightPanel === "skills"}>
@@ -252,7 +277,7 @@ function PanelTab({
       onMouseLeave={() => setHover(false)}
       style={{
         position: "relative",
-        height: 28,
+        height: 24,
         padding: "0 var(--space-2)",
         backgroundColor: "transparent",
         color: active ? "var(--text-primary)" : "var(--text-secondary)",
@@ -1625,9 +1650,13 @@ function ChecksView() {
 function SecondaryPanel({
   worktree,
   collapsed,
+  panelHidden,
 }: {
   worktree: Worktree;
   collapsed: boolean;
+  /** True while the whole right panel is collapsed to 0 width — the
+   *  native side pane must report hidden (zero rect + pty detach). */
+  panelHidden: boolean;
 }) {
   const dispatch = useAppDispatch();
   return (
@@ -1734,7 +1763,9 @@ function SecondaryPanel({
       >
         <WarpSurfaceTracker
           paneKey="side"
-          visible={!collapsed && worktree.secondaryTab === "terminal"}
+          visible={
+            !collapsed && !panelHidden && worktree.secondaryTab === "terminal"
+          }
         />
         <AnimatePresence initial={false}>
           {!collapsed && (

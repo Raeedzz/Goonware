@@ -408,7 +408,7 @@ export function IconPickerDialog({
   );
 }
 
-function IconCell({
+export function IconCell({
   icon,
   active,
   onClick,
@@ -456,7 +456,7 @@ function IconCell({
   );
 }
 
-function ColorSwatch({
+export function ColorSwatch({
   id,
   active,
   onClick,
@@ -517,7 +517,7 @@ function ColorSwatch({
   );
 }
 
-function SearchGlyph() {
+export function SearchGlyph() {
   return (
     <svg
       width="14"

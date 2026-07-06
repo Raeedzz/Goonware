@@ -247,6 +247,12 @@ pub fn run() {
             pr::pr_merge,
             pr::merge_base_into_branch,
             pr::gh_username,
+            // PRs tab (list / review / checkout / return)
+            pr::pr_list,
+            pr::pr_checkout,
+            pr::pr_checkout_return,
+            pr::pr_review_enter,
+            pr::pr_review_restore,
             // Connections (Task #10)
             connections::connections_scan,
             // Search (Task #15)
@@ -299,8 +305,6 @@ pub fn run() {
             warp_term::term_native_mouse,
             #[cfg(target_os = "macos")]
             warp_term::term_native_selection_text,
-            #[cfg(target_os = "macos")]
-            warp_term::term_native_selection_scrolled,
             #[cfg(target_os = "macos")]
             warp_term::term_native_set_viewport,
             #[cfg(target_os = "macos")]

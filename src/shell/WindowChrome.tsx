@@ -1,7 +1,6 @@
 import {
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
   type ComponentType,
@@ -24,8 +23,9 @@ import {
   useAppState,
 } from "@/state/AppState";
 import { useToast } from "@/primitives/Toast";
-import { projectSettings, type Tab, type Worktree } from "@/state/types";
+import { projectSettings, type Worktree } from "@/state/types";
 import { collectWorktreePtyIds, worktreeArchive } from "@/lib/worktrees";
+import { mergeBaseAndHandOff } from "@/git/conflictAgent";
 import { forgetPtys } from "@/terminal/sessionMemory";
 
 const TRAFFIC_LIGHT_GUTTER = 78;
@@ -47,12 +47,6 @@ interface PrStatus {
   url: string | null;
   state: string | null;
   mergeable: string | null;
-}
-
-interface ConflictResult {
-  conflicts: boolean;
-  files: string[];
-  alreadyUpToDate: boolean;
 }
 
 /**
@@ -214,26 +208,6 @@ function BranchActionButton({ worktree }: { worktree: Worktree | null }) {
     void archiveAfterMerge();
   }, [archiveOnMerge, worktree, pr?.state, archiveAfterMerge]);
 
-  // Find a terminal-tab PTY to inject a prompt into when delegating
-  // conflict resolution to the agent. Falls back to the secondary
-  // panel's active terminal if no main-column terminal is open.
-  const targetPtyId = useMemo(() => {
-    if (!worktree) return null;
-    const activeTab = worktree.activeTabId
-      ? state.tabs[worktree.activeTabId]
-      : null;
-    if (activeTab && isTerminal(activeTab)) return activeTab.ptyId;
-    for (const id of worktree.tabIds) {
-      const t = state.tabs[id];
-      if (t && isTerminal(t)) return t.ptyId;
-    }
-    return (
-      worktree.secondaryActiveTerminalId ??
-      worktree.secondaryPtyId ??
-      null
-    );
-  }, [worktree, state.tabs]);
-
   const merge = useCallback(async () => {
     if (!worktree || !pr?.number) return;
     setBusy(true);
@@ -265,11 +239,17 @@ function BranchActionButton({ worktree }: { worktree: Worktree | null }) {
     if (!worktree) return;
     setBusy(true);
     try {
-      const result = await invoke<ConflictResult>(
-        "merge_base_into_branch",
-        { cwd: path, base: "main" },
-      );
-      if (!result.conflicts) {
+      // Shared with the PRs tab's session banner — one prompt, one
+      // PTY-selection policy (see conflictAgent.ts).
+      const result = await mergeBaseAndHandOff({
+        path,
+        base: "main",
+        branchLabel: "this branch",
+        worktree,
+        tabs: state.tabs,
+        project: state.projects[worktree.projectId],
+      });
+      if (result.kind === "clean") {
         window.dispatchEvent(
           new CustomEvent("goonware-git-refresh", { detail: { cwd: path } }),
         );
@@ -281,43 +261,20 @@ function BranchActionButton({ worktree }: { worktree: Worktree | null }) {
         await refresh();
         return;
       }
-      // Conflicts present in working tree. Hand off to the worktree's
-      // agent via PTY injection — user sees the agent work in real
-      // time, which beats a one-shot helperRun for a multi-file edit.
-      const fileList = result.files.slice(0, 24).join(", ");
-      const project = state.projects[worktree.projectId];
-      const cfg = projectSettings(project);
-      const extras = [cfg.prefs.general, cfg.prefs.resolveConflicts]
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .join("\n\n");
-      const prompt =
-        `Merge conflicts after pulling main into this branch. ` +
-        `Files: ${fileList}. ` +
-        `Read each conflicted file, resolve the <<<<<<<, =======, >>>>>>> markers ` +
-        `keeping the correct intent, then run \`git add <files>\`, \`git commit --no-edit\`, ` +
-        `and \`git push\`. Don't ask for confirmation between files — just resolve them all.` +
-        (extras ? `\n\n${extras}` : "");
-      if (targetPtyId) {
-        const bytes = stringToUtf8Bytes(prompt + "\n");
-        await invoke("term_input", { id: targetPtyId, data: bytes }).catch(
-          () => undefined,
-        );
-        toast.show({
-          message: `Conflicts in ${result.files.length} file${result.files.length === 1 ? "" : "s"} — sent to agent.`,
-        });
-      } else {
-        toast.show({
-          message: `Conflicts in ${result.files.length} file${result.files.length === 1 ? "" : "s"}. Open your agent terminal and ask it to resolve.`,
-        });
-      }
+      const files = `${result.files} file${result.files === 1 ? "" : "s"}`;
+      toast.show({
+        message:
+          result.kind === "sent"
+            ? `Conflicts in ${files} — sent to agent.`
+            : `Conflicts in ${files}. Open your agent terminal and ask it to resolve.`,
+      });
       await refresh();
     } catch (e) {
       toast.show({ message: `Resolve failed: ${e}` });
     } finally {
       setBusy(false);
     }
-  }, [worktree, path, targetPtyId, refresh, toast]);
+  }, [worktree, path, state.projects, state.tabs, refresh, toast]);
 
   const openCreatePR = (m: "manual" | "auto") => {
     if (!worktree) return;
@@ -655,15 +612,6 @@ function intentText(intent: ButtonIntent): string {
   if (intent === "danger")
     return "color-mix(in oklch, var(--text-primary), var(--state-error) 35%)";
   return "color-mix(in oklch, var(--text-primary), var(--accent) 35%)";
-}
-
-function isTerminal(t: Tab): t is Extract<Tab, { kind: "terminal" }> {
-  return t.kind === "terminal";
-}
-
-function stringToUtf8Bytes(s: string): number[] {
-  const enc = new TextEncoder();
-  return Array.from(enc.encode(s));
 }
 
 /**

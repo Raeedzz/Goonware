@@ -32,6 +32,43 @@ pub struct PrStatus {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PrListItem {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub head_ref_name: String,
+    pub base_ref_name: String,
+    pub author: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+    /// One of MERGEABLE, CONFLICTING, UNKNOWN.
+    pub mergeable: String,
+    pub is_draft: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrCheckoutResult {
+    pub original_branch: String,
+    pub stashed: bool,
+    /// Branch head at checkout time — what `pr_checkout_return` needs
+    /// to undo the review-state soft reset. None when review state
+    /// could not be established (the branch is checked out normally).
+    pub head_sha: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrReturnResult {
+    /// False when a stash was expected but the tagged stash was gone —
+    /// the branch switch happened, but nothing was restored.
+    pub stash_restored: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConflictResult {
     pub conflicts: bool,
     pub files: Vec<String>,
@@ -574,6 +611,360 @@ pub async fn pr_status(cwd: String, branch: String) -> Result<PrStatus, String> 
         state: Some(parsed.state),
         mergeable: Some(parsed.mergeable),
     })
+}
+
+/// List every open PR on the repo via `gh pr list`. Drives the right
+/// panel's PRs tab. Author is flattened to the login string; draft PRs
+/// are included (the tab renders a Draft chip rather than hiding them).
+#[tauri::command]
+pub async fn pr_list(cwd: String) -> Result<Vec<PrListItem>, String> {
+    if !Path::new(&cwd).exists() {
+        return Err(format!("cwd does not exist: {cwd}"));
+    }
+    let out = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "50",
+            "--json",
+            "number,title,url,headRefName,baseRefName,author,additions,deletions,changedFiles,mergeable,isDraft,updatedAt",
+        ])
+        .current_dir(&cwd)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh: {e}. Is GitHub CLI installed? `brew install gh`"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "gh pr list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    #[derive(Deserialize)]
+    struct AuthorJson {
+        login: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RowJson {
+        number: u64,
+        title: String,
+        url: String,
+        head_ref_name: String,
+        base_ref_name: String,
+        author: Option<AuthorJson>,
+        additions: u64,
+        deletions: u64,
+        changed_files: u64,
+        mergeable: String,
+        is_draft: bool,
+        updated_at: String,
+    }
+    let rows: Vec<RowJson> = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("parse gh json: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| PrListItem {
+            number: r.number,
+            title: r.title,
+            url: r.url,
+            head_ref_name: r.head_ref_name,
+            base_ref_name: r.base_ref_name,
+            author: r.author.map(|a| a.login).unwrap_or_default(),
+            additions: r.additions,
+            deletions: r.deletions,
+            changed_files: r.changed_files,
+            mergeable: r.mergeable,
+            is_draft: r.is_draft,
+            updated_at: r.updated_at,
+        })
+        .collect())
+}
+
+/// Put the checked-out PR branch into "review state": HEAD soft-reset
+/// to the merge-base with `base`, so the PR's entire diff shows up as
+/// staged changes and flows through the app's normal changes UI (the
+/// Changes tab, the all-changes view, per-file diffs) instead of a
+/// bespoke PR-diff surface. Returns the branch head sha needed to undo
+/// this later.
+///
+/// Best-effort by design: any failure past resolving HEAD leaves the
+/// branch checked out normally and still returns the sha — the
+/// checkout already succeeded, and the caller must be able to offer
+/// the way back regardless.
+async fn enter_review_state(cwd: &str, base: &str) -> Option<String> {
+    let head_sha = run_git_checked(cwd, &["rev-parse", "HEAD"])
+        .await
+        .ok()?
+        .trim()
+        .to_string();
+    if head_sha.is_empty() || base.is_empty() {
+        return if head_sha.is_empty() { None } else { Some(head_sha) };
+    }
+    // origin/<base> may be stale or absent locally; refresh best-effort.
+    // Non-interactive and timeboxed — a fetch that wants credentials or
+    // a dead network must degrade to "merge-base against the local ref",
+    // never hang the checkout.
+    let mut fetch = Command::new("git");
+    fetch
+        .args(["fetch", "origin", base])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null());
+    for (k, v) in NON_INTERACTIVE_GIT_ENV {
+        fetch.env(k, v);
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(20), fetch.output()).await;
+    let origin_base = format!("origin/{base}");
+    let merge_base = match run_git_checked(cwd, &["merge-base", &origin_base, "HEAD"]).await {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => match run_git_checked(cwd, &["merge-base", base, "HEAD"]).await {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => return Some(head_sha),
+        },
+    };
+    if !merge_base.is_empty() && merge_base != head_sha {
+        let _ = run_git_checked(cwd, &["reset", "--soft", &merge_base]).await;
+    }
+    Some(head_sha)
+}
+
+/// Undo `enter_review_state`: move the branch ref forward to the
+/// recorded head. Soft, so any review edits stay in the index/worktree
+/// as diffs against the real head — lossless. Only acts when HEAD is
+/// an ancestor of `head_sha` (the soft reset is still in effect); if
+/// the user or an agent committed on top, resetting would drop those
+/// commits from the branch, so we leave everything alone and report
+/// false.
+async fn restore_review_state(cwd: &str, head_sha: &str) -> Result<bool, String> {
+    let head = run_git_checked(cwd, &["rev-parse", "HEAD"])
+        .await?
+        .trim()
+        .to_string();
+    if head == head_sha {
+        return Ok(false);
+    }
+    let ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", "HEAD", head_sha])
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| format!("spawn git: {e}"))?
+        .status
+        .success();
+    if !ancestor {
+        return Ok(false);
+    }
+    run_git_checked(cwd, &["reset", "--soft", head_sha]).await?;
+    Ok(true)
+}
+
+/// Re-establish review state on an already-checked-out PR branch —
+/// used after a clean base merge so the (now conflict-free) PR diff
+/// shows as staged changes again. Returns the new head sha to persist.
+#[tauri::command]
+pub async fn pr_review_enter(cwd: String, base: String) -> Result<Option<String>, String> {
+    if !Path::new(&cwd).exists() {
+        return Err(format!("cwd does not exist: {cwd}"));
+    }
+    Ok(enter_review_state(&cwd, &base).await)
+}
+
+/// Leave review state (branch ref back on the real head) without
+/// switching branches — the step before any operation that needs the
+/// branch in its true shape, e.g. merging the base in.
+#[tauri::command]
+pub async fn pr_review_restore(cwd: String, head_sha: String) -> Result<bool, String> {
+    if !Path::new(&cwd).exists() {
+        return Err(format!("cwd does not exist: {cwd}"));
+    }
+    if head_sha.is_empty() {
+        return Ok(false);
+    }
+    restore_review_state(&cwd, &head_sha).await
+}
+
+/// Message marker on the auto-stash created by `pr_checkout`, suffixed
+/// with the branch it was taken from so `pr_checkout_return` can find
+/// exactly this stash even if the user made others in between.
+const PR_STASH_MARKER: &str = "goonware-pr-checkout";
+
+/// Find the stash ref (e.g. `stash@{1}`) whose message carries our
+/// marker for `branch`. Newest match wins.
+async fn find_pr_stash(cwd: &str, branch: &str) -> Option<String> {
+    let raw = run_git(cwd, &["stash", "list", "--format=%gd\u{1f}%gs"])
+        .await
+        .ok()?;
+    let needle = format!("{PR_STASH_MARKER}:{branch}");
+    for line in raw.lines() {
+        let Some((gd, gs)) = line.split_once('\u{1f}') else {
+            continue;
+        };
+        // %gs renders as "On <branch>: <message>" — compare the message
+        // exactly, so returning to `feat` can never pop a stash tagged
+        // for `feature` (or any user stash that merely mentions the
+        // marker). Branch names can't contain spaces, so the first
+        // ": " is always git's own separator.
+        let msg = gs.split_once(": ").map_or(gs, |(_, m)| m);
+        if msg == needle {
+            return Some(gd.to_string());
+        }
+    }
+    None
+}
+
+/// Turn the worktree into a review environment for a PR: stash any
+/// uncommitted work (tagged so we can restore it later), `gh pr
+/// checkout <number>`, then soft-reset to the merge-base with `base`
+/// so the PR's whole diff appears as staged changes in the normal
+/// changes UI. Returns what the caller needs to offer a "go back"
+/// button — the original branch, whether a stash was made, and the PR
+/// branch's real head sha.
+///
+/// If the checkout itself fails the stash is popped back immediately so
+/// the user's work never silently disappears into the stash list.
+#[tauri::command]
+pub async fn pr_checkout(
+    cwd: String,
+    number: u64,
+    base: String,
+    head: String,
+) -> Result<PrCheckoutResult, String> {
+    if !Path::new(&cwd).exists() {
+        return Err(format!("cwd does not exist: {cwd}"));
+    }
+    let original_branch = run_git_checked(&cwd, &["symbolic-ref", "--short", "HEAD"])
+        .await
+        .map_err(|_| "could not determine current branch (detached HEAD?)".to_string())?
+        .trim()
+        .to_string();
+    if original_branch.is_empty() {
+        return Err("could not determine current branch (detached HEAD?)".into());
+    }
+
+    // Reviewing the PR that IS this worktree's branch would stash the
+    // user's own work-in-progress and soft-reset their working branch
+    // in place — and when the worktree hosts a running dev build, that
+    // rewrites the app's own sources mid-flight. There is nothing to
+    // check out; refuse up front.
+    if !head.is_empty() && head == original_branch {
+        return Err(format!(
+            "PR #{number}'s branch (`{head}`) is what this worktree is already on — \
+             this worktree IS that PR. Review it from a different branch or worktree."
+        ));
+    }
+
+    // A tagged stash for this branch means an earlier review session
+    // never finished (e.g. the app died mid-checkout). Stacking a
+    // second stash under the same tag would make the eventual pop
+    // ambiguous — refuse and point at the recovery path instead.
+    if find_pr_stash(&cwd, &original_branch).await.is_some() {
+        return Err(format!(
+            "A previous PR review left stashed work on `{original_branch}` \
+             (see `git stash list`). Pop or drop that stash, then retry."
+        ));
+    }
+
+    let porcelain = run_git_checked(&cwd, &["status", "--porcelain"]).await?;
+    let dirty = porcelain.lines().any(|l| !l.trim().is_empty());
+    let mut stashed = false;
+    if dirty {
+        let msg = format!("{PR_STASH_MARKER}:{original_branch}");
+        run_git_checked(&cwd, &["stash", "push", "-u", "-m", &msg]).await?;
+        stashed = true;
+    }
+
+    let num = number.to_string();
+    let out = Command::new("gh")
+        .args(["pr", "checkout", &num])
+        .current_dir(&cwd)
+        .output()
+        .await
+        .map_err(|e| format!("spawn gh: {e}. Is GitHub CLI installed? `brew install gh`"))?;
+    if !out.status.success() {
+        let mut msg = format!(
+            "gh pr checkout failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        // Roll the stash back so a failed checkout is a clean no-op.
+        // gh isn't atomic — it can die after already switching branches
+        // — so make sure the pop lands on the original branch, and say
+        // so when the stash couldn't be restored rather than dropping
+        // the pop error on the floor.
+        if stashed {
+            let head = run_git_checked(&cwd, &["symbolic-ref", "--short", "HEAD"])
+                .await
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let on_original = head == original_branch
+                || run_git_checked(&cwd, &["checkout", &original_branch])
+                    .await
+                    .is_ok();
+            let popped = match find_pr_stash(&cwd, &original_branch).await {
+                Some(stash_ref) if on_original => {
+                    run_git_checked(&cwd, &["stash", "pop", &stash_ref])
+                        .await
+                        .is_ok()
+                }
+                _ => false,
+            };
+            if !popped {
+                msg.push_str(
+                    " — your uncommitted work is still saved in the stash list (`git stash list`)",
+                );
+            }
+        }
+        return Err(msg);
+    }
+    // Best-effort past this point — the checkout succeeded, so the
+    // session record (and its way back) must reach the caller even if
+    // review state couldn't be established.
+    let head_sha = enter_review_state(&cwd, &base).await;
+    Ok(PrCheckoutResult {
+        original_branch,
+        stashed,
+        head_sha,
+    })
+}
+
+/// Undo `pr_checkout`: put the PR branch back on its real head (the
+/// review-state soft reset would otherwise carry the whole PR diff
+/// onto the original branch as staged changes), switch back, and pop
+/// the tagged stash if one was made. Fails loudly if the PR branch has
+/// review edits (git refuses the checkout) — the user decides whether
+/// to commit or discard those, we never do it for them.
+///
+/// `stash_restored` is false when `stashed` was set but the tagged
+/// stash no longer exists (e.g. the user popped it by hand) — the
+/// caller must not claim the work was restored.
+#[tauri::command]
+pub async fn pr_checkout_return(
+    cwd: String,
+    branch: String,
+    stashed: bool,
+    head_sha: Option<String>,
+) -> Result<PrReturnResult, String> {
+    if !Path::new(&cwd).exists() {
+        return Err(format!("cwd does not exist: {cwd}"));
+    }
+    if branch.is_empty() {
+        return Err("no branch to return to".into());
+    }
+    // A failed restore must abort the return: checking out with the
+    // PR's diff still staged would splat it onto the original branch.
+    if let Some(sha) = head_sha.as_deref().filter(|s| !s.is_empty()) {
+        restore_review_state(&cwd, sha).await?;
+    }
+    run_git_checked(&cwd, &["checkout", &branch]).await?;
+    let mut stash_restored = false;
+    if stashed {
+        if let Some(stash_ref) = find_pr_stash(&cwd, &branch).await {
+            run_git_checked(&cwd, &["stash", "pop", &stash_ref]).await?;
+            stash_restored = true;
+        }
+    }
+    Ok(PrReturnResult { stash_restored })
 }
 
 /// Merge a PR via `gh pr merge` — server-side merge using the user's
@@ -1207,5 +1598,273 @@ mod tests {
             .await
             .expect_err("missing cwd should error");
         assert!(!err.is_empty());
+    }
+
+    // ---- pr_checkout_return stash round-trip -----------------------------
+
+    #[tokio::test]
+    async fn checkout_return_restores_branch_and_pops_tagged_stash() {
+        // Simulate the state pr_checkout leaves behind: work stashed
+        // with the marker message on `feature/mine`, HEAD moved to a
+        // "PR branch". Return must land back on the original branch
+        // with the stashed file restored — and leave an unrelated,
+        // newer stash untouched.
+        let (clone, _bare) = build_repo_with_bare_remote("feature/mine");
+        let cwd = clone.path().to_str().unwrap();
+
+        std::fs::write(clone.path().join("wip.txt"), "my wip\n").unwrap();
+        run_sync(
+            clone.path(),
+            &[
+                "stash",
+                "push",
+                "-u",
+                "-m",
+                &format!("{PR_STASH_MARKER}:feature/mine"),
+            ],
+        );
+        run_sync(clone.path(), &["checkout", "-b", "pr-branch"]);
+
+        // A second, unrelated stash made "later" (stash@{0}) must survive.
+        std::fs::write(clone.path().join("other.txt"), "other\n").unwrap();
+        run_sync(clone.path(), &["stash", "push", "-u", "-m", "user stash"]);
+
+        let result = pr_checkout_return(cwd.to_string(), "feature/mine".to_string(), true, None)
+            .await
+            .expect("return succeeds");
+        assert!(result.stash_restored, "tagged stash should be reported restored");
+
+        let branch = run_sync(clone.path(), &["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(branch.trim(), "feature/mine");
+        assert!(
+            clone.path().join("wip.txt").exists(),
+            "stashed wip should be restored"
+        );
+        let stashes = run_sync(clone.path(), &["stash", "list"]);
+        assert!(
+            stashes.contains("user stash"),
+            "unrelated stash must survive: {stashes}"
+        );
+        assert!(
+            !stashes.contains(PR_STASH_MARKER),
+            "tagged stash should be consumed: {stashes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_return_without_stash_just_switches_branch() {
+        let (clone, _bare) = build_repo_with_bare_remote("feature/clean");
+        let cwd = clone.path().to_str().unwrap();
+        run_sync(clone.path(), &["checkout", "-b", "pr-branch"]);
+
+        let result = pr_checkout_return(cwd.to_string(), "feature/clean".to_string(), false, None)
+            .await
+            .expect("return succeeds");
+        assert!(!result.stash_restored, "no stash existed to restore");
+
+        let branch = run_sync(clone.path(), &["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(branch.trim(), "feature/clean");
+    }
+
+    #[tokio::test]
+    async fn checkout_return_ignores_stash_tagged_for_prefixed_branch() {
+        // Marker matching is exact: a stash tagged for `feature/mine-2`
+        // must not be popped when returning to `feature/mine`.
+        let (clone, _bare) = build_repo_with_bare_remote("feature/mine");
+        let cwd = clone.path().to_str().unwrap();
+
+        std::fs::write(clone.path().join("wip.txt"), "other branch wip\n").unwrap();
+        run_sync(
+            clone.path(),
+            &[
+                "stash",
+                "push",
+                "-u",
+                "-m",
+                &format!("{PR_STASH_MARKER}:feature/mine-2"),
+            ],
+        );
+        run_sync(clone.path(), &["checkout", "-b", "pr-branch"]);
+
+        let result = pr_checkout_return(cwd.to_string(), "feature/mine".to_string(), true, None)
+            .await
+            .expect("return succeeds");
+        assert!(
+            !result.stash_restored,
+            "stash tagged for a prefixed branch name must not match"
+        );
+        let stashes = run_sync(clone.path(), &["stash", "list"]);
+        assert!(
+            stashes.contains("feature/mine-2"),
+            "the other branch's stash must survive: {stashes}"
+        );
+    }
+
+    // ---- pr_checkout guards ----------------------------------------------
+
+    #[tokio::test]
+    async fn checkout_refuses_the_worktrees_own_branch() {
+        // Reviewing the PR whose head IS the current branch would stash
+        // the user's WIP and soft-reset their own working branch —
+        // refuse before touching anything.
+        let (clone, _bare) = build_repo_with_bare_remote("feature/mine");
+        let cwd = clone.path().to_str().unwrap();
+        std::fs::write(clone.path().join("wip.txt"), "wip\n").unwrap();
+
+        let err = pr_checkout(
+            cwd.to_string(),
+            7,
+            "main".to_string(),
+            "feature/mine".to_string(),
+        )
+        .await
+        .expect_err("same-branch checkout must refuse");
+        assert!(err.contains("already on"), "unexpected error: {err}");
+
+        // Nothing was stashed or moved.
+        assert!(clone.path().join("wip.txt").exists());
+        let stashes = run_sync(clone.path(), &["stash", "list"]);
+        assert!(stashes.trim().is_empty(), "no stash expected: {stashes}");
+    }
+
+    #[tokio::test]
+    async fn checkout_refuses_when_a_tagged_stash_already_exists() {
+        // A leftover tagged stash means a previous session never
+        // finished — a second checkout must not stack another stash
+        // under the same tag.
+        let (clone, _bare) = build_repo_with_bare_remote("feature/mine");
+        let cwd = clone.path().to_str().unwrap();
+        std::fs::write(clone.path().join("old-wip.txt"), "stranded\n").unwrap();
+        run_sync(
+            clone.path(),
+            &[
+                "stash",
+                "push",
+                "-u",
+                "-m",
+                &format!("{PR_STASH_MARKER}:feature/mine"),
+            ],
+        );
+
+        let err = pr_checkout(
+            cwd.to_string(),
+            7,
+            "main".to_string(),
+            "someone-elses-branch".to_string(),
+        )
+        .await
+        .expect_err("existing tagged stash must refuse");
+        assert!(err.contains("stash"), "unexpected error: {err}");
+
+        // The stranded stash is untouched — exactly one, same tag.
+        let stashes = run_sync(clone.path(), &["stash", "list"]);
+        assert_eq!(
+            stashes.matches(PR_STASH_MARKER).count(),
+            1,
+            "stash list changed: {stashes}"
+        );
+    }
+
+    // ---- review state (soft reset to merge-base) --------------------------
+
+    /// Repo with main pushed to a bare remote plus a two-commit
+    /// "PR branch" checked out. Returns (clone, bare, pr_head_sha).
+    fn build_pr_branch_repo() -> (TempDir, TempDir, String) {
+        let (clone, bare) = build_repo_on_main("main");
+        run_sync(clone.path(), &["checkout", "-b", "pr-branch"]);
+        std::fs::write(clone.path().join("a.txt"), "one\n").unwrap();
+        run_sync(clone.path(), &["add", "a.txt"]);
+        run_sync(clone.path(), &["commit", "-m", "pr commit 1"]);
+        std::fs::write(clone.path().join("b.txt"), "two\n").unwrap();
+        run_sync(clone.path(), &["add", "b.txt"]);
+        run_sync(clone.path(), &["commit", "-m", "pr commit 2"]);
+        let head = run_sync(clone.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        (clone, bare, head)
+    }
+
+    #[tokio::test]
+    async fn enter_review_state_stages_pr_diff_and_restore_undoes_it() {
+        let (clone, _bare, pr_head) = build_pr_branch_repo();
+        let cwd = clone.path().to_str().unwrap();
+
+        let returned = enter_review_state(cwd, "main").await;
+        assert_eq!(returned.as_deref(), Some(pr_head.as_str()));
+
+        // HEAD sits on the merge-base; the PR's files are staged.
+        let mb = run_sync(clone.path(), &["merge-base", "origin/main", &pr_head]);
+        let head_now = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(head_now.trim(), mb.trim());
+        let staged = run_sync(clone.path(), &["diff", "--cached", "--name-only"]);
+        assert!(staged.contains("a.txt") && staged.contains("b.txt"),
+            "PR files should show as staged: {staged}");
+
+        // Restore: branch ref back on the real head, tree clean.
+        let did = restore_review_state(cwd, &pr_head).await.expect("restore");
+        assert!(did, "restore should have acted");
+        let head_after = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(head_after.trim(), pr_head);
+        let porcelain = run_sync(clone.path(), &["status", "--porcelain"]);
+        assert!(porcelain.trim().is_empty(), "expected clean tree: {porcelain}");
+    }
+
+    #[tokio::test]
+    async fn restore_review_state_refuses_when_commits_were_made_on_top() {
+        let (clone, _bare, pr_head) = build_pr_branch_repo();
+        let cwd = clone.path().to_str().unwrap();
+        enter_review_state(cwd, "main").await.expect("enter");
+
+        // Simulate a takeover: commit the staged review diff as one
+        // new commit. HEAD is no longer an ancestor of the PR head.
+        run_sync(clone.path(), &["commit", "-m", "review takeover"]);
+        let new_head = run_sync(clone.path(), &["rev-parse", "HEAD"]).trim().to_string();
+
+        let did = restore_review_state(cwd, &pr_head).await.expect("restore call");
+        assert!(!did, "must not reset past user commits");
+        let head_after = run_sync(clone.path(), &["rev-parse", "HEAD"]);
+        assert_eq!(head_after.trim(), new_head, "takeover commit must survive");
+    }
+
+    #[tokio::test]
+    async fn checkout_return_with_head_sha_restores_branch_before_switching() {
+        let (clone, _bare, pr_head) = build_pr_branch_repo();
+        let cwd = clone.path().to_str().unwrap();
+        enter_review_state(cwd, "main").await.expect("enter");
+
+        let result = pr_checkout_return(
+            cwd.to_string(),
+            "main".to_string(),
+            false,
+            Some(pr_head.clone()),
+        )
+        .await
+        .expect("return succeeds");
+        assert!(!result.stash_restored);
+
+        // Back on main with a clean tree — the PR diff did NOT come along.
+        let branch = run_sync(clone.path(), &["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(branch.trim(), "main");
+        let porcelain = run_sync(clone.path(), &["status", "--porcelain"]);
+        assert!(porcelain.trim().is_empty(), "expected clean tree: {porcelain}");
+        // And the PR branch still points at its real head.
+        let pr_ref = run_sync(clone.path(), &["rev-parse", "pr-branch"]);
+        assert_eq!(pr_ref.trim(), pr_head);
+    }
+
+    #[tokio::test]
+    async fn review_edits_survive_restore_as_uncommitted_changes() {
+        let (clone, _bare, pr_head) = build_pr_branch_repo();
+        let cwd = clone.path().to_str().unwrap();
+        enter_review_state(cwd, "main").await.expect("enter");
+
+        // Edit a PR file during review.
+        std::fs::write(clone.path().join("a.txt"), "one edited\n").unwrap();
+
+        let did = restore_review_state(cwd, &pr_head).await.expect("restore");
+        assert!(did);
+        // The edit remains, now as a plain uncommitted diff vs the head.
+        let porcelain = run_sync(clone.path(), &["status", "--porcelain"]);
+        assert!(porcelain.contains("a.txt"), "edit must survive: {porcelain}");
+        let content = std::fs::read_to_string(clone.path().join("a.txt")).unwrap();
+        assert_eq!(content, "one edited\n");
     }
 }

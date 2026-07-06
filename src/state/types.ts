@@ -191,8 +191,44 @@ export function projectSettings(project: Project | null | undefined): ProjectSet
    target, and a secondary terminal in the right panel.
    ------------------------------------------------------------------ */
 
-export type RightPanelTab = "files" | "changes" | "skills" | "browser";
+export type RightPanelTab = "files" | "changes" | "prs" | "skills" | "browser";
 export type SecondaryTab = "setup" | "run" | "terminal";
+
+/**
+ * A "reviewing a PR" session on a worktree. Set when the user checks
+ * a PR out from the PRs tab: their uncommitted work is stashed (tagged
+ * so nothing else can pop it by accident) and the PR's head branch is
+ * checked out in place. Cleared by the Return flow, which restores the
+ * original branch and pops the stash. Persisted with the worktree so
+ * the "go back" affordance survives restarts.
+ */
+export interface PrSession {
+  /** PR number checked out into the worktree. */
+  number: number;
+  /** PR head branch currently checked out. */
+  branch: string;
+  /** PR title, for the banner label. */
+  title: string;
+  /** Branch to return to when the session ends. */
+  originalBranch: string;
+  /**
+   * PR base branch (merge target), captured at checkout so conflict
+   * resolution never has to guess it from the (possibly truncated or
+   * still-loading) PR list. Optional only for sessions persisted
+   * before the field existed.
+   */
+  baseBranch?: string;
+  /**
+   * The PR branch's real head sha, recorded at checkout. The branch is
+   * soft-reset to its merge-base with the PR's base so the whole diff
+   * reads as staged changes in the normal changes UI; this sha is what
+   * the Return flow resets back to. Absent when review state couldn't
+   * be established (or for sessions persisted before the field).
+   */
+  headSha?: string;
+  /** True when pre-checkout dirty state was stashed (and must pop back). */
+  stashed: boolean;
+}
 
 export interface Worktree {
   id: WorktreeId;
@@ -212,6 +248,14 @@ export interface Worktree {
   /** Tabs (terminal / diff / markdown) in the main column for this worktree. */
   tabIds: TabId[];
   activeTabId: TabId | null;
+  /**
+   * Second pane of the 50/50 main-column split. Null/undefined = no
+   * split (the active tab fills the column). Set by dropping a tab
+   * from the strip onto the right half of the content area. Invariant
+   * (reducer-enforced): never equal to `activeTabId` — the same tab
+   * can't render in both halves.
+   */
+  splitTabId?: TabId | null;
 
   /** Right-panel selected tab and split position. */
   rightPanel: RightPanelTab;
@@ -235,6 +279,8 @@ export interface Worktree {
   color?: TagId;
   /** User-picked HugeIcons component name (overrides project's choice). */
   iconName?: string;
+  /** Active PR-review session, if the worktree is checked out to a PR. */
+  prSession?: PrSession | null;
   /**
    * True when the backing directory on disk has gone missing between
    * launches (e.g. the user deleted it manually). Transient — set by a
@@ -552,6 +598,9 @@ export interface AppState {
      */
     mode: "manual" | "auto";
   } | null;
+  /** Project the "New worktree" dialog is creating into; null = closed.
+      Transient — stripped by persistence like the other dialog flags. */
+  createWorktreeProjectId: ProjectId | null;
 
   settings: Settings;
   markdownView: "rich" | "source";
@@ -586,6 +635,7 @@ export type AppAction =
       worktreeId: WorktreeId;
       iconName: string | undefined;
     }
+  | { type: "set-create-worktree-open"; projectId: ProjectId | null }
 
   // Worktrees
   | { type: "add-worktree"; worktree: Worktree }
@@ -615,6 +665,19 @@ export type AppAction =
   | { type: "open-tab"; tab: Tab; activate?: boolean }
   | { type: "close-tab"; id: TabId }
   | { type: "select-tab"; worktreeId: WorktreeId; id: TabId }
+  /** Drop a tab onto one half of the content area. `side: "right"`
+      puts it in the split pane (creating the split); `side: "left"`
+      makes it the active tab. Either way the reducer preserves the
+      activeTabId ≠ splitTabId invariant (swapping when needed). */
+  | {
+      type: "split-tab";
+      worktreeId: WorktreeId;
+      id: TabId;
+      side: "left" | "right";
+    }
+  /** Collapse the split back to one full-width pane. `keep` names the
+      half whose tab stays visible (as the active tab). */
+  | { type: "unsplit"; worktreeId: WorktreeId; keep: "left" | "right" }
   | { type: "update-tab"; id: TabId; patch: Partial<Tab> }
   | { type: "set-tab-summary"; id: TabId; summary: string }
 

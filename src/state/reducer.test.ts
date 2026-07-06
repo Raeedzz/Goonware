@@ -248,3 +248,149 @@ describe("reorder-worktree", () => {
     expect(order(out, "p2")).toEqual(["x", "y"]);
   });
 });
+
+describe("split panes", () => {
+  /** Worktree with three commit tabs t1 (active), t2, t3. */
+  const seeded = (): AppState => {
+    let s = seed([worktree("w1", "p1")]);
+    s = open(s, commitTab("t1", "w1", "aaa111"));
+    s = open(s, commitTab("t2", "w1", "bbb222"));
+    s = open(s, commitTab("t3", "w1", "ccc333"));
+    return reducer(s, { type: "select-tab", worktreeId: "w1", id: "t1" });
+  };
+
+  test("dropping a non-active tab on the right splits", () => {
+    const s = reducer(seeded(), {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t2",
+      side: "right",
+    });
+    expect(s.worktrees.w1.activeTabId).toBe("t1");
+    expect(s.worktrees.w1.splitTabId).toBe("t2");
+  });
+
+  test("dropping the ACTIVE tab on the right backfills the left half", () => {
+    const s = reducer(seeded(), {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t1",
+      side: "right",
+    });
+    expect(s.worktrees.w1.splitTabId).toBe("t1");
+    expect(s.worktrees.w1.activeTabId).toBe("t3");
+  });
+
+  test("a single-tab worktree cannot split with itself", () => {
+    let s = seed([worktree("w1", "p1")]);
+    s = open(s, commitTab("t1", "w1", "aaa111"));
+    const out = reducer(s, {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t1",
+      side: "right",
+    });
+    expect(out).toBe(s);
+  });
+
+  test("dropping a tab on the left of an unsplit view splits (old active → right)", () => {
+    const s = reducer(seeded(), {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t2",
+      side: "left",
+    });
+    expect(s.worktrees.w1.activeTabId).toBe("t2");
+    expect(s.worktrees.w1.splitTabId).toBe("t1");
+  });
+
+  test("dropping the split tab on the left swaps halves", () => {
+    let s = reducer(seeded(), {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t2",
+      side: "right",
+    });
+    s = reducer(s, {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t2",
+      side: "left",
+    });
+    expect(s.worktrees.w1.activeTabId).toBe("t2");
+    expect(s.worktrees.w1.splitTabId).toBe("t1");
+  });
+
+  test("selecting the split tab in the strip swaps instead of duplicating", () => {
+    let s = reducer(seeded(), {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t2",
+      side: "right",
+    });
+    s = reducer(s, { type: "select-tab", worktreeId: "w1", id: "t2" });
+    expect(s.worktrees.w1.activeTabId).toBe("t2");
+    expect(s.worktrees.w1.splitTabId).toBe("t1");
+  });
+
+  test("re-opening (dedup path) the split tab's target also swaps", () => {
+    let s = reducer(seeded(), {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t2",
+      side: "right",
+    });
+    s = open(s, commitTab("t9", "w1", "bbb222")); // dedups onto t2
+    expect(s.worktrees.w1.activeTabId).toBe("t2");
+    expect(s.worktrees.w1.splitTabId).toBe("t1");
+  });
+
+  test("unsplit keeping the left half", () => {
+    let s = reducer(seeded(), {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t2",
+      side: "right",
+    });
+    s = reducer(s, { type: "unsplit", worktreeId: "w1", keep: "left" });
+    expect(s.worktrees.w1.activeTabId).toBe("t1");
+    expect(s.worktrees.w1.splitTabId).toBeNull();
+  });
+
+  test("unsplit keeping the right half", () => {
+    let s = reducer(seeded(), {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t2",
+      side: "right",
+    });
+    s = reducer(s, { type: "unsplit", worktreeId: "w1", keep: "right" });
+    expect(s.worktrees.w1.activeTabId).toBe("t2");
+    expect(s.worktrees.w1.splitTabId).toBeNull();
+  });
+
+  test("closing the split tab clears the split", () => {
+    let s = reducer(seeded(), {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t2",
+      side: "right",
+    });
+    s = reducer(s, { type: "close-tab", id: "t2" });
+    expect(s.worktrees.w1.activeTabId).toBe("t1");
+    expect(s.worktrees.w1.splitTabId).toBeNull();
+    expect(s.worktrees.w1.tabIds).toEqual(["t1", "t3"]);
+  });
+
+  test("closing the active tab promotes the split tab", () => {
+    let s = reducer(seeded(), {
+      type: "split-tab",
+      worktreeId: "w1",
+      id: "t2",
+      side: "right",
+    });
+    s = reducer(s, { type: "close-tab", id: "t1" });
+    expect(s.worktrees.w1.activeTabId).toBe("t2");
+    expect(s.worktrees.w1.splitTabId).toBeNull();
+  });
+});

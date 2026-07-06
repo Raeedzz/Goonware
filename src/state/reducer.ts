@@ -36,6 +36,7 @@ export const INITIAL_STATE: AppState = {
   settingsOpen: false,
   settingsSection: { kind: "general" },
   prDialogOpen: null,
+  createWorktreeProjectId: null,
   settings: DEFAULT_SETTINGS,
   markdownView: "rich",
 };
@@ -175,6 +176,10 @@ export function reducer(state: AppState, action: AppAction): AppState {
       return updateWorktree(state, action.worktreeId, () => ({
         iconName: action.iconName,
       }));
+
+    case "set-create-worktree-open":
+      if (state.createWorktreeProjectId === action.projectId) return state;
+      return { ...state, createWorktreeProjectId: action.projectId };
 
     /* Worktrees --------------------------------------------------- */
 
@@ -433,7 +438,16 @@ export function reducer(state: AppState, action: AppAction): AppState {
               action.activate !== false
                 ? {
                     ...state.worktrees,
-                    [w.id]: { ...w, activeTabId: existing.id },
+                    [w.id]: {
+                      ...w,
+                      activeTabId: existing.id,
+                      // Focusing the tab that occupies the split pane
+                      // swaps halves — same rule as `select-tab`.
+                      splitTabId:
+                        w.splitTabId === existing.id
+                          ? w.activeTabId
+                          : w.splitTabId ?? null,
+                    },
                   }
                 : state.worktrees,
           };
@@ -458,24 +472,85 @@ export function reducer(state: AppState, action: AppAction): AppState {
       const w = state.worktrees[t.worktreeId];
       if (!w) return state;
       const tabIds = w.tabIds.filter((id) => id !== action.id);
-      const activeTabId =
-        w.activeTabId === action.id
-          ? tabIds[tabIds.length - 1] ?? null
-          : w.activeTabId;
+      let splitTabId = w.splitTabId === action.id ? null : w.splitTabId ?? null;
+      let activeTabId = w.activeTabId;
+      if (w.activeTabId === action.id) {
+        // Closing the active (left) tab of a split promotes the split
+        // tab to active rather than jumping to an arbitrary neighbour.
+        if (splitTabId) {
+          activeTabId = splitTabId;
+          splitTabId = null;
+        } else {
+          activeTabId = tabIds[tabIds.length - 1] ?? null;
+        }
+      }
+      if (splitTabId === activeTabId) splitTabId = null;
       const { [action.id]: _removed, ...tabs } = state.tabs;
       return {
         ...state,
         tabs,
         worktrees: {
           ...state.worktrees,
-          [w.id]: { ...w, tabIds, activeTabId },
+          [w.id]: { ...w, tabIds, activeTabId, splitTabId },
         },
       };
     }
 
     case "select-tab": {
-      return updateWorktree(state, action.worktreeId, () => ({
+      return updateWorktree(state, action.worktreeId, (w) => ({
         activeTabId: action.id,
+        // Selecting the tab that lives in the split pane swaps the two
+        // halves (both stay visible) instead of rendering one tab twice.
+        splitTabId:
+          w.splitTabId === action.id ? w.activeTabId : w.splitTabId ?? null,
+      }));
+    }
+
+    case "split-tab": {
+      const w = state.worktrees[action.worktreeId];
+      if (!w) return state;
+      const t = state.tabs[action.id];
+      if (!t || t.worktreeId !== w.id || !w.tabIds.includes(action.id))
+        return state;
+      const oldActive = w.activeTabId;
+      const oldSplit = w.splitTabId ?? null;
+      if (action.side === "right") {
+        // Dragged tab becomes the split pane. If it was the active tab
+        // the left half needs a different occupant: the previous split
+        // tab if there was one, otherwise the nearest other tab. A
+        // single-tab worktree can't split with itself — no-op.
+        let activeTabId = oldActive;
+        if (action.id === oldActive) {
+          const fallback =
+            oldSplit ?? w.tabIds.filter((id) => id !== action.id).pop() ?? null;
+          if (!fallback) return state;
+          activeTabId = fallback;
+        }
+        return updateWorktree(state, w.id, () => ({
+          activeTabId,
+          splitTabId: action.id,
+        }));
+      }
+      // side === "left": dragged tab becomes the active tab. Keep the
+      // split (swap if the dragged tab WAS the split tab); when unsplit,
+      // the previous active tab moves to the right half so the drop
+      // always produces/keeps a split.
+      if (action.id === oldActive && oldSplit) return state;
+      const splitTabId =
+        action.id === oldSplit ? oldActive : oldSplit ?? oldActive;
+      if (!splitTabId || splitTabId === action.id) return state;
+      return updateWorktree(state, w.id, () => ({
+        activeTabId: action.id,
+        splitTabId,
+      }));
+    }
+
+    case "unsplit": {
+      const w = state.worktrees[action.worktreeId];
+      if (!w || !w.splitTabId) return state;
+      return updateWorktree(state, w.id, () => ({
+        activeTabId: action.keep === "right" ? w.splitTabId : w.activeTabId,
+        splitTabId: null,
       }));
     }
 

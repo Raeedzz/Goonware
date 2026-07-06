@@ -109,6 +109,19 @@
   --diff-change-bg:  oklch(32% 0.13  85 / 0.40);
   --diff-change-fg:  oklch(86% 0.18  85);
 
+  /* Syntax palette — shared by the editor theme (cm6-theme.ts) and the
+     diff highlighter (diff-highlight.tsx), which mirror each other.
+     Identifiers — variables, function calls, and properties — are the
+     bulk of any code diff, and Lezer tags them all as plain
+     `variableName`/`propertyName`. Left uncolored they fall back to
+     near-white --text-primary, so a diff reads as a wall of white.
+     A soft light-blue for identifiers and a warm gold for functions
+     give code real color while staying calm against the cool-dark
+     surface. */
+  --syntax-variable: oklch(83% 0.055 245);
+  --syntax-property: oklch(83% 0.055 245);
+  --syntax-function: oklch(87% 0.11  92);
+
   /* Modal backdrop */
   --backdrop: oklch(0% 0 0 / 0.55);
 
@@ -215,7 +228,7 @@
   --right-width:      372px;   /* files / changes / checks / memory + secondary terminal */
 
   --rail-width:         48px;
-  --tab-height:         36px;   /* 2-line tab (title + summary) at a fixed height; shared by sidebar + right-panel top bars */
+  --tab-height:         30px;   /* single-line tab at a fixed height; shared by sidebar + right-panel top bars */
   --pane-header-height: 28px;
   --filter-bar-height:  32px;
   --section-header-height: 24px;

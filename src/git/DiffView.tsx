@@ -1,8 +1,24 @@
 import { motion } from "motion/react";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  memo,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { git } from "@/lib/git";
 import { useDiffLineRenderers } from "./diff-highlight";
 import { DiffAskOverlay, reconstructDiffContext } from "./DiffAsk";
+import {
+  DiffFixBar,
+  DiffFixProvider,
+  HunkAddButton,
+  HunkCommentBox,
+  useDiffFix,
+  type HunkRef,
+} from "./DiffFix";
 import { parseUnifiedDiff, type DiffLine } from "./diff-parse";
 
 export { parseUnifiedDiff, type DiffLine };
@@ -121,6 +137,7 @@ export function DiffView({ projectPath, filePath, staged, onClose }: Props) {
     : "";
 
   return (
+    <DiffFixProvider cwd={projectPath}>
     <motion.div
       initial={{ opacity: 0, y: 4 }}
       animate={{ opacity: 1, y: 0 }}
@@ -283,8 +300,10 @@ export function DiffView({ projectPath, filePath, staged, onClose }: Props) {
             resolve={() => ({ path: filePath, diff: diffContext })}
           />
         )}
+        <DiffFixBar />
       </div>
     </motion.div>
+    </DiffFixProvider>
   );
 }
 
@@ -372,6 +391,72 @@ function hunkLabel(text: string): string {
   return m ? m[1].trim() : "";
 }
 
+/** Cap the diff snippet we attach per block so a giant edit doesn't
+ *  balloon the prompt handed to the agent. */
+const MAX_HUNK_SNIPPET_LINES = 80;
+
+interface BlockLayout {
+  /** Change-block ordinal each visible row belongs to (-1 if the row is
+   *  not part of an edited block — context, hunk header, plumbing). */
+  blockOf: number[];
+  /** Metadata per block: id, enclosing scope, and its diff snippet. */
+  blocks: HunkRef[];
+  /** First visible-row index of each block — where the `+` button sits. */
+  firstRow: number[];
+  /** Last visible-row index of each block — where the comment box lands. */
+  lastRow: number[];
+}
+
+/**
+ * Walk the rendered rows once and group the *edited* lines into change
+ * blocks: a block is a maximal run of consecutive `+`/`-` lines. A
+ * context line, a hunk boundary, or a plumbing header ends the run. Each
+ * block gets the `+` button on its first line and, when opened, the
+ * comment box directly under its last line — so a request targets the
+ * exact contiguous edit the user is pointing at, not the whole hunk.
+ *
+ * The snippet handed to the agent is that block's changed lines under
+ * the enclosing `@@` header (so line numbers/scope are anchored).
+ */
+function computeBlockLayout(visible: DiffLine[], file: string): BlockLayout {
+  const blockOf = new Array<number>(visible.length).fill(-1);
+  const blocks: HunkRef[] = [];
+  const firstRow: number[] = [];
+  const lastRow: number[] = [];
+  const snippetLines: string[][] = [];
+  let hunkHeader = "";
+  let label = "";
+  let cur = -1; // open block, or -1 between blocks
+  visible.forEach((l, i) => {
+    if (l.kind === "hunk") {
+      hunkHeader = l.text;
+      label = hunkLabel(l.text);
+      cur = -1;
+      return;
+    }
+    if (l.kind === "add" || l.kind === "remove") {
+      if (cur < 0) {
+        cur = blocks.length;
+        blocks.push({ id: `${file}#${cur}`, file, label, snippet: "" });
+        firstRow[cur] = i;
+        snippetLines.push(hunkHeader ? [hunkHeader] : []);
+      }
+      blockOf[i] = cur;
+      lastRow[cur] = i;
+      const prefix = l.kind === "add" ? "+" : "-";
+      if (snippetLines[cur].length < MAX_HUNK_SNIPPET_LINES)
+        snippetLines[cur].push(prefix + l.text);
+    } else {
+      // context / surviving header — closes the current block.
+      cur = -1;
+    }
+  });
+  blocks.forEach((b, k) => {
+    b.snippet = snippetLines[k].join("\n");
+  });
+  return { blockOf, blocks, firstRow, lastRow };
+}
+
 export function DiffBody({
   lines,
   filePath,
@@ -383,6 +468,17 @@ export function DiffBody({
   // indices line up with what we actually render.
   const visible = useMemo(() => visibleDiffLines(lines), [lines]);
   const rendered = useDiffLineRenderers(visible, filePath);
+  // Present only inside a working-diff view; null for historical commit
+  // diffs, which keeps them read-only (no `+`, no boxes).
+  const fix = useDiffFix();
+  const layout = useMemo(
+    () => computeBlockLayout(visible, filePath ?? ""),
+    [visible, filePath],
+  );
+  // The `+` gutter only exists in a working-diff view; commit diffs mount
+  // without a provider, so `fix` is null and no extra column is added.
+  const hasFix = !!fix;
+  const cols = hasFix ? 4 : 3;
   return (
     <table
       style={{
@@ -392,21 +488,77 @@ export function DiffBody({
       }}
     >
       <colgroup>
-        {/* One line-number gutter, one sigil, then the code. */}
-        <col style={{ width: 52 }} />
-        <col style={{ width: 22 }} />
+        {/* Optional `+` gutter, line-number gutter, sigil, then the code. */}
+        {hasFix && <col style={{ width: 20 }} />}
+        <col style={{ width: 28 }} />
+        <col style={{ width: 14 }} />
         <col />
       </colgroup>
       <tbody>
-        {visible.map((l, i) => (
-          <DiffRow key={i} line={l} body={rendered[i]} />
-        ))}
+        {visible.map((l, i) => {
+          const ord = layout.blockOf[i];
+          // The button sits on the first changed line of each block; only
+          // that row carries `fix`, so the rest keep stable props and skip
+          // re-render while the user types in a box.
+          const blockRef =
+            ord >= 0 && layout.firstRow[ord] === i
+              ? layout.blocks[ord]
+              : undefined;
+          const showBox =
+            hasFix &&
+            ord >= 0 &&
+            layout.lastRow[ord] === i &&
+            fix.isOpen(layout.blocks[ord].id);
+          return (
+            <Fragment key={i}>
+              <DiffRow
+                line={l}
+                body={rendered[i]}
+                gutter={hasFix}
+                colSpanAll={cols}
+                blockRef={blockRef}
+                fix={blockRef ? fix ?? undefined : undefined}
+              />
+              {showBox && fix && (
+                <tr>
+                  <td
+                    colSpan={cols}
+                    style={{
+                      padding: "var(--space-2) var(--space-3)",
+                      backgroundColor: "var(--surface-1)",
+                      borderBottom: "var(--border-1)",
+                    }}
+                  >
+                    <HunkCommentBox hunkRef={layout.blocks[ord]} fix={fix} />
+                  </td>
+                </tr>
+              )}
+            </Fragment>
+          );
+        })}
       </tbody>
     </table>
   );
 }
 
-function DiffRow({ line, body }: { line: DiffLine; body: ReactNode }) {
+const DiffRow = memo(function DiffRow({
+  line,
+  body,
+  gutter,
+  colSpanAll,
+  blockRef,
+  fix,
+}: {
+  line: DiffLine;
+  body: ReactNode;
+  /** Whether the leading `+`-button gutter column is present. */
+  gutter: boolean;
+  /** colSpan for full-width rows (hunk/header) — 4 with gutter, else 3. */
+  colSpanAll: number;
+  /** Set only on the first line of a change block — renders the button. */
+  blockRef?: HunkRef;
+  fix?: ReturnType<typeof useDiffFix>;
+}) {
   // Hunk markers become a single full-width separator rule — the visual
   // "the diff skips here" cue, with the enclosing-scope label if git gave
   // one. No raw `@@ -a,b +c,d @@` noise, no per-side numbers to decode.
@@ -415,9 +567,9 @@ function DiffRow({ line, body }: { line: DiffLine; body: ReactNode }) {
     return (
       <tr>
         <td
-          colSpan={3}
+          colSpan={colSpanAll}
           style={{
-            padding: "var(--space-1) var(--space-3)",
+            padding: "var(--space-1) var(--space-2)",
             borderTop: "var(--border-1)",
             borderBottom: "var(--border-1)",
             backgroundColor: "var(--surface-1)",
@@ -442,9 +594,9 @@ function DiffRow({ line, body }: { line: DiffLine; body: ReactNode }) {
     return (
       <tr>
         <td
-          colSpan={3}
+          colSpan={colSpanAll}
           style={{
-            padding: "var(--space-1) var(--space-3)",
+            padding: "var(--space-1) var(--space-2)",
             backgroundColor: "var(--surface-1)",
             color: "var(--text-tertiary)",
             fontSize: "var(--text-2xs)",
@@ -475,7 +627,9 @@ function DiffRow({ line, body }: { line: DiffLine; body: ReactNode }) {
   // Single gutter: the line's position in the file it belongs to —
   // removed lines carry their old number, everything else the new one.
   const lineNo = isRemove ? line.oldLine : line.newLine;
-  // A colored left edge reinforces add/remove without a second column.
+  // A colored left edge reinforces add/remove without a second column. It
+  // rides the leftmost cell — the `+` gutter when present, otherwise the
+  // line-number column — so the strip always hugs the far left of the row.
   const edge = isAdd
     ? "2px solid var(--diff-add-fg)"
     : isRemove
@@ -484,15 +638,45 @@ function DiffRow({ line, body }: { line: DiffLine; body: ReactNode }) {
 
   return (
     <tr style={{ backgroundColor: bg }}>
+      {gutter && (
+        <td
+          style={{
+            padding: 0,
+            position: "relative",
+            verticalAlign: "top",
+            borderLeft: edge,
+          }}
+        >
+          {fix && blockRef && (
+            // Absolutely positioned so the 18px button never stretches the
+            // first line of the block taller than the lines below it.
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                display: "flex",
+                alignItems: "flex-start",
+                justifyContent: "center",
+                paddingTop: 1,
+                pointerEvents: "none",
+              }}
+            >
+              <span style={{ pointerEvents: "auto" }}>
+                <HunkAddButton hunkRef={blockRef} fix={fix} />
+              </span>
+            </div>
+          )}
+        </td>
+      )}
       <td
         style={{
-          padding: "0 var(--space-2)",
+          padding: "0 var(--space-1)",
           textAlign: "right",
           color: "var(--text-tertiary)",
           userSelect: "none",
           fontSize: "var(--text-2xs)",
           verticalAlign: "top",
-          borderLeft: edge,
+          borderLeft: gutter ? undefined : edge,
         }}
         className="tabular"
       >
@@ -500,7 +684,7 @@ function DiffRow({ line, body }: { line: DiffLine; body: ReactNode }) {
       </td>
       <td
         style={{
-          padding: "0 var(--space-1)",
+          padding: 0,
           color: sigilColor,
           userSelect: "none",
           textAlign: "center",
@@ -522,7 +706,7 @@ function DiffRow({ line, body }: { line: DiffLine; body: ReactNode }) {
       </td>
     </tr>
   );
-}
+});
 
 function Empty({ label }: { label: string }) {
   return (

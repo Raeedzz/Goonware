@@ -40,6 +40,10 @@ const COLORS = {
   stateWarning:   "var(--state-warning)",
   stateError:     "var(--state-error)",
   stateInfoMuted: "color-mix(in oklch, var(--surface-1), var(--state-info) 18%)",
+
+  syntaxVariable: "var(--syntax-variable)",
+  syntaxProperty: "var(--syntax-property)",
+  syntaxFunction: "var(--syntax-function)",
 };
 
 export const cm6Theme = EditorView.theme(
@@ -134,15 +138,18 @@ export const cm6Highlight = HighlightStyle.define([
   { tag: t.paren, color: COLORS.textSecondary },
   { tag: t.separator, color: COLORS.textTertiary },
 
-  // Identifiers — primary text, no special color
-  { tag: t.variableName, color: COLORS.textPrimary },
-  { tag: t.propertyName, color: COLORS.textPrimary },
+  // Identifiers — soft light-blue. Lezer tags bare variables and
+  // function calls alike as `variableName`, so this is what gives the
+  // bulk of the code color instead of a wall of near-white text.
+  { tag: t.variableName, color: COLORS.syntaxVariable },
+  { tag: t.definition(t.variableName), color: COLORS.syntaxVariable },
+  { tag: t.propertyName, color: COLORS.syntaxProperty },
   { tag: t.attributeName, color: COLORS.stateInfo },
 
-  // Functions — medium weight, primary color
-  { tag: t.function(t.variableName), color: COLORS.textPrimary, fontWeight: "500" },
-  { tag: t.function(t.propertyName), color: COLORS.textPrimary, fontWeight: "500" },
-  { tag: t.macroName, color: COLORS.textPrimary, fontWeight: "500" },
+  // Functions — warm gold, medium weight
+  { tag: t.function(t.variableName), color: COLORS.syntaxFunction, fontWeight: "500" },
+  { tag: t.function(t.propertyName), color: COLORS.syntaxFunction, fontWeight: "500" },
+  { tag: t.macroName, color: COLORS.syntaxFunction, fontWeight: "500" },
 
   // Keywords — info blue, distinct from accent
   { tag: t.keyword, color: COLORS.stateInfo, fontWeight: "500" },
