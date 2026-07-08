@@ -2281,37 +2281,6 @@ pub fn term_start(
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    // Tells `claude` / `codex` / hand-rolled shell scripts running
-    // inside this PTY where to find the in-house browser daemon.
-    // Without this, `claude` would reach for its `claude-in-chrome`
-    // MCP server (which drives the user's real Chrome — not what we
-    // want for app testing).
-    //
-    // We read the **actual** bound port from `BrowserState` instead
-    // of hardcoding 4000 — the daemon may have landed anywhere in
-    // 4000..=4199 (collision case) or even on an OS-assigned port if
-    // the whole preferred range was taken. Hardcoding 4000 meant
-    // agents inside PTYs were sometimes pointed at nothing.
-    //
-    // If the daemon hasn't finished binding yet (rare race on app
-    // boot), fall back to the default 4000 — at worst the agent will
-    // get a connection-refused on the first call and recover when
-    // the daemon comes up, which is the same failure mode the old
-    // hardcoded value had.
-    #[cfg(target_os = "macos")]
-    let browser_port = app
-        .try_state::<crate::browser::BrowserState>()
-        .and_then(|s| s.port())
-        .unwrap_or(4000);
-    #[cfg(not(target_os = "macos"))]
-    let browser_port = 4000u16;
-    let browser_url = format!("http://127.0.0.1:{browser_port}");
-    // Export GOONWARE_* (current), GLI_* (prior name), and RLI_*
-    // (legacy) so user-side tooling that hardcodes any spelling keeps
-    // working through the rename window.
-    cmd.env("GOONWARE_BROWSER_URL", &browser_url);
-    cmd.env("GLI_BROWSER_URL", &browser_url);
-    cmd.env("RLI_BROWSER_URL", &browser_url);
 
     // Per-pane scoping: in-pane agents (claude, codex, gemini) read
     // these env vars to scope their behavior to the project + session

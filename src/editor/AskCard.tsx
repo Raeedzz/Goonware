@@ -1,4 +1,5 @@
 import { motion } from "motion/react";
+import { createPortal } from "react-dom";
 import { useEffect, useRef, useState } from "react";
 import { marginCardVariants } from "@/design/motion";
 import { helperRun } from "@/lib/helper-agent";
@@ -143,7 +144,11 @@ export function AskCard({
     Math.min(anchor.left, window.innerWidth - CARD_WIDTH - 8),
   );
 
-  return (
+  // Portal to <body> so the fixed card escapes the diff view's stacking
+  // context. Without this it's trapped inside the center column and the
+  // right panel's tab strip (a later sibling) paints on top of it, even
+  // though the card carries the max z-index token (--z-tooltip).
+  return createPortal(
     <motion.div
       ref={ref}
       variants={marginCardVariants}
@@ -211,7 +216,8 @@ export function AskCard({
           {answer}
         </div>
       )}
-    </motion.div>
+    </motion.div>,
+    document.body,
   );
 }
 

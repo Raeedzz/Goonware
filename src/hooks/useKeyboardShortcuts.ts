@@ -35,12 +35,11 @@ function digitKey(e: KeyboardEvent): number | null {
  *   ⌘⇧F          — search overlay (alias)
  *   ⌘⌥F          — open Files in the right panel
  *   ⌘⌥G          — open Changes (git) in the right panel
- *   ⌘⌥B          — open Browser in the right panel
  *   ⌘⌥P          — auto-draft a PR for the active worktree
  *   Esc          — close overlays
  *
  * When ⌥ (Option) is held on macOS the produced `e.key` is a glyph
- * (⌘⌥F → "ƒ", ⌘⌥G → "©", ⌘⌥B → "∫", ⌘⌥P → "π"), so the ⌘⌥ branch
+ * (⌘⌥F → "ƒ", ⌘⌥G → "©", ⌘⌥P → "π"), so the ⌘⌥ branch
  * reads physical key codes (e.code) instead.
  */
 export function useKeyboardShortcuts() {
@@ -68,7 +67,7 @@ export function useKeyboardShortcuts() {
         return;
       }
 
-      // ⌘⌥F / ⌘⌥G / ⌘⌥B — flip the right panel to a specific tab and
+      // ⌘⌥F / ⌘⌥G — flip the right panel to a specific tab and
       // make sure it's visible. Using e.code dodges Option's glyph
       // substitution (⌘⌥F arrives as e.key === "ƒ" on US layouts).
       if (cmd && e.altKey && !shift && worktree) {
@@ -78,9 +77,7 @@ export function useKeyboardShortcuts() {
             ? "files"
             : code === "KeyG"
               ? "changes"
-              : code === "KeyB"
-                ? "browser"
-                : null;
+              : null;
         if (panel) {
           e.preventDefault();
           dispatch({

@@ -68,11 +68,10 @@ static MCPS_CACHE: OnceLock<Mutex<Option<Vec<McpEntry>>>> = OnceLock::new();
 /// `(directory name, SKILL.md contents)`; the body is embedded at build
 /// time via `include_str!` from `resources/skills/<name>/SKILL.md`, so
 /// there's no runtime dependency on the bundle layout. Add a tuple here
-/// to ship another skill.
-const BUNDLED_SKILLS: &[(&str, &str)] = &[(
-    "browser",
-    include_str!("../resources/skills/browser/SKILL.md"),
-)];
+/// to ship a skill — e.g.
+/// `("my-skill", include_str!("../resources/skills/my-skill/SKILL.md"))`.
+/// Currently empty: Goonware bundles no skills.
+const BUNDLED_SKILLS: &[(&str, &str)] = &[];
 
 /// Write every bundled skill into `~/.claude/skills/<name>/SKILL.md`.
 ///
