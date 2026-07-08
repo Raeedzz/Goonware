@@ -2,8 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { useAppDispatch } from "@/state/AppState";
 import type { TodoItem, Worktree } from "@/state/types";
 
-type View = "todos" | "history";
-
 /**
  * Right-panel "Todo" pane. A single inline checklist — no separate
  * composer box. Click anywhere empty to create a todo and start typing;
@@ -11,17 +9,18 @@ type View = "todos" | "history";
  * deletes it. The circular checkbox cycles todo → in_progress → done;
  * done items drop out of the list and into History.
  *
- * A small "Todos / History" toggle sits at the top. Both the active list
- * (`worktree.todos`) and the completed archive (`worktree.todoHistory`)
- * are written back with the generic `update-worktree` action, so they
- * persist with the worktree exactly like `prSession` — survive relaunch,
- * no extra plumbing.
+ * Completed items live behind a "History" bar pinned to the bottom of the
+ * pane. Clicking it expands a panel upward with every archived todo; click
+ * again to collapse. Both the active list (`worktree.todos`) and the
+ * completed archive (`worktree.todoHistory`) are written back with the
+ * generic `update-worktree` action, so they persist with the worktree
+ * exactly like `prSession` — survive relaunch, no extra plumbing.
  */
 export function TodoView({ worktree }: { worktree: Worktree }) {
   const dispatch = useAppDispatch();
   const todos = worktree.todos ?? [];
   const history = worktree.todoHistory ?? [];
-  const [view, setView] = useState<View>("todos");
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   // Which row to focus after the next render. Set by add/delete actions;
   // consumed by the effect once React has committed the new list to the
@@ -29,6 +28,25 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
   // freshly-added id doesn't exist until the re-render).
   const [focusId, setFocusId] = useState<string | null>(null);
   const inputRefs = useRef(new Map<string, HTMLInputElement>());
+
+  // Always-fresh mirror of the persisted lists, read inside the deferred
+  // "done" timeout below — the store may have changed (another todo added,
+  // text edited) between the click and the timer firing, and the patch is a
+  // shallow merge, so we must archive against the latest state, not a stale
+  // closure captured at click time.
+  const latest = useRef({ todos, history });
+  latest.current = { todos, history };
+
+  // Timers for todos flashing green before they drop into History, so we can
+  // cancel them on unmount and avoid firing against a dead component.
+  const doneTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  useEffect(
+    () => () => {
+      doneTimers.current.forEach((t) => clearTimeout(t));
+      doneTimers.current.clear();
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!focusId) return;
@@ -74,8 +92,9 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
   };
 
   // Circle click cycles the state: todo → in_progress → done. Reaching
-  // "done" pulls the item out of the active list and pushes it to the
-  // front of history (empty items are just discarded, not archived).
+  // "done" flips the marker to a green check in place and leaves the row
+  // sitting there for a beat before it drops out of the active list and
+  // into History (empty items are just discarded, not archived).
   const cycle = (id: string) => {
     const cur = todos.find((t) => t.id === id);
     if (!cur) return;
@@ -87,17 +106,41 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
       });
       return;
     }
-    const remaining = todos.filter((t) => t.id !== id);
+    // Already flashing green — a second click shouldn't queue a duplicate.
+    if (cur.status === "done") return;
+
     if (cur.text.trim() === "") {
-      patch({ todos: remaining });
+      patch({ todos: todos.filter((t) => t.id !== id) });
       return;
     }
-    const done: TodoItem = {
-      ...cur,
-      status: "done",
-      completedAt: Date.now(),
-    };
-    patch({ todos: remaining, todoHistory: [done, ...history] });
+
+    // Show the green check right away, then archive after the flash.
+    patch({
+      todos: todos.map((t) => (t.id === id ? { ...t, status: "done" } : t)),
+    });
+    const timer = setTimeout(() => {
+      doneTimers.current.delete(id);
+      const { todos: curTodos, history: curHistory } = latest.current;
+      const item = curTodos.find((t) => t.id === id);
+      if (!item) return;
+      const done: TodoItem = { ...item, status: "done", completedAt: Date.now() };
+      const nextTodos = curTodos.filter((t) => t.id !== id);
+      const nextHistory = [done, ...curHistory];
+      // Advance the mirror synchronously. If another todo's timer fires
+      // before React commits this archive back into the `worktree` prop, it
+      // must read this accumulated state — otherwise its shallow-merge patch
+      // would clobber `todoHistory` and drop the item we just archived.
+      latest.current = { todos: nextTodos, history: nextHistory };
+      dispatch({
+        type: "update-worktree",
+        id: worktree.id,
+        patch: {
+          todos: nextTodos,
+          todoHistory: nextHistory,
+        },
+      });
+    }, 900);
+    doneTimers.current.set(id, timer);
   };
 
   const remove = (id: string, focusPrev: boolean) => {
@@ -112,7 +155,9 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
     if (next) setFocusId(next.id);
   };
 
-  // Send a completed item back to the active list from History.
+  // Send a completed item back to the active list from History. The
+  // history panel stays open — restoring one item shouldn't yank the user
+  // away from the list they're browsing.
   const restore = (id: string) => {
     const cur = history.find((t) => t.id === id);
     if (!cur) return;
@@ -121,7 +166,6 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
       todos: [...todos, revived],
       todoHistory: history.filter((t) => t.id !== id),
     });
-    setView("todos");
   };
 
   return (
@@ -134,177 +178,246 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
         backgroundColor: "var(--surface-1)",
       }}
     >
-      {/* Todos / History toggle */}
+      {/* Active todo list. Click anywhere in the scroll region (including
+          the empty area below the rows) to append a new todo and focus it. */}
       <div
+        onClick={(e) => {
+          if (e.target === e.currentTarget) addAtEnd();
+        }}
         style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 2,
-          height: 32,
-          padding: "0 var(--space-2)",
-          borderBottom: "var(--border-1)",
-          flexShrink: 0,
+          flex: 1,
+          minHeight: 0,
+          overflow: "auto",
+          padding: "var(--space-2) 0",
+          cursor: "text",
         }}
       >
-        <SegTab
-          label="Todos"
-          active={view === "todos"}
-          onClick={() => setView("todos")}
-        />
-        <SegTab
-          label="History"
-          count={history.length}
-          active={view === "history"}
-          onClick={() => setView("history")}
-        />
-        {view === "history" && history.length > 0 && (
-          <button
-            type="button"
-            onClick={() => patch({ todoHistory: [] })}
-            title="Clear all completed items"
+        <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+          {todos.map((todo) => (
+            <TodoRow
+              key={todo.id}
+              todo={todo}
+              registerRef={(el) => {
+                if (el) inputRefs.current.set(todo.id, el);
+                else inputRefs.current.delete(todo.id);
+              }}
+              onChangeText={(text) => setText(todo.id, text)}
+              onCycle={() => cycle(todo.id)}
+              onEnter={() => insertAfter(todo.id)}
+              onDeleteEmpty={() => remove(todo.id, true)}
+              onArrow={(dir) => focusSibling(todo.id, dir)}
+            />
+          ))}
+        </ul>
+
+        {todos.length === 0 && (
+          <div
+            onClick={addAtEnd}
             style={{
-              marginLeft: "auto",
-              background: "transparent",
-              border: "none",
+              padding: "6px var(--space-3)",
               color: "var(--text-tertiary)",
-              fontSize: "var(--text-2xs)",
-              cursor: "pointer",
-              padding: "2px 4px",
-              transition: "color var(--motion-fast) var(--ease-out-quart)",
+              fontSize: "var(--text-sm)",
+              cursor: "text",
             }}
-            onMouseEnter={(e) =>
-              (e.currentTarget.style.color = "var(--text-primary)")
-            }
-            onMouseLeave={(e) =>
-              (e.currentTarget.style.color = "var(--text-tertiary)")
-            }
           >
-            Clear
-          </button>
+            Click to add a todo…
+          </div>
         )}
       </div>
 
-      {view === "todos" ? (
-        // Click anywhere in the scroll region (including the empty area
-        // below the rows) to append a new todo and focus it.
-        <div
-          onClick={(e) => {
-            if (e.target === e.currentTarget) addAtEnd();
-          }}
-          style={{
-            flex: 1,
-            minHeight: 0,
-            overflow: "auto",
-            padding: "var(--space-2) 0",
-            cursor: "text",
-          }}
-        >
-          <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-            {todos.map((todo) => (
-              <TodoRow
-                key={todo.id}
-                todo={todo}
-                registerRef={(el) => {
-                  if (el) inputRefs.current.set(todo.id, el);
-                  else inputRefs.current.delete(todo.id);
+      {/* History bar pinned to the bottom. Click to expand a panel that
+          grows upward over the list, filling about half the pane and
+          scrolling through the whole archive; click again to collapse. */}
+      <div style={{ flexShrink: 0 }}>
+        {historyOpen && (
+          <div
+            style={{
+              position: "absolute",
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: "50%",
+              display: "flex",
+              flexDirection: "column",
+              backgroundColor: "var(--surface-1)",
+              borderTop: "var(--border-1)",
+              boxShadow: "0 -8px 24px -12px rgba(0,0,0,0.45)",
+            }}
+          >
+            {/* "History" heading stays at the top of the expanded panel and
+                doubles as the toggle — click it to collapse. The completed
+                todos are listed under it. */}
+            <div
+              role="button"
+              tabIndex={0}
+              onClick={() => setHistoryOpen(false)}
+              title="Collapse history"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "0 var(--space-3)",
+                height: 32,
+                flexShrink: 0,
+                cursor: "pointer",
+                borderBottom: "var(--border-1)",
+              }}
+            >
+              <HistoryIcon />
+              <span
+                style={{
+                  fontSize: "var(--text-xs)",
+                  fontWeight: "var(--weight-medium)",
+                  color: "var(--text-secondary)",
                 }}
-                onChangeText={(text) => setText(todo.id, text)}
-                onCycle={() => cycle(todo.id)}
-                onEnter={() => insertAfter(todo.id)}
-                onDeleteEmpty={() => remove(todo.id, true)}
-                onArrow={(dir) => focusSibling(todo.id, dir)}
-              />
-            ))}
-          </ul>
+              >
+                History
+              </span>
+              {history.length > 0 && (
+                <span
+                  className="tabular"
+                  style={{
+                    fontSize: "var(--text-2xs)",
+                    color: "var(--text-tertiary)",
+                  }}
+                >
+                  {history.length}
+                </span>
+              )}
+              {history.length > 0 && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    patch({ todoHistory: [] });
+                  }}
+                  title="Clear all completed items"
+                  style={{
+                    marginLeft: "auto",
+                    background: "transparent",
+                    border: "none",
+                    color: "var(--text-tertiary)",
+                    fontSize: "var(--text-2xs)",
+                    cursor: "pointer",
+                    padding: "2px 4px",
+                    transition: "color var(--motion-fast) var(--ease-out-quart)",
+                  }}
+                  onMouseEnter={(e) =>
+                    (e.currentTarget.style.color = "var(--text-primary)")
+                  }
+                  onMouseLeave={(e) =>
+                    (e.currentTarget.style.color = "var(--text-tertiary)")
+                  }
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+              {history.length === 0 ? (
+                <div
+                  style={{
+                    padding: "var(--space-4)",
+                    color: "var(--text-tertiary)",
+                    fontSize: "var(--text-xs)",
+                  }}
+                >
+                  No completed todos yet.
+                </div>
+              ) : (
+                <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+                  {history.map((todo) => (
+                    <HistoryRow
+                      key={todo.id}
+                      todo={todo}
+                      onRestore={() => restore(todo.id)}
+                    />
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
 
-          {todos.length === 0 && (
-            <div
-              onClick={addAtEnd}
-              style={{
-                padding: "6px var(--space-3)",
-                color: "var(--text-tertiary)",
-                fontSize: "var(--text-sm)",
-                cursor: "text",
-              }}
-            >
-              Click to add a todo…
-            </div>
-          )}
-        </div>
-      ) : (
-        <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
-          {history.length === 0 ? (
-            <div
-              style={{
-                padding: "var(--space-4)",
-                color: "var(--text-tertiary)",
-                fontSize: "var(--text-xs)",
-              }}
-            >
-              No completed todos yet.
-            </div>
-          ) : (
-            <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-              {history.map((todo) => (
-                <HistoryRow
-                  key={todo.id}
-                  todo={todo}
-                  onRestore={() => restore(todo.id)}
-                />
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
+        {!historyOpen && (
+          <button
+            type="button"
+            onClick={() => setHistoryOpen(true)}
+            aria-expanded={historyOpen}
+            title="Show completed todos"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              width: "100%",
+              height: 32,
+              padding: "0 var(--space-3)",
+              border: "none",
+              borderTop: "var(--border-1)",
+              backgroundColor: "var(--surface-2)",
+              color: "var(--text-secondary)",
+              cursor: "pointer",
+              fontSize: "var(--text-xs)",
+              fontWeight: "var(--weight-medium)",
+              transition:
+                "background-color var(--motion-instant) var(--ease-out-quart)",
+            }}
+          >
+            <HistoryIcon />
+            <span>History</span>
+            {history.length > 0 && (
+              <span
+                className="tabular"
+                style={{
+                  fontSize: "var(--text-2xs)",
+                  color: "var(--text-tertiary)",
+                }}
+              >
+                {history.length}
+              </span>
+            )}
+          </button>
+        )}
+      </div>
     </div>
   );
 }
 
-function SegTab({
-  label,
-  count,
-  active,
-  onClick,
-}: {
-  label: string;
-  count?: number;
-  active: boolean;
-  onClick: () => void;
-}) {
+/** Clock-with-counterclockwise-arrow "history" glyph, drawn inline so it
+ *  inherits the surrounding text color. */
+function HistoryIcon() {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 5,
-        height: 22,
-        padding: "0 8px",
-        borderRadius: "var(--radius-xs)",
-        border: "none",
-        cursor: "pointer",
-        backgroundColor: active ? "var(--surface-3)" : "transparent",
-        color: active ? "var(--text-primary)" : "var(--text-secondary)",
-        fontSize: "var(--text-xs)",
-        fontWeight: active ? "var(--weight-medium)" : "var(--weight-regular)",
-        transition:
-          "background-color var(--motion-instant) var(--ease-out-quart), color var(--motion-instant) var(--ease-out-quart)",
-      }}
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 16 16"
+      aria-hidden
+      style={{ opacity: 0.7 }}
     >
-      <span>{label}</span>
-      {count !== undefined && count > 0 && (
-        <span
-          className="tabular"
-          style={{
-            fontSize: "var(--text-2xs)",
-            color: active ? "var(--text-secondary)" : "var(--text-disabled)",
-          }}
-        >
-          {count}
-        </span>
-      )}
-    </button>
+      <path
+        d="M3 8 a5 5 0 1 0 1.6 -3.7"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.25"
+        strokeLinecap="round"
+      />
+      <path
+        d="M3 2.5 L3 5 L5.5 5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.25"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M8 5 L8 8 L10.3 9.4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.25"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   );
 }
 
@@ -327,6 +440,7 @@ function TodoRow({
 }) {
   const [hover, setHover] = useState(false);
   const inProgress = todo.status === "in_progress";
+  const done = todo.status === "done";
 
   return (
     <li>
@@ -338,9 +452,10 @@ function TodoRow({
           alignItems: "center",
           gap: 8,
           padding: "3px var(--space-3)",
-          backgroundColor: hover ? "var(--surface-2)" : "transparent",
+          backgroundColor: hover && !done ? "var(--surface-2)" : "transparent",
+          opacity: done ? 0.6 : 1,
           transition:
-            "background-color var(--motion-instant) var(--ease-out-quart)",
+            "background-color var(--motion-instant) var(--ease-out-quart), opacity var(--motion-fast) var(--ease-out-quart)",
         }}
       >
         <button
@@ -358,6 +473,7 @@ function TodoRow({
           value={todo.text}
           onChange={(e) => onChangeText(e.target.value)}
           placeholder="Todo"
+          readOnly={done}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
@@ -382,7 +498,9 @@ function TodoRow({
             padding: 0,
             fontFamily: "var(--font-sans)",
             fontSize: "var(--text-sm)",
-            color: "var(--text-primary)",
+            color: done ? "var(--text-secondary)" : "var(--text-primary)",
+            textDecoration: done ? "line-through" : "none",
+            transition: "color var(--motion-fast) var(--ease-out-quart)",
           }}
         />
       </div>
@@ -406,7 +524,9 @@ function HistoryRow({
         style={{
           display: "flex",
           alignItems: "center",
+          flexWrap: "nowrap",
           gap: 8,
+          minWidth: 0,
           padding: "3px var(--space-3)",
           backgroundColor: hover ? "var(--surface-2)" : "transparent",
           transition:
@@ -427,7 +547,8 @@ function HistoryRow({
             flex: 1,
             minWidth: 0,
             fontSize: "var(--text-sm)",
-            color: "var(--text-primary)",
+            lineHeight: 1.2,
+            color: "var(--text-secondary)",
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
@@ -435,18 +556,6 @@ function HistoryRow({
         >
           {todo.text}
         </span>
-        {todo.completedAt !== undefined && (
-          <span
-            className="tabular"
-            style={{
-              flexShrink: 0,
-              fontSize: "var(--text-2xs)",
-              color: "var(--text-disabled)",
-            }}
-          >
-            {formatWhen(todo.completedAt)}
-          </span>
-        )}
       </div>
     </li>
   );
@@ -501,20 +610,4 @@ function StatusCircle({ status }: { status: TodoItem["status"] }) {
       )}
     </svg>
   );
-}
-
-/** Compact relative time: "now", "5m", "3h", "2d", else a short date. */
-function formatWhen(ts: number): string {
-  const diff = Date.now() - ts;
-  const min = Math.floor(diff / 60000);
-  if (min < 1) return "now";
-  if (min < 60) return `${min}m`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h`;
-  const day = Math.floor(hr / 24);
-  if (day < 7) return `${day}d`;
-  return new Date(ts).toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-  });
 }
