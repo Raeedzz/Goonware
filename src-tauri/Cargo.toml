@@ -29,16 +29,6 @@ portable-pty = "0.9"
 alacritty_terminal = "0.25"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 uuid = { version = "1", features = ["v4"] }
-
-# Browser daemon: in-house replacement for gstack's localhost:4000 service.
-# Spawns a headless Chrome and exposes /health, /status, /screenshot,
-# /console/recent, /navigate, /click, /type, /key over HTTP so RLI's own
-# BrowserPane *and* a `claude` running in any RLI terminal pane can
-# drive the same browser session via the same contract.
-chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
-axum = "0.7"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
 futures = "0.3"
 dirs = "5"
 libc = "0.2"

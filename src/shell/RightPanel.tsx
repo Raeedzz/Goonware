@@ -31,8 +31,8 @@ import { BlockTerminal } from "@/terminal/BlockTerminal";
 import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
 import { useToast } from "@/primitives/Toast";
 import { Loader } from "@/primitives/Loader";
-import { BrowserPane } from "@/browser/BrowserPane";
 import { SkillsView } from "@/skills/SkillsView";
+import { TodoView } from "@/todo/TodoView";
 import { forgetPtys } from "@/terminal/sessionMemory";
 
 /**
@@ -83,8 +83,6 @@ export function RightPanel() {
    ------------------------------------------------------------------ */
 
 function UpperPanel({ worktree }: { worktree: Worktree }) {
-  const dispatch = useAppDispatch();
-
   // Single source of truth for this worktree's git status. Polls
   // once at 4s, dispatches `set-change-count` so the tab badge and
   // sidebar `+N` indicator stay fresh, AND surfaces the full entries
@@ -147,27 +145,29 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
         />
         <PanelTab
           worktreeId={worktree.id}
-          label="Browser"
-          tab="browser"
-          active={worktree.rightPanel === "browser"}
+          label="Todo"
+          tab="todo"
+          active={worktree.rightPanel === "todo"}
+          badge={
+            worktree.todos && worktree.todos.length > 0
+              ? worktree.todos.length
+              : undefined
+          }
         />
       </div>
 
       {/*
-        All three panes stay mounted across right-panel tab switches.
+        All panes stay mounted across right-panel tab switches.
         Inactive panes are hidden with `display: none` — they keep
-        their scroll position, their internal state (composer text,
-        expanded folders, console scroll), and the BrowserPane keeps
-        its long-lived screenshot polling and Chrome session alive.
-        Flipping tabs is now instant: zero remount cost, zero refetch
-        flash. Previously Files and Changes remounted on every switch,
-        which threw away expanded-folder state and re-ran git.status
-        every time.
+        their scroll position and their internal state (composer text,
+        expanded folders, console scroll). Flipping tabs is now instant:
+        zero remount cost, zero refetch flash. Previously Files and
+        Changes remounted on every switch, which threw away
+        expanded-folder state and re-ran git.status every time.
 
         FilesView's FileTree is lazy (reads only on expand), so the
         always-mounted cost is negligible. ChangesView reads its data
-        from props (no poll of its own anymore). BrowserPane's polling
-        already pauses on `document.visibilityState`.
+        from props (no poll of its own anymore).
        */}
       <div style={{ minHeight: 0, overflow: "hidden", position: "relative" }}>
         <PaneSlot active={worktree.rightPanel === "files"}>
@@ -187,32 +187,15 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
         <PaneSlot active={worktree.rightPanel === "prs"}>
           <PrsView
             worktree={worktree}
-            // Gates the gh-CLI polling — hidden panes stay quiet, same
-            // deal as BrowserPane's isVisible below.
+            // Gates the gh-CLI polling — hidden panes stay quiet.
             isVisible={worktree.rightPanel === "prs"}
           />
         </PaneSlot>
         <PaneSlot active={worktree.rightPanel === "skills"}>
           <SkillsView worktree={worktree} />
         </PaneSlot>
-        <PaneSlot active={worktree.rightPanel === "browser"}>
-          <BrowserPane
-            embedded
-            // Passing the active-pane flag through tells BrowserPane
-            // to skip its 1Hz health/status/screenshot tick when the
-            // pane is sitting behind display:none. With 20 worktrees
-            // this is the difference between zero browser IPC traffic
-            // (every other tab is on Files or Changes) and 20 IPC
-            // round-trips per second for previews nobody is watching.
-            isVisible={worktree.rightPanel === "browser"}
-            onClose={() =>
-              dispatch({
-                type: "set-right-panel",
-                worktreeId: worktree.id,
-                panel: "files",
-              })
-            }
-          />
+        <PaneSlot active={worktree.rightPanel === "todo"}>
+          <TodoView worktree={worktree} />
         </PaneSlot>
       </div>
     </div>
@@ -221,10 +204,9 @@ function UpperPanel({ worktree }: { worktree: Worktree }) {
 
 /**
  * Absolute-positioned wrapper used to mount every right-panel pane
- * once and toggle visibility via `display`. Browser used to be the
- * only pane with this treatment — extending it to Files and Changes
- * eliminates the remount-on-switch tax that the user complained about
- * ("going from browser to git tree" felt slow). Each pane gets
+ * once and toggle visibility via `display`. This eliminates the
+ * remount-on-switch tax that the user complained about ("going from
+ * one tab to the git tree" felt slow). Each pane gets
  * `pointer-events: none` + `display: none` when inactive so neither
  * focus nor accidental clicks hit the hidden tree.
  */
@@ -262,7 +244,7 @@ function PanelTab({
   //     mounts on the new one — motion sees the layoutId match and
   //     interpolates the transform between the two bounding rects.
   //     That's the "slide" effect: a single rect glides from Files
-  //     → Changes → Browser instead of disappearing and reappearing.
+  //     → Changes instead of disappearing and reappearing.
   //   - The *hover* highlight is a plain span — fades in on enter,
   //     out on leave. Only renders when the tab is inactive; the
   //     active highlight already covers the surface treatment.
@@ -2261,10 +2243,9 @@ function ScriptPanel({
 }
 
 void fs;
-// ChecksView is currently unrouted — its panel slot now hosts the
-// Browser tab. The component itself is retained because checks are
-// likely to come back as a different surface (status bar pill or
-// notifications drawer), so deleting and re-implementing would be
-// wasted work. The `void` reference silences the unused-locals
-// diagnostic without contributing runtime cost.
+// ChecksView is currently unrouted. The component itself is retained
+// because checks are likely to come back as a different surface
+// (status bar pill or notifications drawer), so deleting and
+// re-implementing would be wasted work. The `void` reference silences
+// the unused-locals diagnostic without contributing runtime cost.
 void ChecksView;

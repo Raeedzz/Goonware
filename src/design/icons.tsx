@@ -72,9 +72,8 @@ export {
   TerminalWindowIcon as IconTerminal,
   BrainIcon as IconMemory,
 
-  // Connections / browser
+  // Connections
   GraphIcon as IconConnections,
-  BrowserIcon as IconBrowser,
 } from "@phosphor-icons/react";
 
 /**

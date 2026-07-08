@@ -191,8 +191,28 @@ export function projectSettings(project: Project | null | undefined): ProjectSet
    target, and a secondary terminal in the right panel.
    ------------------------------------------------------------------ */
 
-export type RightPanelTab = "files" | "changes" | "prs" | "skills" | "browser";
+export type RightPanelTab =
+  | "files"
+  | "changes"
+  | "prs"
+  | "skills"
+  | "todo";
 export type SecondaryTab = "setup" | "run" | "terminal";
+
+/**
+ * A single item in a worktree's Todo tab. The circular checkbox cycles
+ * through `status`: "todo" (empty circle) → "in_progress" (yellow circle
+ * with a marker) → "done". A done item leaves the active list and moves
+ * to `Worktree.todoHistory`, where `completedAt` timestamps it. `createdAt`
+ * keeps insertion order in the active list.
+ */
+export interface TodoItem {
+  id: string;
+  text: string;
+  status: "todo" | "in_progress" | "done";
+  createdAt: number;
+  completedAt?: number;
+}
 
 /**
  * A "reviewing a PR" session on a worktree. Set when the user checks
@@ -281,6 +301,19 @@ export interface Worktree {
   iconName?: string;
   /** Active PR-review session, if the worktree is checked out to a PR. */
   prSession?: PrSession | null;
+  /**
+   * Per-worktree checklist shown in the right-panel Todo tab. Persisted
+   * with the worktree (via the whole `worktrees` map), so items survive
+   * relaunches. Undefined for worktrees created before the tab existed —
+   * treat as an empty list.
+   */
+  todos?: TodoItem[];
+  /**
+   * Completed todos, most-recent-first. An item lands here when it's
+   * checked off the active list; surfaced by the Todo tab's "History"
+   * view. Persisted with the worktree alongside `todos`.
+   */
+  todoHistory?: TodoItem[];
   /**
    * True when the backing directory on disk has gone missing between
    * launches (e.g. the user deleted it manually). Transient — set by a

@@ -17,8 +17,6 @@
 ///
 /// Per-feature plumbing lives in `crate::*` modules — registered below.
 #[cfg(target_os = "macos")]
-mod browser;
-#[cfg(target_os = "macos")]
 mod warp_term;
 mod agent_hooks;
 mod block_id;
@@ -37,8 +35,6 @@ mod state;
 mod term;
 mod worktree;
 
-#[cfg(target_os = "macos")]
-use browser::BrowserState;
 use term::TerminalState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -71,20 +67,7 @@ pub fn run() {
 
     #[cfg(target_os = "macos")]
     let builder = builder
-        .manage(BrowserState::default())
         .setup(|app| {
-            // Browser daemon: in-house replacement for gstack's
-            // localhost:4000 service. Binds the port + spawns the axum
-            // server in the background; Chrome itself is forked lazily
-            // on the first /navigate or /screenshot HTTP call.
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                match browser::daemon::start(handle).await {
-                    Ok(port) => eprintln!("[browser daemon] bound on 127.0.0.1:{port}"),
-                    Err(e) => eprintln!("[browser daemon] failed to start: {e}"),
-                }
-            });
-
             // Window-focus → terminal-frame cadence gate. When the
             // user switches to another app, macOS WKWebView suspends
             // the JS context. Any term frame events we emit during
@@ -145,11 +128,10 @@ pub fn run() {
             agent_hooks::start_socket_server(app.handle().clone());
 
             // Seed the skills Goonware ships with into ~/.claude/skills so
-            // every install gets them in Claude Code automatically (e.g. the
-            // `browser` skill that points agents at the built-in browser
-            // daemon instead of the Claude-in-Chrome MCP). Same lifecycle as
-            // the hooks above: idempotent, runs once per launch, only touches
-            // directories we own.
+            // every install gets them in Claude Code automatically. Same
+            // lifecycle as the hooks above: idempotent, runs once per launch,
+            // only touches directories we own. (No skills are currently
+            // bundled — see BUNDLED_SKILLS in skills.rs.)
             skills::install_bundled_skills();
 
             // Native terminal migration (M0 spike): stand up an embedded
@@ -282,13 +264,6 @@ pub fn run() {
             state::state_save,
             state::state_load,
             state::state_clear,
-            // In-app browser (macOS only). Stubs on other platforms
-            // would just live elsewhere; keep them inside the cfg so
-            // non-macOS builds don't get unresolved-symbol errors.
-            #[cfg(target_os = "macos")]
-            browser::browser_bound_port,
-            #[cfg(target_os = "macos")]
-            browser::browser_restart,
             #[cfg(target_os = "macos")]
             warp_term::term_surface_set_rect,
             #[cfg(target_os = "macos")]

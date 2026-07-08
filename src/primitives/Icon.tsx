@@ -3,7 +3,6 @@ import {
   FolderIcon as PhFolder,
   MagnifyingGlassIcon as PhSearch,
   GraphIcon as PhGraph,
-  BrowserIcon as PhBrowser,
   GitBranchIcon as PhGitBranch,
   GearIcon as PhGear,
   TerminalWindowIcon as PhTerminal,
@@ -49,9 +48,6 @@ export function ConnectionsIcon(props: IconProps) {
   return <PhGraph {...commonProps(props)} />;
 }
 
-export function BrowserIcon(props: IconProps) {
-  return <PhBrowser {...commonProps(props)} />;
-}
 
 export function GitIcon(props: IconProps) {
   return <PhGitBranch {...commonProps(props)} />;
