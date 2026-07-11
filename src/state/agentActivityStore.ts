@@ -107,15 +107,17 @@ function applyRecord(record: SessionRecord) {
   }
   const prev = sessions.get(key);
   if (!prev) {
-    // First event for this session_id — a fresh agent process. Evict
-    // any prior sessions for the same (provider, cwd) so a Claude /
-    // Gemini that was hard-killed before its Stop / SessionEnd hook
-    // fired doesn't keep the worktree spinner spinning forever. The
-    // PID-watchdog would also eventually catch this, but acting on
-    // the new-session signal makes the spinner restart deterministic:
-    // by the time the AgentChrome reads the most-recent session, the
-    // stale "working" record is gone.
-    evictStaleForCwd(record.provider, record.cwd, record.session_id);
+    // First event for this session_id — a fresh agent process. Stale
+    // same-(provider, cwd) cleanup is NOT done here: the frontend has
+    // no pid knowledge, so a client-side sweep can't tell a dead
+    // hard-killed session from a live peer running in a sibling pane
+    // of the same worktree (two agents would mutually evict each
+    // other's records and the spinner ping-pongs). The Rust backend
+    // owns that decision — on a new session's first event it evicts
+    // same-provider overlapping-cwd sessions only when their pid is
+    // missing or dead, and broadcasts each eviction as a synthetic
+    // Ended record over agent://session/state, which the `ended`
+    // branch above handles generically.
     sessions.set(key, record);
     notifyAll();
     return;
@@ -133,32 +135,6 @@ function applyRecord(record: SessionRecord) {
   }
   sessions.set(key, record);
   notifyAll();
-}
-
-/**
- * Drop every session for `(provider, cwd)` whose session_id differs
- * from `keepSessionId`. Used by applyRecord on the new-session edge
- * and by `forceEvictForCwd` on the SIGKILL path. Returns true iff at
- * least one session was removed (caller may decide whether to bundle
- * the notify with its own — applyRecord does, forceEvictForCwd does
- * its own notify).
- */
-function evictStaleForCwd(
-  provider: Provider,
-  cwd: string,
-  keepSessionId: string,
-): boolean {
-  let removed = false;
-  for (const [k, rec] of sessions) {
-    if (rec.provider !== provider) continue;
-    if (rec.session_id === keepSessionId) continue;
-    if (!cwdMatchesWorktree(rec.cwd, cwd) && !cwdMatchesWorktree(cwd, rec.cwd)) {
-      continue;
-    }
-    sessions.delete(k);
-    removed = true;
-  }
-  return removed;
 }
 
 async function bootstrap() {

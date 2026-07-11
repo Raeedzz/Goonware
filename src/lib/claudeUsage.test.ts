@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  detectAgentBanner,
   detectClaude,
   formatDuration,
   formatTokenCount,
@@ -29,6 +30,32 @@ describe("detectClaude", () => {
   test("returns false for the substring 'claude' alone (must be Claude Code)", () => {
     expect(detectClaude("claude")).toBe(false);
     expect(detectClaude("a user named claude")).toBe(false);
+  });
+});
+
+describe("detectAgentBanner", () => {
+  test("classifies the Claude banner", () => {
+    expect(detectAgentBanner("│ ✻ Welcome to Claude")).toBe("claude");
+    expect(detectAgentBanner("Claude Code v1.2.3")).toBe("claude");
+  });
+
+  test("classifies the Codex banner case-insensitively", () => {
+    expect(detectAgentBanner("OpenAI Codex (v0.42.0)")).toBe("codex");
+    expect(detectAgentBanner(">_ openai codex")).toBe("codex");
+  });
+
+  test("classifies the Gemini banner", () => {
+    expect(detectAgentBanner("Tips for getting started:")).toBe("gemini");
+  });
+
+  test("returns null for plain shell output", () => {
+    expect(detectAgentBanner("$ ls -la\ntotal 42")).toBe(null);
+    expect(detectAgentBanner("")).toBe(null);
+  });
+
+  test("the bare CLI name is not a banner", () => {
+    expect(detectAgentBanner("codex")).toBe(null);
+    expect(detectAgentBanner("gemini")).toBe(null);
   });
 });
 

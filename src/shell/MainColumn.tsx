@@ -188,7 +188,6 @@ export function MainColumn() {
     </div>
   );
 }
-
 /* ------------------------------------------------------------------
    Breadcrumb
    ------------------------------------------------------------------ */
@@ -774,16 +773,6 @@ function TabContent({
   draggingTabId: string | null;
 }) {
   const split = !!splitTab;
-  // TEMP DEBUG — remove before commit (live-state mirror for the render
-  // investigation; a module-level interval at the bottom of this file
-  // posts it to a local diagnostics listener).
-  (window as unknown as Record<string, unknown>).__paneState = {
-    wt: worktree.id,
-    splitTabIdRaw: worktree.splitTabId ?? null,
-    activeTabId: worktree.activeTabId ?? null,
-    active: tab ? { id: tab.id, kind: tab.kind } : null,
-    split: splitTab ? { id: splitTab.id, kind: splitTab.kind } : null,
-  };
   // Terminal-kind tabs go through the always-mounted keepalive
   // layer; non-terminal kinds (diff, markdown, all-changes,
   // project-settings) mount on demand. The keepalive layer is
@@ -1819,43 +1808,4 @@ function MissingWorktreeView({
       </div>
     </div>
   );
-}
-
-
-
-// TEMP DEBUG — remove before commit. Posts a 2s heartbeat of the pane
-// layout (state mirror + drop-zone children boxes + visibility) to a
-// local diagnostics listener so pane-rendering failures can be caught
-// in the exact moment they happen.
-{
-  const g = window as unknown as { __paneDump?: number; __paneState?: unknown };
-  if (g.__paneDump) window.clearInterval(g.__paneDump);
-  g.__paneDump = window.setInterval(() => {
-    const z = document.querySelector("[data-tab-drop-zone]");
-    const kids = z
-      ? Array.from(z.children).map((c) => {
-          const e = c as HTMLElement;
-          const r = e.getBoundingClientRect();
-          const cs = getComputedStyle(e);
-          return {
-            rect: { x: r.x, y: r.y, w: r.width, h: r.height },
-            vis: cs.visibility,
-            z: cs.zIndex,
-            kidCount: e.children.length,
-            text: (e.textContent ?? "").slice(0, 40),
-          };
-        })
-      : null;
-    const zr = z?.getBoundingClientRect();
-    fetch("http://localhost:8787/dump", {
-      method: "POST",
-      body: JSON.stringify({
-        t: new Date().toISOString(),
-        win: { w: window.innerWidth, h: window.innerHeight },
-        zone: zr ? { x: zr.x, y: zr.y, w: zr.width, h: zr.height } : null,
-        state: g.__paneState ?? null,
-        kids,
-      }),
-    }).catch(() => {});
-  }, 2000);
 }

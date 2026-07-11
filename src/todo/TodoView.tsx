@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useAppDispatch } from "@/state/AppState";
 import type { TodoItem, Worktree } from "@/state/types";
 
@@ -38,14 +38,15 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
   latest.current = { todos, history };
 
   // Timers for todos flashing green before they drop into History, so we can
-  // cancel them on unmount and avoid firing against a dead component.
+  // cancel them on unmount or worktree switch and avoid firing against a
+  // dead component or archiving one worktree's id into another worktree.
   const doneTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  useEffect(
+  useLayoutEffect(
     () => () => {
       doneTimers.current.forEach((t) => clearTimeout(t));
       doneTimers.current.clear();
     },
-    [],
+    [worktree.id],
   );
 
   useEffect(() => {
@@ -91,6 +92,48 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
     patch({ todos: todos.map((t) => (t.id === id ? { ...t, text } : t)) });
   };
 
+  // Move a "done" todo out of the active list and into History. Shared by
+  // the 900ms flash timer below and the recovery sweep effect. Always reads
+  // from — and synchronously advances — the `latest` mirror: if another
+  // archive dispatches before React commits this one back into the
+  // `worktree` prop, it must see this accumulated state, otherwise its
+  // shallow-merge patch would clobber `todoHistory` and drop the item we
+  // just archived.
+  const archiveDone = (id: string) => {
+    const { todos: curTodos, history: curHistory } = latest.current;
+    const item = curTodos.find((t) => t.id === id);
+    if (!item) return;
+    const done: TodoItem = { ...item, status: "done", completedAt: Date.now() };
+    const nextTodos = curTodos.filter((t) => t.id !== id);
+    const nextHistory = [done, ...curHistory];
+    latest.current = { todos: nextTodos, history: nextHistory };
+    dispatch({
+      type: "update-worktree",
+      id: worktree.id,
+      patch: {
+        todos: nextTodos,
+        todoHistory: nextHistory,
+      },
+    });
+  };
+
+  // Recovery sweep. A todo can be stranded in "done" forever: the status
+  // persists as soon as the checkbox is clicked, but the archive only
+  // happens on the 900ms timer — which the unmount cleanup above cancels.
+  // Switch worktree/tab or quit inside that window and the item comes back
+  // as a read-only, uncycleable "done" row that nothing will ever archive.
+  // On mount and whenever the worktree changes, archive such items
+  // immediately; they already missed their flash animation, so there is
+  // nothing to wait for. Items with a live timer are mid-flash and are
+  // left to their timer.
+  useEffect(() => {
+    for (const t of latest.current.todos) {
+      if (t.status === "done" && !doneTimers.current.has(t.id)) {
+        archiveDone(t.id);
+      }
+    }
+  }, [worktree.id]);
+
   // Circle click cycles the state: todo → in_progress → done. Reaching
   // "done" flips the marker to a green check in place and leaves the row
   // sitting there for a beat before it drops out of the active list and
@@ -120,25 +163,7 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
     });
     const timer = setTimeout(() => {
       doneTimers.current.delete(id);
-      const { todos: curTodos, history: curHistory } = latest.current;
-      const item = curTodos.find((t) => t.id === id);
-      if (!item) return;
-      const done: TodoItem = { ...item, status: "done", completedAt: Date.now() };
-      const nextTodos = curTodos.filter((t) => t.id !== id);
-      const nextHistory = [done, ...curHistory];
-      // Advance the mirror synchronously. If another todo's timer fires
-      // before React commits this archive back into the `worktree` prop, it
-      // must read this accumulated state — otherwise its shallow-merge patch
-      // would clobber `todoHistory` and drop the item we just archived.
-      latest.current = { todos: nextTodos, history: nextHistory };
-      dispatch({
-        type: "update-worktree",
-        id: worktree.id,
-        patch: {
-          todos: nextTodos,
-          todoHistory: nextHistory,
-        },
-      });
+      archiveDone(id);
     }, 900);
     doneTimers.current.set(id, timer);
   };
