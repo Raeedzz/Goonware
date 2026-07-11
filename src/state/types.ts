@@ -297,7 +297,7 @@ export interface Worktree {
 
   /** User-assigned color tag (sidebar accent). */
   color?: TagId;
-  /** User-picked HugeIcons component name (overrides project's choice). */
+  /** User-picked picker-registry icon key (overrides project's choice). */
   iconName?: string;
   /** Active PR-review session, if the worktree is checked out to a PR. */
   prSession?: PrSession | null;

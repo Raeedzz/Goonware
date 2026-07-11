@@ -698,16 +698,9 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
             if is_new_session {
                 let mut to_remove: Vec<SessionKey> = Vec::new();
                 for (other_key, rec) in sessions.iter() {
-                    if rec.provider != provider {
-                        continue;
+                    if should_evict_stale(rec, provider, &envelope.session_id, &envelope.cwd) {
+                        to_remove.push(other_key.clone());
                     }
-                    if rec.session_id == envelope.session_id {
-                        continue;
-                    }
-                    if !cwds_overlap(&rec.cwd, &envelope.cwd) {
-                        continue;
-                    }
-                    to_remove.push(other_key.clone());
                 }
                 for other_key in to_remove {
                     if let Some(mut stale) = sessions.remove(&other_key) {
@@ -799,9 +792,59 @@ fn cwds_overlap(a: &str, b: &str) -> bool {
     if a_trim == b_trim {
         return true;
     }
+    // Root / degenerate case: "/" trims to "". Without this guard the
+    // prefix below becomes "/" and matches EVERY absolute path — one
+    // session with cwd "/" would evict all same-provider sessions
+    // everywhere. Root overlaps only root (handled by the equality
+    // check above), so bail here.
+    if a_trim.is_empty() || b_trim.is_empty() {
+        return false;
+    }
     let a_prefix = format!("{}/", a_trim);
     let b_prefix = format!("{}/", b_trim);
     b_trim.starts_with(&a_prefix) || a_trim.starts_with(&b_prefix)
+}
+
+/// Should this existing session record be evicted (with a synthetic
+/// Ended emit) when a NEW session key appears for `new_provider` at
+/// `new_cwd`?
+///
+/// The stale-eviction sweep exists to clear leftover records from a
+/// relaunched CLI whose old process never sent SessionEnd. But two
+/// LIVE same-provider sessions in one worktree are a legitimate state
+/// (two panes running claude side by side), and evicting a live peer
+/// caused an eviction ping-pong: each session's next event found its
+/// own key missing (its peer had just evicted it), re-registered as
+/// "new," and evicted the peer right back — spinner flicker and wiped
+/// permission state on every event, forever.
+///
+/// So a record whose agent PID is known AND alive is never evicted
+/// here; only records with no PID or a dead PID keep the legacy
+/// eviction behavior. A never-evicted peer never re-registers as
+/// "new," which structurally ends the ping-pong.
+fn should_evict_stale(
+    rec: &SessionRecord,
+    new_provider: Provider,
+    new_session_id: &str,
+    new_cwd: &str,
+) -> bool {
+    if rec.provider != new_provider {
+        return false;
+    }
+    if rec.session_id == new_session_id {
+        return false;
+    }
+    if !cwds_overlap(&rec.cwd, new_cwd) {
+        return false;
+    }
+    // Live peer — coexist instead of evicting. Dead or PID-less
+    // records fall through and are evicted as before.
+    if let Some(pid) = rec.agent_process_id {
+        if pid_alive(pid) {
+            return false;
+        }
+    }
+    true
 }
 
 /// True iff a process with this PID is currently in the kernel's
@@ -2324,5 +2367,67 @@ mod tests {
         assert!(!cwds_overlap("", "/Users/me/proj"));
         assert!(!cwds_overlap("/Users/me/proj", ""));
         assert!(!cwds_overlap("", ""));
+    }
+
+    #[test]
+    fn cwds_overlap_root_only_matches_root() {
+        assert!(cwds_overlap("/", "/"));
+        assert!(!cwds_overlap("/", "/Users/me/proj"));
+        assert!(!cwds_overlap("/Users/me/proj", "/"));
+    }
+
+    #[test]
+    fn stale_eviction_preserves_live_peers_and_rejects_unrelated_records() {
+        let mut record = SessionRecord {
+            provider: Provider::Claude,
+            session_id: "old".into(),
+            cwd: "/Users/me/proj".into(),
+            status: SessionStatus::Working,
+            last_event: "UserPromptSubmit".into(),
+            last_tool: String::new(),
+            agent_process_id: Some(std::process::id() as i32),
+            updated_at_ms: 1,
+        };
+
+        assert!(!should_evict_stale(
+            &record,
+            Provider::Claude,
+            "new",
+            "/Users/me/proj"
+        ));
+        assert!(!should_evict_stale(
+            &record,
+            Provider::Codex,
+            "new",
+            "/Users/me/proj"
+        ));
+        assert!(!should_evict_stale(
+            &record,
+            Provider::Claude,
+            "old",
+            "/Users/me/proj"
+        ));
+        assert!(!should_evict_stale(
+            &record,
+            Provider::Claude,
+            "new",
+            "/Users/me/other"
+        ));
+
+        record.agent_process_id = None;
+        assert!(should_evict_stale(
+            &record,
+            Provider::Claude,
+            "new",
+            "/Users/me/proj/src"
+        ));
+
+        record.agent_process_id = Some(-1);
+        assert!(should_evict_stale(
+            &record,
+            Provider::Claude,
+            "new",
+            "/Users/me/proj"
+        ));
     }
 }

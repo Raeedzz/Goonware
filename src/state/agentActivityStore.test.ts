@@ -164,18 +164,15 @@ describe("forceIdleForCwd — Ctrl+C local spinner flip", () => {
   });
 });
 
-describe("applyRecord — stale-session eviction on new-session edge", () => {
+describe("applyRecord — backend-owned stale-session eviction", () => {
   /**
-   * The reported "loading box doesn't fire on restart" bug. A
-   * hard-killed Claude leaves its SessionRecord stuck at `working` in
-   * the map (SessionEnd never fires). When the user launches a fresh
-   * Claude in the same pane, the new SessionStart record joins the
-   * old one — the sidebar spinner reads "ANY working session = on"
-   * and stays lit even when the new agent is idle. Eviction on the
-   * new-session edge drops the stale record so the spinner reflects
-   * just the live agent.
+   * The frontend cannot tell a stale hard-killed session from a live
+   * peer in another pane because SessionRecord's wire shape does not
+   * expose enough trustworthy process-liveness information. It must
+   * retain both records until the Rust backend emits a synthetic Ended
+   * event for a session it has proved dead.
    */
-  test("new session_id at same (provider, cwd) evicts the stale one", () => {
+  test("new session_id at same (provider, cwd) preserves the existing peer", () => {
     seedSession({
       session_id: "old",
       cwd: "/Users/me/proj",
@@ -191,11 +188,11 @@ describe("applyRecord — stale-session eviction on new-session edge", () => {
       last_tool: "",
       updated_at_ms: 2000,
     });
-    expect(__internals.sessions.has("claude:old")).toBe(false);
+    expect(__internals.sessions.has("claude:old")).toBe(true);
     expect(__internals.sessions.has("claude:new")).toBe(true);
   });
 
-  test("eviction matches when new session's cwd is a subdirectory of the stale one", () => {
+  test("preserves an existing peer when the new cwd is a descendant", () => {
     seedSession({
       session_id: "old",
       cwd: "/Users/me/proj",
@@ -211,11 +208,11 @@ describe("applyRecord — stale-session eviction on new-session edge", () => {
       last_tool: "",
       updated_at_ms: 2000,
     });
-    expect(__internals.sessions.has("claude:old")).toBe(false);
+    expect(__internals.sessions.has("claude:old")).toBe(true);
     expect(__internals.sessions.has("claude:new")).toBe(true);
   });
 
-  test("eviction matches when stale session's cwd is a subdirectory of the new one", () => {
+  test("preserves an existing peer when its cwd is a descendant", () => {
     seedSession({
       session_id: "old",
       cwd: "/Users/me/proj/src",
@@ -231,7 +228,7 @@ describe("applyRecord — stale-session eviction on new-session edge", () => {
       last_tool: "",
       updated_at_ms: 2000,
     });
-    expect(__internals.sessions.has("claude:old")).toBe(false);
+    expect(__internals.sessions.has("claude:old")).toBe(true);
     expect(__internals.sessions.has("claude:new")).toBe(true);
   });
 
@@ -278,9 +275,7 @@ describe("applyRecord — stale-session eviction on new-session edge", () => {
   });
 
   test("re-applying an event for an existing session does NOT trigger self-eviction", () => {
-    // The eviction is gated on `prev === null` — i.e. the session_id
-    // is new to the map. Without that gate, the very record we're
-    // applying would self-evict, blanking the state mid-update.
+    // Existing records are still updated in place rather than duplicated.
     seedSession({
       session_id: "abc",
       cwd: "/Users/me/proj",
@@ -299,18 +294,6 @@ describe("applyRecord — stale-session eviction on new-session edge", () => {
     expect(__internals.sessions.get("claude:abc")!.status).toBe("compacting");
   });
 
-  // NOTE: multi-pane same-(provider, cwd) is intentionally NOT
-  // preserved. Two simultaneous claude sessions in the same worktree
-  // is rare; the much more common failure mode is a stale "working"
-  // record sitting in the map after a hard-killed agent, which
-  // accidentally lights the worktree spinner for the new fresh-launch
-  // session. Treating same-(provider, cwd) as one logical session
-  // and clobbering the older record on new-session arrival is the
-  // explicit trade-off here. The Rust-side PID watchdog catches the
-  // dead-but-not-evicted case for the single-pane scenario, and
-  // multi-pane users can land in a worktree subdirectory to
-  // disambiguate (cwd prefix-matching ensures eviction still respects
-  // the descendant relationship).
 });
 
 describe("forceEvictForCwd — SIGKILL drops sessions definitively", () => {

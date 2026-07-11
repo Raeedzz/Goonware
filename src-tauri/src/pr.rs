@@ -736,7 +736,9 @@ async fn enter_review_state(cwd: &str, base: &str) -> Option<String> {
 /// an ancestor of `head_sha` (the soft reset is still in effect); if
 /// the user or an agent committed on top, resetting would drop those
 /// commits from the branch, so we leave everything alone and report
-/// false.
+/// false. Errs when the ancestry check itself fails (e.g. `head_sha`
+/// no longer resolves after a force-push + prune) — callers must treat
+/// that as "do not touch the worktree", not as a benign skip.
 async fn restore_review_state(cwd: &str, head_sha: &str) -> Result<bool, String> {
     let head = run_git_checked(cwd, &["rev-parse", "HEAD"])
         .await?
@@ -745,16 +747,28 @@ async fn restore_review_state(cwd: &str, head_sha: &str) -> Result<bool, String>
     if head == head_sha {
         return Ok(false);
     }
-    let ancestor = Command::new("git")
+    let out = Command::new("git")
         .args(["merge-base", "--is-ancestor", "HEAD", head_sha])
         .current_dir(cwd)
         .output()
         .await
-        .map_err(|e| format!("spawn git: {e}"))?
-        .status
-        .success();
-    if !ancestor {
-        return Ok(false);
+        .map_err(|e| format!("spawn git: {e}"))?;
+    match out.status.code() {
+        // HEAD is an ancestor — the soft reset is still in effect.
+        Some(0) => {}
+        // Definitive "not an ancestor": someone committed on top —
+        // resetting would drop those commits, so leave everything be.
+        Some(1) => return Ok(false),
+        // Anything else (e.g. 128: head_sha unresolvable after a
+        // force-push + prune) means git couldn't answer the question.
+        // Neither resetting nor pretending "user committed on top" is
+        // safe, so surface it and let the caller abort.
+        _ => {
+            return Err(format!(
+                "git merge-base --is-ancestor HEAD {head_sha} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
     }
     run_git_checked(cwd, &["reset", "--soft", head_sha]).await?;
     Ok(true)
@@ -1822,6 +1836,40 @@ mod tests {
         assert!(!did, "must not reset past user commits");
         let head_after = run_sync(clone.path(), &["rev-parse", "HEAD"]);
         assert_eq!(head_after.trim(), new_head, "takeover commit must survive");
+    }
+
+    #[tokio::test]
+    async fn checkout_return_aborts_when_head_sha_is_unresolvable() {
+        // A force-push + prune can leave the recorded head sha pointing
+        // at nothing. That is NOT the "user committed on top" case:
+        // proceeding would check out the original branch with the whole
+        // PR diff still staged. The return must abort and leave the
+        // review checkout exactly as it was.
+        let (clone, _bare, _pr_head) = build_pr_branch_repo();
+        let cwd = clone.path().to_str().unwrap();
+        enter_review_state(cwd, "main").await.expect("enter");
+
+        let bogus = "0123456789abcdef0123456789abcdef01234567";
+        let err = pr_checkout_return(
+            cwd.to_string(),
+            "main".to_string(),
+            false,
+            Some(bogus.to_string()),
+        )
+        .await
+        .expect_err("unresolvable head sha must abort the return");
+        assert!(err.contains(bogus), "error should name the sha: {err}");
+
+        // Still in the review checkout on the PR branch...
+        let branch = run_sync(clone.path(), &["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(branch.trim(), "pr-branch", "must not switch branches");
+        // ...with the PR diff still staged where it belongs — not
+        // carried onto main.
+        let staged = run_sync(clone.path(), &["diff", "--cached", "--name-only"]);
+        assert!(
+            staged.contains("a.txt") && staged.contains("b.txt"),
+            "review state must remain intact: {staged}"
+        );
     }
 
     #[tokio::test]

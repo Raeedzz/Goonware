@@ -1740,20 +1740,22 @@ export function BlockTerminal({
   // foreground process group via tcgetpgrp(master_fd) and SIGKILLs
   // it, bypassing whatever signal trap the running process installed.
   //
-  // Always force-EVICT here (not just force-idle). A double-tap
-  // escalation means the user really wants the agent dead — even if
-  // it traps SIGINT, the foreground process group is about to receive
-  // SIGKILL. The SessionEnd hook will never fire (the agent process
-  // is killed before it can run its at-exit handler), so the only way
-  // to keep the session map from accumulating a stuck "working"
-  // record is to drop it locally right here. Without this, the next
-  // time the user runs `claude` in this pane the stale record is
-  // still there: the sidebar spinner stays on (any working session
-  // counts) and the per-pane chrome can briefly show the killed
-  // agent's last status before the new SessionStart record arrives.
+  // Force-EVICT here (not just force-idle) — but ONLY when the
+  // foregrounded process is an agent, mirroring the single-Ctrl+C
+  // gate in onSendBytesVoid. A double-tap escalation means the user
+  // really wants the foreground process dead — even if it traps
+  // SIGINT, the foreground process group is about to receive SIGKILL.
+  // When that process IS an agent, its SessionEnd hook will never
+  // fire (killed before its at-exit handler runs), so drop its
+  // session record locally right here; otherwise the next `claude`
+  // launch in this pane inherits a stuck "working" record and the
+  // sidebar spinner stays on. When the killed process is NOT an
+  // agent (e.g. a stuck `npm run dev`), evicting by cwd would wipe
+  // the live session records of OTHER panes sharing this worktree —
+  // so the eviction is gated, while the kill itself is not.
   const onForceKill = useCallback(() => {
     const path = cwdRef.current;
-    if (path) forceEvictForCwd(path);
+    if (path && foregroundIsAgentRef.current) forceEvictForCwd(path);
     void termKillForeground(ptyId).catch(() => {
       // Backend may have torn the session down between the read and
       // the kill (rare race on tab close). Nothing useful to do; the
