@@ -71,6 +71,7 @@ out = {
     'event': payload.get('hook_event_name', ''),
     'tool': payload.get('tool_name', ''),
     'aux': payload.get('notification_type', ''),
+    'prompt': payload.get('prompt', '') or '',
     'goonware_session_id': '$GOONWARE_SID',
     'goonware_instance_id': os.environ.get('GOONWARE_INSTANCE_ID', ''),
 }

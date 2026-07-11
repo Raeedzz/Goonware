@@ -14,10 +14,13 @@ ls /tmp/goonware-agent-*.sock >/dev/null 2>&1 || exit 0
 GOONWARE_SID="${GOONWARE_SESSION_ID:-${GLI_SESSION_ID:-$RLI_SESSION_ID}}"
 [ -z "$GOONWARE_SID" ] && exit 0
 
-# Codex's hook protocol is similar to Claude's but emits fewer events
-# (only SessionStart / UserPromptSubmit / Stop are reliably wired).
-# That means we have no SessionEnd signal — the Rust side compensates
-# with PID-based liveness monitoring, for which it needs the codex
+# Codex's hook protocol mirrors Claude's, but only SessionStart /
+# UserPromptSubmit / Stop are guaranteed on every Codex build — the
+# richer events (PreToolUse / PostToolUse / Notification / PreCompact
+# / SessionEnd) fire on newer CLIs and are forwarded verbatim when
+# they do; the Rust classifier handles them all. Codex still has no
+# reliable SessionEnd signal, so the Rust side compensates with
+# PID-based liveness monitoring, for which it needs the codex
 # process id. We walk up the parent process tree looking for "codex"
 # so the Rust side has a PID to watch.
 /usr/bin/python3 -c "
@@ -69,6 +72,14 @@ def codex_pid():
         pid = info['ppid']
     return None
 
+# Same envelope shape as goonware-claude-hook.sh:
+#  - 'aux' carries Notification's sub-classifier (notification_type)
+#    so the Rust side can tell idle_prompt (→ Idle) from a real
+#    question (→ Waiting).
+#  - 'prompt' carries the user's typed text for UserPromptSubmit so
+#    the tab-subtitle summarizer works for codex tabs too. Captured
+#    here (inside codex's process tree) so Goonware never has to read
+#    ~/.codex/sessions/*.jsonl — same TCC rationale as Claude.
 out = {
     'provider': 'codex',
     'session_id': payload.get('session_id', ''),
@@ -76,7 +87,8 @@ out = {
     'cwd': payload.get('cwd', ''),
     'event': payload.get('hook_event_name', ''),
     'tool': payload.get('tool_name', ''),
-    'aux': '',
+    'aux': payload.get('notification_type', ''),
+    'prompt': payload.get('prompt', '') or '',
     'goonware_session_id': '$GOONWARE_SID',
     'goonware_instance_id': os.environ.get('GOONWARE_INSTANCE_ID', ''),
 }

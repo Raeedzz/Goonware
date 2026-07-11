@@ -26,14 +26,19 @@
 //!
 //! Each provider installs differently:
 //!   * Claude   → `~/.claude/settings.json` (hooks block per event name).
-//!   * Codex    → `~/.codex/hooks.json` + `codex_hooks = true` flag in `~/.codex/config.toml`.
+//!   * Codex    → `~/.codex/hooks.json` + `hooks = true` under `[features]` in `~/.codex/config.toml`.
 //!   * Gemini   → `~/.gemini/settings.json` (hooks block per event name).
 //!
-//! Codex's hook coverage is the thinnest — only SessionStart /
-//! UserPromptSubmit / Stop fire reliably. There's no SessionEnd, so the
-//! Rust side does PID-based liveness monitoring: every 2s, walk all
-//! known Codex sessions and `kill(pid, 0)`. After two consecutive
-//! misses, synthesize a SessionEnd to evict the session from the map.
+//! Codex's GUARANTEED hook coverage is the thinnest — only
+//! SessionStart / UserPromptSubmit / Stop fire on every build. The
+//! installer registers the full Claude-equivalent roster anyway
+//! (tool events, Notification, compaction, SessionEnd); newer Codex
+//! CLIs fire them and get full parity, older ones silently ignore
+//! the extra registrations. Because SessionEnd can't be relied on,
+//! the Rust side also does PID-based liveness monitoring: every 2s,
+//! walk all known Codex sessions and `kill(pid, 0)`. After two
+//! consecutive misses, synthesize a SessionEnd to evict the session
+//! from the map.
 
 use std::collections::HashMap;
 use std::fs;
@@ -192,11 +197,21 @@ struct HookEnvelope {
     aux: String,
     /// The CLI process id we should watch for liveness. All three
     /// providers populate this now (Claude/Gemini for parity with
-    /// Codex's PID watchdog). `alias = "codex_process_id"` keeps a
-    /// stale hook script (left on disk from a prior Goonware build)
-    /// parseable during the upgrade window.
-    #[serde(default, alias = "codex_process_id")]
+    /// Codex's PID watchdog).
+    ///
+    /// TWO separate fields, NOT a serde alias. The codex hook script
+    /// deliberately sends BOTH names (`agent_process_id` for current
+    /// builds, `codex_process_id` for older ones), and serde treats
+    /// an alias receiving both spellings as a `duplicate field`
+    /// DECODE ERROR — which silently rejected every real codex
+    /// envelope and killed the spinner for codex entirely (the
+    /// "decode failed: duplicate field `agent_process_id`" lines in
+    /// the app log). Read through {@agent_pid} which merges the two.
+    #[serde(default)]
     agent_process_id: Option<i32>,
+    /// Legacy wire name for the same PID — see `agent_process_id`.
+    #[serde(default)]
+    codex_process_id: Option<i32>,
     /// True iff this envelope is from a Goonware helper-agent invocation
     /// (commit-message draft, PR description, etc.). Belt-and-braces:
     /// the hook script already exits early when `GOONWARE_HELPER_AGENT` is
@@ -240,6 +255,17 @@ struct HookEnvelope {
     /// (each transcript file gets a fresh MACL UUID).
     #[serde(default)]
     prompt: String,
+}
+
+impl HookEnvelope {
+    /// The liveness-watchdog PID, whichever wire name it arrived
+    /// under. Scripts may send `agent_process_id`, the legacy
+    /// `codex_process_id`, or both — both spellings are first-class
+    /// fields (NOT serde aliases) precisely so a script sending both
+    /// can't trip serde's duplicate-field decode error.
+    fn agent_pid(&self) -> Option<i32> {
+        self.agent_process_id.or(self.codex_process_id)
+    }
 }
 
 /// Drop envelopes that shouldn't move the spinner at all. Three rules:
@@ -371,17 +397,46 @@ fn classify_event(
         },
 
         Provider::Codex => match event {
-            // Codex emits these three reliably. The fourth state
-            // (Ended) is synthesized by the PID monitor, not by the
-            // CLI itself.
+            // Codex emits SessionStart / UserPromptSubmit / Stop on
+            // every build; the richer events below fire on newer CLIs
+            // (the installer registers them all — older Codex builds
+            // simply never send them). Ended is still synthesized by
+            // the PID monitor when SessionEnd doesn't arrive.
             "UserPromptSubmit" => Some((SessionStatus::Working, true)),
-            "SessionStart" => Some((SessionStatus::Idle, false)),
-            "Stop" => Some((SessionStatus::Idle, false)),
+
+            // Same in-turn gate as Claude: tool events refresh the
+            // Working state (and last_tool → "Codex is using X") only
+            // inside a user turn; startup housekeeping is ignored.
+            // SubagentStop is in-turn, not turn-end — same reasoning
+            // as the Claude arm above.
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "SubagentStart"
+            | "SubagentStop" => {
+                if in_user_turn {
+                    Some((SessionStatus::Working, true))
+                } else {
+                    None
+                }
+            }
+
+            "PreCompact" => Some((SessionStatus::Compacting, in_user_turn)),
+            "PostCompact" => Some((SessionStatus::Idle, in_user_turn)),
+
+            "PermissionRequest" => Some((SessionStatus::Waiting, in_user_turn)),
+
             // Codex's notification taxonomy isn't fully documented;
             // mirror Claude's "Notification = the user is being
             // asked something" heuristic so codex's permission /
-            // tool-confirm prompts also stop the spinner.
-            "Notification" => Some((SessionStatus::Waiting, in_user_turn)),
+            // tool-confirm prompts also stop the spinner. Honor the
+            // idle_prompt carve-out when the CLI sends it (the hook
+            // script forwards notification_type as aux).
+            "Notification" => match aux {
+                "idle_prompt" => Some((SessionStatus::Idle, false)),
+                _ => Some((SessionStatus::Waiting, in_user_turn)),
+            },
+
+            "SessionStart" => Some((SessionStatus::Idle, false)),
+            "Stop" => Some((SessionStatus::Idle, false)),
+            "SessionEnd" => Some((SessionStatus::Ended, false)),
             _ => None,
         },
 
@@ -630,7 +685,7 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
                 status,
                 last_event: envelope.event.clone(),
                 last_tool: envelope.tool.clone(),
-                agent_process_id: envelope.agent_process_id,
+                agent_process_id: envelope.agent_pid(),
                 updated_at_ms: now_ms(),
             }
         } else {
@@ -672,7 +727,7 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
                     status,
                     last_event: envelope.event.clone(),
                     last_tool: envelope.tool.clone(),
-                    agent_process_id: envelope.agent_process_id,
+                    agent_process_id: envelope.agent_pid(),
                     updated_at_ms: now_ms(),
                 });
             entry.cwd = envelope.cwd.clone();
@@ -684,8 +739,8 @@ fn handle_connection(mut stream: UnixStream, app: &AppHandle<Wry>) {
             // Keep the most recent non-None pid. Each hook fire
             // includes the PID; this is just defensive in case some
             // event omits it.
-            if envelope.agent_process_id.is_some() {
-                entry.agent_process_id = envelope.agent_process_id;
+            if envelope.agent_pid().is_some() {
+                entry.agent_process_id = envelope.agent_pid();
             }
             entry.updated_at_ms = now_ms();
             // Any successful event proves the agent is alive — drop
@@ -977,7 +1032,7 @@ fn install_codex_hooks() {
         eprintln!("[goonware-hooks] write codex config.toml failed: {e}");
     } else {
         eprintln!(
-            "[goonware-hooks] enabled codex_hooks in {}",
+            "[goonware-hooks] enabled [features].hooks in {}",
             config_path.display()
         );
     }
@@ -987,16 +1042,37 @@ fn upsert_codex_hooks_json(mut root: Value, script_path: &Path) -> Value {
     let command = script_path.to_string_lossy().into_owned();
     let hook_entry = json!([{"type": "command", "command": command}]);
     let with_matcher = json!([{"matcher": "startup|resume", "hooks": hook_entry}]);
+    // Tool events take a tool-name matcher; "*" = every tool, same as
+    // the Claude installer's PreToolUse/PostToolUse registration.
+    let with_star_matcher = json!([{"matcher": "*", "hooks": hook_entry}]);
     let without_matcher = json!([{"hooks": hook_entry}]);
     let with_timeout =
         json!([{"hooks": [{"type": "command", "command": command, "timeout": 30}]}]);
 
-    // Codex's reliable hook surface is small — these three events
-    // cover spinner-on / spinner-off / fresh-start.
+    // Codex's GUARANTEED hook surface is small — SessionStart /
+    // UserPromptSubmit / Stop cover spinner-on / spinner-off /
+    // fresh-start on every Codex build. The rest of the roster is
+    // registered for parity with Claude: newer Codex CLIs fire
+    // Notification (permission / question prompts must park the
+    // spinner), PreToolUse / PostToolUse ("Codex is using X" + the
+    // mid-turn Working refresh), PreCompact / PostCompact (the
+    // Compacting state), and SessionEnd (instant eviction instead of
+    // waiting on the PID watchdog). Codex silently ignores event
+    // names it doesn't know, so registering them on an older CLI is
+    // harmless — the classifier just never sees them.
     let events: &[(&str, &Value)] = &[
         ("SessionStart", &with_matcher),
         ("UserPromptSubmit", &without_matcher),
+        ("PreToolUse", &with_star_matcher),
+        ("PostToolUse", &with_star_matcher),
+        ("PermissionRequest", &with_star_matcher),
+        ("Notification", &without_matcher),
+        ("PreCompact", &without_matcher),
+        ("PostCompact", &without_matcher),
+        ("SubagentStart", &with_star_matcher),
+        ("SubagentStop", &with_star_matcher),
         ("Stop", &with_timeout),
+        ("SessionEnd", &without_matcher),
     ];
 
     if !root.is_object() {
@@ -1046,52 +1122,87 @@ fn upsert_codex_hooks_json(mut root: Value, script_path: &Path) -> Value {
     root
 }
 
-/// Ensure `codex_hooks = true` exists under `[features]`. Preserves
-/// the rest of config.toml byte-for-byte. Lightweight string editing
-/// is enough — no need to pull in a full TOML parser.
+/// Ensure `hooks = true` exists under `[features]`, and migrate away
+/// the pre-0.144 `codex_hooks` flag. Codex 0.144 renamed the feature
+/// flag: `codex_hooks` is deprecated — hooks.json entries DON'T run
+/// under it anymore, and its mere presence makes codex print a red
+/// deprecation banner on every launch. (This was the "spinner never
+/// runs for codex" bug: our hooks were registered but the feature
+/// gate no longer honored the old flag, so no event ever fired.)
+/// Preserves the rest of config.toml byte-for-byte. Lightweight
+/// string editing is enough — no need to pull in a full TOML parser.
+/// Section-aware: only lines inside `[features]` are touched, so a
+/// hypothetical `hooks` key in another table survives.
 fn upsert_codex_feature_flag(existing: &str) -> String {
-    let target_line = "codex_hooks = true";
+    let target_line = "hooks = true";
 
-    // 1. If a `codex_hooks = ...` line already exists, rewrite it.
-    if existing
-        .lines()
-        .any(|l| l.trim_start().starts_with("codex_hooks"))
-    {
-        let mut out = String::with_capacity(existing.len());
-        for line in existing.split_inclusive('\n') {
-            let stripped = line.trim_start();
-            if stripped.starts_with("codex_hooks") {
-                out.push_str(target_line);
-                out.push('\n');
-            } else {
-                out.push_str(line);
+    // Pass 1: walk sections; inside [features], drop the deprecated
+    // codex_hooks line and rewrite any existing hooks line in place.
+    let mut out = String::with_capacity(existing.len() + target_line.len() + 1);
+    let mut in_features = false;
+    let mut has_features_header = false;
+    let mut wrote_flag = false;
+    for line in existing.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_features = trimmed == "[features]";
+            if in_features {
+                has_features_header = true;
             }
-        }
-        return out;
-    }
-
-    // 2. If `[features]` exists, insert immediately after the header.
-    if existing.contains("[features]") {
-        let mut out = String::with_capacity(existing.len() + target_line.len() + 1);
-        for line in existing.split_inclusive('\n') {
             out.push_str(line);
-            if line.trim() == "[features]" {
+            continue;
+        }
+        if in_features {
+            let key = trimmed
+                .split(['=', ' ', '\t'])
+                .next()
+                .unwrap_or("");
+            if key == "codex_hooks" {
+                // Deprecated name — dropping it silences the red
+                // banner; the modern flag below keeps hooks enabled.
+                continue;
+            }
+            if key == "hooks" {
                 out.push_str(target_line);
                 out.push('\n');
+                wrote_flag = true;
+                continue;
             }
         }
+        out.push_str(line);
+    }
+    if wrote_flag {
         return out;
     }
 
-    // 3. Neither exists — append a fresh `[features]` block.
-    let mut out = existing.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
+    // Pass 2: no hooks line existed. Insert right after the
+    // [features] header when there is one.
+    if has_features_header {
+        let src = out;
+        let mut rebuilt = String::with_capacity(src.len() + target_line.len() + 1);
+        for line in src.split_inclusive('\n') {
+            rebuilt.push_str(line);
+            if !wrote_flag && line.trim() == "[features]" {
+                if !line.ends_with('\n') {
+                    rebuilt.push('\n');
+                }
+                rebuilt.push_str(target_line);
+                rebuilt.push('\n');
+                wrote_flag = true;
+            }
+        }
+        return rebuilt;
     }
-    out.push_str("\n[features]\n");
-    out.push_str(target_line);
-    out.push('\n');
-    out
+
+    // Pass 3: no [features] section at all — append a fresh block.
+    let mut appended = out;
+    if !appended.is_empty() && !appended.ends_with('\n') {
+        appended.push('\n');
+    }
+    appended.push_str("\n[features]\n");
+    appended.push_str(target_line);
+    appended.push('\n');
+    appended
 }
 
 /* ---------- Gemini ---------- */
@@ -1359,8 +1470,62 @@ mod tests {
             classify_in_turn(Provider::Codex, "Stop", ""),
             Some(SessionStatus::Idle)
         );
-        // Codex never emits SessionEnd — PID monitor synthesizes it.
-        assert_eq!(classify_in_turn(Provider::Codex, "SessionEnd", ""), None);
+        // Newer Codex CLIs DO emit SessionEnd — instant eviction,
+        // no waiting on the PID monitor. (Older builds still rely on
+        // the watchdog to synthesize it.)
+        assert_eq!(
+            classify_in_turn(Provider::Codex, "SessionEnd", ""),
+            Some(SessionStatus::Ended)
+        );
+    }
+
+    /// Codex tool events mirror Claude's: Working inside a user turn
+    /// (keeps the spinner lit and last_tool fresh → "Codex is using
+    /// X"), dropped outside one so startup housekeeping can't flash
+    /// the spinner.
+    #[test]
+    fn classify_codex_tool_events_gated_on_turn() {
+        for ev in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            assert_eq!(
+                classify_in_turn(Provider::Codex, ev, ""),
+                Some(SessionStatus::Working),
+                "codex {ev} mid-turn must keep Working"
+            );
+            assert_eq!(
+                classify_event(Provider::Codex, ev, "", false),
+                None,
+                "codex {ev} outside a turn must be dropped"
+            );
+        }
+    }
+
+    /// Codex compaction gets the same distinct state as Claude/Gemini,
+    /// preserving the surrounding turn flag in both directions.
+    #[test]
+    fn classify_codex_compaction_preserves_turn() {
+        assert_eq!(
+            classify_event(Provider::Codex, "PreCompact", "", true),
+            Some((SessionStatus::Compacting, true))
+        );
+        assert_eq!(
+            classify_event(Provider::Codex, "PreCompact", "", false),
+            Some((SessionStatus::Compacting, false))
+        );
+        assert_eq!(
+            classify_event(Provider::Codex, "PostCompact", "", true),
+            Some((SessionStatus::Idle, true))
+        );
+    }
+
+    /// idle_prompt is Codex noting the user has gone quiet — not a
+    /// question. Same carve-out as Claude: park to Idle AND clear the
+    /// turn so a stray later tool event can't re-light the spinner.
+    #[test]
+    fn classify_codex_idle_prompt_clears_turn() {
+        assert_eq!(
+            classify_event(Provider::Codex, "Notification", "idle_prompt", true),
+            Some((SessionStatus::Idle, false))
+        );
     }
 
     #[test]
@@ -1659,23 +1824,59 @@ mod tests {
     fn upsert_codex_feature_flag_into_empty() {
         let out = upsert_codex_feature_flag("");
         assert!(out.contains("[features]"));
-        assert!(out.contains("codex_hooks = true"));
+        assert!(out.contains("hooks = true"));
+    }
+
+    /// Codex 0.144 deprecated `codex_hooks` — hooks.json entries no
+    /// longer run under it and its presence prints a red banner on
+    /// every codex launch. The upsert must migrate the old flag to
+    /// the modern `hooks = true`, not keep both.
+    #[test]
+    fn upsert_codex_feature_flag_migrates_deprecated_name() {
+        let prior = "[features]\ncodex_hooks = true\njs_repl = false\n";
+        let out = upsert_codex_feature_flag(prior);
+        assert!(out.contains("hooks = true"));
+        assert!(!out.contains("codex_hooks"));
+        assert!(out.contains("js_repl = false"));
+    }
+
+    /// Both keys present (the state a 0.144 user lands in after
+    /// following the deprecation banner's advice while our installer
+    /// keeps re-adding the old one): keep exactly one `hooks = true`.
+    #[test]
+    fn upsert_codex_feature_flag_dedupes_both_keys() {
+        let prior = "[features]\nhooks = true\ncodex_hooks = true\n";
+        let out = upsert_codex_feature_flag(prior);
+        assert_eq!(out.matches("hooks = true").count(), 1);
+        assert!(!out.contains("codex_hooks"));
+    }
+
+    /// A `hooks` key in a DIFFERENT table must survive untouched —
+    /// the migration is scoped to [features].
+    #[test]
+    fn upsert_codex_feature_flag_ignores_other_sections() {
+        let prior = "[tui]\nhooks = false\n\n[features]\njs_repl = false\n";
+        let out = upsert_codex_feature_flag(prior);
+        assert!(out.contains("[tui]\nhooks = false"));
+        let features_pos = out.find("[features]").unwrap();
+        let flag_pos = out.rfind("hooks = true").unwrap();
+        assert!(flag_pos > features_pos);
     }
 
     #[test]
     fn upsert_codex_feature_flag_idempotent() {
         let once = upsert_codex_feature_flag("");
         let twice = upsert_codex_feature_flag(&once);
-        assert_eq!(once.matches("codex_hooks = true").count(), 1);
-        assert_eq!(twice.matches("codex_hooks = true").count(), 1);
+        assert_eq!(once.matches("hooks = true").count(), 1);
+        assert_eq!(twice.matches("hooks = true").count(), 1);
     }
 
     #[test]
     fn upsert_codex_feature_flag_rewrites_existing() {
-        let prior = "[features]\ncodex_hooks = false\nother = 1\n";
+        let prior = "[features]\nhooks = false\nother = 1\n";
         let out = upsert_codex_feature_flag(prior);
-        assert!(out.contains("codex_hooks = true"));
-        assert!(!out.contains("codex_hooks = false"));
+        assert!(out.contains("hooks = true"));
+        assert!(!out.contains("hooks = false"));
         assert!(out.contains("other = 1"));
     }
 
@@ -1683,11 +1884,53 @@ mod tests {
     fn upsert_codex_feature_flag_inserts_under_existing_features() {
         let prior = "[features]\nother = 1\n";
         let out = upsert_codex_feature_flag(prior);
-        assert!(out.contains("codex_hooks = true"));
+        assert!(out.contains("hooks = true"));
         assert!(out.contains("other = 1"));
         let header_pos = out.find("[features]").unwrap();
-        let flag_pos = out.find("codex_hooks = true").unwrap();
+        let flag_pos = out.find("hooks = true").unwrap();
         assert!(flag_pos > header_pos);
+    }
+
+    /// The installer must register every event the Codex arm of
+    /// classify_event understands — a classified-but-never-installed
+    /// event is a dead path (the original "codex Notification never
+    /// parks the spinner" bug).
+    #[test]
+    fn codex_hooks_json_registers_full_event_roster() {
+        let out = upsert_codex_hooks_json(
+            json!({}),
+            Path::new("/tmp/goonware-codex-hook.sh"),
+        );
+        let hooks = out
+            .get("hooks")
+            .and_then(|h| h.as_object())
+            .expect("hooks object");
+        for ev in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PermissionRequest",
+            "Notification",
+            "PreCompact",
+            "PostCompact",
+            "SubagentStart",
+            "SubagentStop",
+            "Stop",
+            "SessionEnd",
+        ] {
+            assert!(hooks.contains_key(ev), "codex hooks.json missing {ev}");
+        }
+    }
+
+    /// Re-running the installer (every Goonware launch) must not
+    /// duplicate entries — the retain() strip keys off the script name.
+    #[test]
+    fn codex_hooks_json_upsert_is_idempotent() {
+        let script = Path::new("/tmp/goonware-codex-hook.sh");
+        let once = upsert_codex_hooks_json(json!({}), script);
+        let twice = upsert_codex_hooks_json(once.clone(), script);
+        assert_eq!(once, twice);
     }
 
     #[test]
@@ -1893,6 +2136,65 @@ mod tests {
         let mut empty = base;
         empty["goonware_instance_id"] = serde_json::json!("");
         assert!(!should_drop_envelope_for(&envelope_from_json(empty), "1234"));
+    }
+
+    /// The tab-subtitle summarizer (`latest_prompt_for_cwd`) and the
+    /// Notification idle_prompt/question split both depend on every
+    /// provider's script forwarding these envelope fields. Claude had
+    /// them from day one; codex/gemini regressing to a prompt-less
+    /// envelope silently blanks their tab subtitles.
+    #[test]
+    fn hook_scripts_forward_prompt_and_aux() {
+        for (name, body) in [
+            ("claude", CLAUDE_HOOK_SCRIPT),
+            ("codex", CODEX_HOOK_SCRIPT),
+            ("gemini", GEMINI_HOOK_SCRIPT),
+        ] {
+            assert!(
+                body.contains("'prompt'"),
+                "{name} hook script must forward the user's prompt text"
+            );
+            assert!(
+                body.contains("notification_type"),
+                "{name} hook script must forward notification_type as aux"
+            );
+        }
+    }
+
+    /// THE bug that killed the codex spinner: the codex hook script
+    /// sends BOTH `agent_process_id` and the legacy `codex_process_id`
+    /// (so old and new Rust builds each find the name they know).
+    /// When the struct declared the legacy name as a serde ALIAS of
+    /// the new one, an envelope carrying both spellings failed to
+    /// decode with `duplicate field agent_process_id` — and every
+    /// real codex envelope was rejected before classification, so no
+    /// codex session ever reached the spinner. The two spellings must
+    /// stay separate struct fields merged via `agent_pid()`.
+    #[test]
+    fn envelope_decodes_with_both_pid_spellings() {
+        let env = envelope_from_json(serde_json::json!({
+            "provider": "codex",
+            "session_id": "s1",
+            "cwd": "/tmp/x",
+            "event": "UserPromptSubmit",
+            "agent_process_id": 4242,
+            "codex_process_id": 4242,
+            "goonware_session_id": "w_x",
+        }));
+        assert_eq!(env.agent_pid(), Some(4242));
+    }
+
+    /// Old scripts (pre-rename) send only the legacy name — the merge
+    /// accessor must still surface it for the liveness watchdog.
+    #[test]
+    fn envelope_pid_falls_back_to_legacy_name() {
+        let env = envelope_from_json(serde_json::json!({
+            "provider": "codex",
+            "session_id": "s1",
+            "event": "Stop",
+            "codex_process_id": 777,
+        }));
+        assert_eq!(env.agent_pid(), Some(777));
     }
 
     /// Sanity check on the script-level guard: the bundled hook

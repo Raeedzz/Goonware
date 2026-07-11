@@ -8,6 +8,16 @@ interface Props {
    * agent that cd'd into a subdirectory still lights this chrome.
    */
   cwd?: string;
+  /**
+   * CLI detected from the pane's command line, shown while no hook
+   * session exists yet (the window between launching the agent and
+   * its first SessionStart event). Keeping the strip mounted during
+   * that window keeps its 32px height invariant for the whole
+   * agent-mode lifetime — the PTY-dimension reserve in BlockTerminal
+   * never has to reflow when the first event lands. `null` renders a
+   * generic "agent" badge (aider and friends have no hook system).
+   */
+  pendingCli?: SessionRecord["provider"] | null;
 }
 
 /**
@@ -49,11 +59,45 @@ export const AGENT_CHROME_HEIGHT_PX = 32;
  * Visual reference: Warp's `use_agent_footer` panel
  * (/tmp/warp-check/app/src/terminal/view/use_agent_footer/mod.rs).
  */
-export function AgentChrome({ cwd }: Props) {
+export function AgentChrome({ cwd, pendingCli }: Props) {
   const session = useAgentSessionForCwd(cwd ?? "");
-  if (!session) return null;
-  if (session.status === "ended") return null;
+  if (!session || session.status === "ended") {
+    // No hook session (yet). When the caller told us which agent is
+    // launching, hold the strip's slot with a quiet "starting" state
+    // instead of unmounting — see the pendingCli prop doc.
+    return <PendingStrip cli={pendingCli ?? null} />;
+  }
 
+  return (
+    <StripShell>
+      <ProviderBadge provider={session.provider} />
+      <StatusGlyph status={session.status} />
+      <StatusLabel session={session} />
+      {session.status === "waiting" && (
+        <span
+          style={{
+            marginLeft: "auto",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 4,
+            color: "var(--state-warning)",
+            fontWeight: "var(--weight-semibold)",
+          }}
+        >
+          <WarnIcon />
+          permission requested
+        </span>
+      )}
+    </StripShell>
+  );
+}
+
+/**
+ * Shared 32px strip shell. BOTH the live and pending states render
+ * through this so the pinned-height contract lives in exactly one
+ * place and can't drift between them.
+ */
+function StripShell({ children }: { children: React.ReactNode }) {
   return (
     <div
       role="status"
@@ -86,25 +130,41 @@ export function AgentChrome({ cwd }: Props) {
         overflow: "hidden",
       }}
     >
-      <ProviderBadge provider={session.provider} />
-      <StatusGlyph status={session.status} />
-      <StatusLabel session={session} />
-      {session.status === "waiting" && (
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Pre-session state: the agent was just launched and hasn't fired its
+ * first hook yet (or has no hook system at all — aider). Occupies the
+ * same 32px slot so the PTY grid below never reflows when the real
+ * session record arrives.
+ */
+function PendingStrip({ cli }: { cli: SessionRecord["provider"] | null }) {
+  return (
+    <StripShell>
+      {cli ? (
+        <ProviderBadge provider={cli} />
+      ) : (
         <span
           style={{
-            marginLeft: "auto",
             display: "inline-flex",
             alignItems: "center",
-            gap: 4,
-            color: "var(--state-warning)",
+            padding: "1px 6px",
+            borderRadius: 4,
+            backgroundColor: "var(--surface-2)",
+            color: "var(--text-tertiary)",
+            fontFamily: "var(--font-mono)",
+            fontSize: "var(--text-2xs)",
             fontWeight: "var(--weight-semibold)",
           }}
         >
-          <WarnIcon />
-          permission requested
+          agent
         </span>
       )}
-    </div>
+      <span style={{ color: "var(--text-tertiary)" }}>starting…</span>
+    </StripShell>
   );
 }
 
