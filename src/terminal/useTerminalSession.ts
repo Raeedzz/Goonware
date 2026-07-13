@@ -85,8 +85,12 @@ interface SessionApi {
   cwd: string | null;
   /** Bell event counter — increments on every BEL. Frontend animates on diff. */
   bellTick: number;
-  /** Submit a line + trailing \n. Used by the block-mode prompt input. */
-  sendLine: (text: string) => Promise<void>;
+  /**
+   * Submit a line + trailing \n. `wireText` may differ when Goonware needs an
+   * integration-only CLI flag while keeping the user's original command in
+   * block history.
+   */
+  sendLine: (text: string, wireText?: string) => Promise<void>;
   /** Send raw bytes (passthrough for ⌃C, alt-screen keystrokes, etc.). */
   sendBytes: (bytes: Uint8Array) => Promise<void>;
   /** Tell Rust the cell-grid size changed. */
@@ -591,12 +595,12 @@ export function useTerminalSession(opts: Args): SessionApi {
     });
   };
 
-  const sendLine = async (text: string) => {
+  const sendLine = async (text: string, wireText = text) => {
     // Push to the pending queue BEFORE sending bytes — there's a real
     // (if tiny) chance the block-close event lands before this function
     // resolves on a fast machine, so the queue must be primed first.
     pendingInputsRef.current.push(text);
-    const bytes = encoder.encode(text + "\n");
+    const bytes = encoder.encode(wireText + "\n");
     await sendBytes(bytes);
   };
 

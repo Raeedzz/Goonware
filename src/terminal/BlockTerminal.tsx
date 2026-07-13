@@ -38,6 +38,8 @@ import {
   shouldRenderBlockList,
 } from "./agentScrollLayout";
 import { deriveInputMode, nextRawLatch } from "./inputModeDecision";
+import { makeCodexScrollable } from "./agentCommand";
+import { shouldPreserveTerminalSelection } from "./terminalClickFocus";
 
 /** Command names that always run as an interactive TUI agent. */
 function isAgentCommand(command: string): boolean {
@@ -358,6 +360,17 @@ export function BlockTerminal({
   // `passthroughActive` is computed.
   const passthroughActiveRef = useRef(false);
 
+  // One focus path for tab switches and pointer clicks. The refs let this
+  // always target whichever input layer is mounted right now, including raw
+  // inline prompts that use PtyPassthrough without setting agent mode.
+  const focusTerminalInput = useCallback(() => {
+    if (foregroundIsAgentRef.current || passthroughActiveRef.current) {
+      passthroughRef.current?.focus();
+    } else {
+      promptRef.current?.focus();
+    }
+  }, []);
+
   // Register a focus function for this terminal's tab id, so the
   // global `useFocusActiveTerminal` hook can send focus here whenever
   // the user switches to this terminal's worktree. Mirrors the
@@ -365,15 +378,9 @@ export function BlockTerminal({
   // we focus the PtyPassthrough invisible input (forwards every key
   // straight to the PTY); in shell mode we focus PromptInput's textarea.
   useEffect(() => {
-    registerTerminalFocus(id, () => {
-      if (foregroundIsAgentRef.current || passthroughActiveRef.current) {
-        passthroughRef.current?.focus();
-      } else {
-        promptRef.current?.focus();
-      }
-    });
+    registerTerminalFocus(id, focusTerminalInput);
     return () => unregisterTerminalFocus(id);
-  }, [id]);
+  }, [id, focusTerminalInput]);
 
   // While a Claude-Code session is foregrounded, the launch command
   // ("claude") tells you nothing about what's actually happening. Ask
@@ -528,8 +535,8 @@ export function BlockTerminal({
 
   // Sustained anchor while stick-to-bottom is true: ANY growth of the
   // scroll container's content (BlockList row added, LiveBlock body
-  // tall canvas mid-bootstrap, AgentChrome rendering for the first
-  // time, etc.) re-snaps scrollTop to the new scrollHeight. Without
+  // tall canvas mid-bootstrap, etc.) re-snaps scrollTop to the new
+  // scrollHeight. Without
   // this, the user-reported "open a new claude and it glitches
   // halfway up the pane" bug fires whenever the LiveBlock fill mode
   // settles AFTER the layout-effect snap above has already run — the
@@ -1320,10 +1327,10 @@ export function BlockTerminal({
 
   // Report this scroll container's region (top offset within the pane + height)
   // to the native surface, so native content pins to exactly it: the shell
-  // transcript sits just above the input bar, and an agent grid sits just below
-  // the AgentChrome strip — never behind either. The native surface still spans
-  // the whole pane; this only bounds the content. Covers shell AND agent (the top
-  // offset differs); re-reports on resize and when agent mode toggles the strip.
+  // transcript sits just above the input bar, while an agent grid claims the
+  // full terminal viewport. The native surface still spans the whole pane; this
+  // only bounds the content. Covers shell AND agent and re-reports on resize or
+  // mode changes.
   useEffect(() => {
     const el = scrollContainerRef.current;
     if (!el || !nativeActive) return;
@@ -1425,19 +1432,14 @@ export function BlockTerminal({
       // the terminal grid (38px + a 6px breathing strip = 44).
       const inputChrome = agentMode ? 44 : 80;
       const liveBlockChrome = 50;
-      // The agent status strip that used to sit above the canvas was
-      // removed, so there's no chrome height to reserve here anymore —
-      // the agent's PTY reclaims that space and fills the pane.
-      const agentChromeHeight = 0;
-      // On a NATIVE agent pane the only real chrome is the AgentChrome strip:
-      // the input bar is hidden and the live block is opacity:0, so reserving
-      // their heights (inputChrome + liveBlockChrome) would shrink Claude's PTY
-      // below the pane the native surface actually fills — leaving black space
-      // above the agent. Reserve only the strip there so Claude fills the pane.
+      // A NATIVE agent pane has no terminal chrome: the input bar is hidden and
+      // the live block is opacity:0. Reserving their heights would shrink the
+      // agent PTY below the pane the native surface actually fills and leave a
+      // black gap above it, so native agents reserve zero pixels here.
       const reserved =
         agentMode && nativeSurface
-          ? agentChromeHeight
-          : inputChrome + liveBlockChrome + agentChromeHeight;
+          ? 0
+          : inputChrome + liveBlockChrome;
       const usableHeight = Math.max(120, rect.height - reserved);
       // Match the native renderer's row pitch (LINE_HEIGHT_RATIO 1.3 in
       // warp_term.rs) on native panes so PTY rows × pitch == the painted grid
@@ -1820,7 +1822,13 @@ export function BlockTerminal({
         sniffBufferRef.current = "";
         setForegroundIsAgent(true);
       }
-      void sendLine(text);
+      // Codex defaults to the alternate screen but does not enable mouse
+      // reporting there, making wheel gestures a no-op. Its supported inline
+      // mode writes the conversation into normal PTY scrollback, which our
+      // native transcript already scrolls smoothly (the same path Claude uses).
+      // Keep `text` as the display/history value; only the bytes sent to the
+      // shell receive the integration flag.
+      void sendLine(text, makeCodexScrollable(text));
       if (text.trim().length > 0) {
         setHistory((prev) => {
           const next = [text, ...prev];
@@ -2075,22 +2083,31 @@ export function BlockTerminal({
     [history],
   );
 
-  // Don't steal focus from a text selection. Click on a block to copy
-  // → the selection survives. Click into empty terminal space → focus
-  // the active input (PromptInput in shell mode, PtyPassthrough in
-  // agent mode) so typing "just works".
+  // Don't steal focus from a text selection made in THIS terminal. A selection
+  // left behind in another pane must not block this terminal from taking focus;
+  // that was the intermittent "clicked main, still typing in the side pane"
+  // failure. Click into empty terminal space → focus the currently-mounted
+  // input layer so typing "just works".
   const onContainerMouseUp = (e: MouseEvent<HTMLDivElement>) => {
     const sel = window.getSelection();
-    if (sel && !sel.isCollapsed && sel.toString().length > 0) {
-      return;
+    const container = containerRef.current;
+    if (sel && container) {
+      const anchorInside = !!sel.anchorNode && container.contains(sel.anchorNode);
+      const focusInside = !!sel.focusNode && container.contains(sel.focusNode);
+      if (
+        shouldPreserveTerminalSelection({
+          collapsed: sel.isCollapsed,
+          textLength: sel.toString().length,
+          anchorInside,
+          focusInside,
+        })
+      ) {
+        return;
+      }
     }
     // Only refocus on plain left-clicks; right-click opens context menus.
     if (e.button !== 0) return;
-    if (foregroundIsAgent) {
-      passthroughRef.current?.focus();
-    } else {
-      promptRef.current?.focus();
-    }
+    focusTerminalInput();
   };
 
   // Mark this terminal as the most-recently-interacted one so the
@@ -2381,10 +2398,6 @@ export function BlockTerminal({
           </button>
         </div>
       )}
-
-      {/* The Warp-style agent status strip ("claude is idle ✓") was
-          removed — it restated what the agent's own TUI already shows
-          and just ate vertical space above the pane. */}
 
       {/* Alt-screen TUIs (vim, htop, claude-in-alt-screen) render on the
           native Metal surface. The previous React WebGPU CanvasGrid

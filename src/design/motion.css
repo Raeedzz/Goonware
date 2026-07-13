@@ -28,17 +28,6 @@
 }
 
 /* ------------------------------------------------------------------
-   Spinner rotate. Used by AgentChrome's status indicator when a
-   Claude/Codex/Gemini session is in `working` or `compacting`. The
-   spinner is a CSS ring with a transparent right border; rotating
-   the whole ring reads as the standard "thinking" affordance.
-   ------------------------------------------------------------------ */
-@keyframes goonware-spin {
-  0%   { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
-}
-
-/* ------------------------------------------------------------------
    Three-dot loading indicator.
    Used inside: highlight-and-ask card while waiting for Gemini,
    "Generate commit message" button while streaming, agent-startup state.
