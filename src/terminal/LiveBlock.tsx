@@ -307,9 +307,9 @@ export function LiveBlock({
             // `renderer.resize()` and the bottom rows of the canvas
             // (claude's input box + footer) would simply never be
             // painted. flex-end keeps the canvas hugging the bottom of
-            // the body whenever it IS shorter than the body — so a
-            // freshly-started agent's input row sits flush against the
-            // agent status bar below instead of floating in the middle.
+            // the body whenever it IS shorter than the body, so a
+            // freshly-started agent's input row sits at the pane bottom
+            // instead of floating in the middle.
             flex: fill ? "1 1 auto" : undefined,
             display: fill ? "flex" : undefined,
             flexDirection: fill ? "column" : undefined,

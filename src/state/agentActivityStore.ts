@@ -287,7 +287,7 @@ export function forceIdleForCwd(cwd: string): void {
  * hook will never arrive. Without this, the next time the user runs
  * `claude` in the same pane the old record is still in the map; the
  * sidebar spinner stays on (any working session counts) and the
- * per-pane AgentChrome can briefly show the killed agent's last
+ * per-pane session consumers can briefly show the killed agent's last
  * status before the new SessionStart record overrides it.
  *
  * This is intentionally more aggressive than `forceIdleForCwd`. That
@@ -331,7 +331,7 @@ export function useTrackAgentActivity(_worktreeId: string, cwd: string): boolean
 
 /**
  * Return the most-recently-updated SessionRecord whose cwd is at or
- * below `cwd`, or null if none. Used by the per-pane AgentChrome to
+ * below `cwd`, or null if none. Used by per-pane session consumers to
  * show "Claude is using Read" / "waiting for permission" / etc.
  *
  * "Most recent" matters when the user has multiple agents touching
