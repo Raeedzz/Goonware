@@ -28,7 +28,7 @@ import {
   setTerminalRunning,
   clearTerminalRunning,
 } from "./terminalActivityStore";
-import { detectClaude } from "@/lib/claudeUsage";
+import { detectAgentBanner } from "@/lib/claudeUsage";
 import { termKillForeground, termResetGrid } from "@/lib/tauri/term";
 import { writeClipboardTextWithFallback } from "./clipboardWrite";
 import { decideSoftResetAction } from "./softReset";
@@ -382,39 +382,37 @@ export function BlockTerminal({
     return () => unregisterTerminalFocus(id);
   }, [id, focusTerminalInput]);
 
-  // While a Claude-Code session is foregrounded, the launch command
-  // ("claude") tells you nothing about what's actually happening. Ask
-  // the helper-agent layer to summarize the last 3 turns of the
-  // transcript — that lands a phrase like "wiring up the OSC 133
-  // segmenter" instead. The Rust side caches the result keyed by the
-  // turn uuids, so polling here is cheap unless a new exchange landed.
-  //
-  // Codex / Gemini have their own transcript layouts; for now we only
-  // run this against Claude transcripts (the only one the helper
-  // currently knows how to parse). Other CLIs fall back to the launch
-  // command via the activeCommand path below.
-  const [claudeSummary, setClaudeSummary] = useState<string | null>(null);
+  // While an agent session is foregrounded, the launch command
+  // ("claude" / "codex" / "gemini") tells you nothing about what's
+  // actually happening. Poll the hook-fed prompt map for the user's
+  // latest prompt — that lands a phrase like "wiring up the OSC 133
+  // segmenter" instead. The Rust command (`claude_activity_summary`,
+  // named for its origin) is provider-agnostic: it reads the
+  // in-memory LATEST_PROMPT_BY_CWD map keyed by cwd, which every
+  // provider's hook script populates via its UserPromptSubmit
+  // `prompt` field. No transcript files are read — same TCC-safety
+  // contract for all three CLIs.
+  const [agentSummary, setAgentSummary] = useState<string | null>(null);
   useEffect(() => {
     if (!autoSummarize) {
-      setClaudeSummary(null);
+      setAgentSummary(null);
       return;
     }
     if (!foregroundIsAgent) {
-      setClaudeSummary(null);
+      setAgentSummary(null);
       return;
     }
     if (!cwd) return;
-    const isClaudeLine = commandLineIsAgent(activeCommand || command)
-      && detectCliFromCommandLine(activeCommand || command) === "claude";
-    if (!isClaudeLine) return;
+    const cli = detectCliFromCommandLine(activeCommand || command);
+    if (!cli) return;
     let cancelled = false;
     const tick = async () => {
       try {
         const summary = await invoke<string | null>("claude_activity_summary", {
           projectCwd: cwd,
-          cli: "claude",
+          cli,
         });
-        if (!cancelled) setClaudeSummary(summary);
+        if (!cancelled) setAgentSummary(summary);
       } catch {
         // Transient failures keep the last value — better than blanking.
       }
@@ -439,14 +437,14 @@ export function BlockTerminal({
   //  2. **Bare CLI launch names don't dispatch either.** When the
   //     tab remounts (e.g. on tab switch), `activeCommand` is
   //     seeded back to the agent's name ("claude" / "codex" /
-  //     "gemini") before `claudeSummary` has had a chance to tick.
+  //     "gemini") before `agentSummary` has had a chance to tick.
   //     Without this guard the stored summary would briefly flip
   //     to "claude" and then get rewritten with the real activity
   //     summary a moment later — a visible flicker the user
   //     specifically called out. Letting the prior real summary
   //     persist until a real new one arrives is the right default.
   useEffect(() => {
-    const source = claudeSummary ?? activeCommand;
+    const source = agentSummary ?? activeCommand;
     const summary = source.replace(/\s+/g, " ").trim();
     if (!summary) return;
     const lower = summary.toLowerCase();
@@ -454,7 +452,7 @@ export function BlockTerminal({
       return;
     }
     onActivitySummaryChangeRef.current?.(summary);
-  }, [activeCommand, claudeSummary]);
+  }, [activeCommand, agentSummary]);
 
   const {
     blocks,
@@ -1624,25 +1622,26 @@ export function BlockTerminal({
   // CRITICAL: only sniff while a command is actively running. After
   // Ctrl+C kills an agent the alacritty grid still holds the agent's
   // TUI bytes — without this gate, the very next frame after the
-  // command_running=false transition would re-detect claude from
+  // command_running=false transition would re-detect the agent from
   // those leftover bytes and flip foregroundIsAgent back to true,
   // pinning PromptInput off-screen forever.
   //
   // AND: skip the sniff entirely once we know what command is running
   // and it isn't an agent. The live frame contains the full grid (per
-  // useTerminalSession's allDirty re-emit), so claude's banner from
+  // useTerminalSession's allDirty re-emit), so the agent's banner from
   // the previous run is still painted above the shell prompt when the
   // user types `ls`. Without this gate, that stale banner trips
-  // detectClaude on the next `command_running=true` transition,
+  // detectAgentBanner on the next `command_running=true` transition,
   // re-arms agent mode, and the prompt input vanishes mid-typing —
   // exactly the bug the user reported. activeCommand-classification
   // (line below) already covers the case where the new command IS an
   // agent, so suppressing the sniff here loses nothing.
   //
-  // Scans the full grid (claude's banner paints near the top of the
-  // initial draw, so a tail-only scan misses it). Bails on the first
-  // marker hit — the inner loop appends span text and short-circuits
-  // as soon as detectClaude succeeds.
+  // Scans the full grid (the banners paint near the top of the
+  // initial draw, so a tail-only scan misses them). Covers every CLI
+  // in the roster — claude, codex, gemini — so an agent launched via
+  // a wrapper script (command line never names the binary) still
+  // flips the pane into agent mode.
   useEffect(() => {
     if (foregroundIsAgent) return;
     // Suppressed after an explicit force-kill until the next submit — see
@@ -1662,9 +1661,12 @@ export function BlockTerminal({
       sniffBufferRef.current.length + text.length > 16_384
         ? (sniffBufferRef.current + text).slice(-16_384)
         : sniffBufferRef.current + text;
-    if (detectClaude(sniffBufferRef.current)) {
+    const bannerCli = detectAgentBanner(sniffBufferRef.current);
+    if (bannerCli) {
       setForegroundIsAgent(true);
-      if (!claudeDetectedLocal) {
+      // The detected-callback anchors the Claude 5h-usage pill; the
+      // other CLIs have no usage surface, so only Claude fires it.
+      if (bannerCli === "claude" && !claudeDetectedLocal) {
         setClaudeDetectedLocal(true);
         onClaudeDetectedRef.current?.(Date.now());
       }
@@ -1673,10 +1675,11 @@ export function BlockTerminal({
   }, [liveFrame, foregroundIsAgent, claudeDetectedLocal, activeCommand]);
 
   // Foreground the agent the moment the user runs one from the shell.
-  // The Claude-only banner sniff above is a slow path that doesn't
-  // know about codex/aider; this catches every known agent on its
-  // command line as soon as command_running flips to true. Skipped
-  // for direct-launch panes (already foregrounded at mount).
+  // The banner sniff above is a slow path (it waits for the TUI's
+  // first paint, and doesn't know aider); this catches every known
+  // agent on its command line as soon as command_running flips to
+  // true. Skipped for direct-launch panes (already foregrounded at
+  // mount).
   useEffect(() => {
     if (directAgent) return;
     if (foregroundIsAgent) return;
@@ -1734,20 +1737,22 @@ export function BlockTerminal({
   // foreground process group via tcgetpgrp(master_fd) and SIGKILLs
   // it, bypassing whatever signal trap the running process installed.
   //
-  // Always force-EVICT here (not just force-idle). A double-tap
-  // escalation means the user really wants the agent dead — even if
-  // it traps SIGINT, the foreground process group is about to receive
-  // SIGKILL. The SessionEnd hook will never fire (the agent process
-  // is killed before it can run its at-exit handler), so the only way
-  // to keep the session map from accumulating a stuck "working"
-  // record is to drop it locally right here. Without this, the next
-  // time the user runs `claude` in this pane the stale record is
-  // still there: the sidebar spinner stays on (any working session
-  // counts) and the per-pane chrome can briefly show the killed
-  // agent's last status before the new SessionStart record arrives.
+  // Force-EVICT here (not just force-idle) — but ONLY when the
+  // foregrounded process is an agent, mirroring the single-Ctrl+C
+  // gate in onSendBytesVoid. A double-tap escalation means the user
+  // really wants the foreground process dead — even if it traps
+  // SIGINT, the foreground process group is about to receive SIGKILL.
+  // When that process IS an agent, its SessionEnd hook will never
+  // fire (killed before its at-exit handler runs), so drop its
+  // session record locally right here; otherwise the next `claude`
+  // launch in this pane inherits a stuck "working" record and the
+  // sidebar spinner stays on. When the killed process is NOT an
+  // agent (e.g. a stuck `npm run dev`), evicting by cwd would wipe
+  // the live session records of OTHER panes sharing this worktree —
+  // so the eviction is gated, while the kill itself is not.
   const onForceKill = useCallback(() => {
     const path = cwdRef.current;
-    if (path) forceEvictForCwd(path);
+    if (path && foregroundIsAgentRef.current) forceEvictForCwd(path);
     void termKillForeground(ptyId).catch(() => {
       // Backend may have torn the session down between the read and
       // the kill (rare race on tab close). Nothing useful to do; the

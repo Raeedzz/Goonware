@@ -2,7 +2,7 @@
 
 **GPU-accelerated terminal for running CLI coding agents in parallel.**
 
-No chat panel. No wrapper around your agent. Just a fast, dark workspace where every `claude` / `codex` session lives in its own git worktree, every commit can be AI-drafted, and the browser, files, and git panels are one keystroke away.
+No chat panel. No wrapper around your agent. Just a fast, dark workspace where every `claude` / `codex` session lives in its own git worktree, every commit can be AI-drafted, and the files and git panels are one keystroke away.
 
 > Built with Tauri (Rust) + React/TypeScript. xterm.js + WebGL for the terminal. macOS only in v1.
 
@@ -15,7 +15,6 @@ A native macOS app for orchestrating CLI coding agents the way you already think
 - **No harness, just a terminal.** Your agent runs in a real PTY with xterm.js + WebGL. Nothing in between you and the model.
 - **Every agent gets its own git worktree.** Spawn five `claude` sessions on five branches and they never step on each other.
 - **Live, plain-English summaries.** Every tab carries a one-line summary of what the agent is doing right now, auto-drafted when the PTY goes idle.
-- **In-house browser daemon.** A headless Chrome at `127.0.0.1:4000` exposes `/screenshot`, `/navigate`, `/click`, `/type`, `/console/recent`. Faster than Chrome MCP. The same HTTP contract works from any agent terminal.
 - **AI commits and AI PRs.** Stage changes, hit `⌘⏎`, get a Gemini Flash-Lite draft. `⌘⌥P` drafts a PR title + body and ships it via `gh`.
 - **Highlight → ask.** Select code, press `⌘L`, get an inline answer in the margin. No side panel. No thread.
 - **Per-project memory.** `rli-memory add` / `recall` from any pane. Auto-scoped to the active worktree. Multiple agents in parallel panes coordinate without a scratch file.

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useAppDispatch } from "@/state/AppState";
 import type { TodoItem, Worktree } from "@/state/types";
 
@@ -27,7 +27,7 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
   // DOM (the dispatch round-trips through the store, so the input for a
   // freshly-added id doesn't exist until the re-render).
   const [focusId, setFocusId] = useState<string | null>(null);
-  const inputRefs = useRef(new Map<string, HTMLInputElement>());
+  const inputRefs = useRef(new Map<string, HTMLTextAreaElement>());
 
   // Always-fresh mirror of the persisted lists, read inside the deferred
   // "done" timeout below — the store may have changed (another todo added,
@@ -38,14 +38,15 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
   latest.current = { todos, history };
 
   // Timers for todos flashing green before they drop into History, so we can
-  // cancel them on unmount and avoid firing against a dead component.
+  // cancel them on unmount or worktree switch and avoid firing against a
+  // dead component or archiving one worktree's id into another worktree.
   const doneTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
-  useEffect(
+  useLayoutEffect(
     () => () => {
       doneTimers.current.forEach((t) => clearTimeout(t));
       doneTimers.current.clear();
     },
-    [],
+    [worktree.id],
   );
 
   useEffect(() => {
@@ -91,6 +92,48 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
     patch({ todos: todos.map((t) => (t.id === id ? { ...t, text } : t)) });
   };
 
+  // Move a "done" todo out of the active list and into History. Shared by
+  // the 900ms flash timer below and the recovery sweep effect. Always reads
+  // from — and synchronously advances — the `latest` mirror: if another
+  // archive dispatches before React commits this one back into the
+  // `worktree` prop, it must see this accumulated state, otherwise its
+  // shallow-merge patch would clobber `todoHistory` and drop the item we
+  // just archived.
+  const archiveDone = (id: string) => {
+    const { todos: curTodos, history: curHistory } = latest.current;
+    const item = curTodos.find((t) => t.id === id);
+    if (!item) return;
+    const done: TodoItem = { ...item, status: "done", completedAt: Date.now() };
+    const nextTodos = curTodos.filter((t) => t.id !== id);
+    const nextHistory = [done, ...curHistory];
+    latest.current = { todos: nextTodos, history: nextHistory };
+    dispatch({
+      type: "update-worktree",
+      id: worktree.id,
+      patch: {
+        todos: nextTodos,
+        todoHistory: nextHistory,
+      },
+    });
+  };
+
+  // Recovery sweep. A todo can be stranded in "done" forever: the status
+  // persists as soon as the checkbox is clicked, but the archive only
+  // happens on the 900ms timer — which the unmount cleanup above cancels.
+  // Switch worktree/tab or quit inside that window and the item comes back
+  // as a read-only, uncycleable "done" row that nothing will ever archive.
+  // On mount and whenever the worktree changes, archive such items
+  // immediately; they already missed their flash animation, so there is
+  // nothing to wait for. Items with a live timer are mid-flash and are
+  // left to their timer.
+  useEffect(() => {
+    for (const t of latest.current.todos) {
+      if (t.status === "done" && !doneTimers.current.has(t.id)) {
+        archiveDone(t.id);
+      }
+    }
+  }, [worktree.id]);
+
   // Circle click cycles the state: todo → in_progress → done. Reaching
   // "done" flips the marker to a green check in place and leaves the row
   // sitting there for a beat before it drops out of the active list and
@@ -120,25 +163,7 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
     });
     const timer = setTimeout(() => {
       doneTimers.current.delete(id);
-      const { todos: curTodos, history: curHistory } = latest.current;
-      const item = curTodos.find((t) => t.id === id);
-      if (!item) return;
-      const done: TodoItem = { ...item, status: "done", completedAt: Date.now() };
-      const nextTodos = curTodos.filter((t) => t.id !== id);
-      const nextHistory = [done, ...curHistory];
-      // Advance the mirror synchronously. If another todo's timer fires
-      // before React commits this archive back into the `worktree` prop, it
-      // must read this accumulated state — otherwise its shallow-merge patch
-      // would clobber `todoHistory` and drop the item we just archived.
-      latest.current = { todos: nextTodos, history: nextHistory };
-      dispatch({
-        type: "update-worktree",
-        id: worktree.id,
-        patch: {
-          todos: nextTodos,
-          todoHistory: nextHistory,
-        },
-      });
+      archiveDone(id);
     }, 900);
     doneTimers.current.set(id, timer);
   };
@@ -205,6 +230,7 @@ export function TodoView({ worktree }: { worktree: Worktree }) {
               onCycle={() => cycle(todo.id)}
               onEnter={() => insertAfter(todo.id)}
               onDeleteEmpty={() => remove(todo.id, true)}
+              onBlurEmpty={() => remove(todo.id, false)}
               onArrow={(dir) => focusSibling(todo.id, dir)}
             />
           ))}
@@ -428,19 +454,32 @@ function TodoRow({
   onCycle,
   onEnter,
   onDeleteEmpty,
+  onBlurEmpty,
   onArrow,
 }: {
   todo: TodoItem;
-  registerRef: (el: HTMLInputElement | null) => void;
+  registerRef: (el: HTMLTextAreaElement | null) => void;
   onChangeText: (text: string) => void;
   onCycle: () => void;
   onEnter: () => void;
   onDeleteEmpty: () => void;
+  onBlurEmpty: () => void;
   onArrow: (dir: 1 | -1) => void;
 }) {
   const [hover, setHover] = useState(false);
   const inProgress = todo.status === "in_progress";
   const done = todo.status === "done";
+
+  // The textarea grows to fit its wrapped content instead of scrolling: reset
+  // to auto, then lock height to the rendered scrollHeight. Runs on every value
+  // change and whenever the element (re)mounts via the ref callback.
+  const areaRef = useRef<HTMLTextAreaElement | null>(null);
+  const autosize = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  };
+  useEffect(() => autosize(areaRef.current), [todo.text]);
 
   return (
     <li>
@@ -449,7 +488,7 @@ function TodoRow({
         onMouseLeave={() => setHover(false)}
         style={{
           display: "flex",
-          alignItems: "center",
+          alignItems: "flex-start",
           gap: 8,
           padding: "3px var(--space-3)",
           backgroundColor: hover && !done ? "var(--surface-2)" : "transparent",
@@ -468,12 +507,25 @@ function TodoRow({
           <StatusCircle status={todo.status} />
         </button>
 
-        <input
-          ref={registerRef}
+        <textarea
+          ref={(el) => {
+            areaRef.current = el;
+            registerRef(el);
+            autosize(el);
+          }}
           value={todo.text}
-          onChange={(e) => onChangeText(e.target.value)}
+          onChange={(e) => {
+            onChangeText(e.target.value);
+            autosize(e.currentTarget);
+          }}
           placeholder="Todo"
           readOnly={done}
+          rows={1}
+          // Clicking away from an empty row discards it rather than leaving a
+          // blank "Todo" placeholder stuck in the list.
+          onBlur={() => {
+            if (!done && todo.text.trim() === "") onBlurEmpty();
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
@@ -496,8 +548,15 @@ function TodoRow({
             border: "none",
             outline: "none",
             padding: 0,
+            margin: 0,
+            resize: "none",
+            overflow: "hidden",
+            // Wrap long words too, so a single unbroken string still folds to
+            // the next (indented) line instead of overflowing the pane.
+            overflowWrap: "anywhere",
             fontFamily: "var(--font-sans)",
             fontSize: "var(--text-sm)",
+            lineHeight: 1.35,
             color: done ? "var(--text-secondary)" : "var(--text-primary)",
             textDecoration: done ? "line-through" : "none",
             transition: "color var(--motion-fast) var(--ease-out-quart)",

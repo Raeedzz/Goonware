@@ -579,7 +579,13 @@ pub fn fs_rename(from: String, to: String) -> Result<String, String> {
     if from_path == to_path {
         return Ok(to);
     }
-    if to_path.exists() {
+    // On macOS's default case-insensitive APFS, a case-only rename
+    // ('readme.md' → 'README.md') makes `to` resolve to the SOURCE
+    // file's own inode, so `exists()` is true even though nothing
+    // distinct would be clobbered. If `from` and `to` are the same
+    // underlying file, fall through — `fs::rename` performs the
+    // in-place case change. Genuinely distinct targets still error.
+    if to_path.exists() && !same_file(from_path, to_path) {
         let name = to_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -592,6 +598,28 @@ pub fn fs_rename(from: String, to: String) -> Result<String, String> {
     }
     fs::rename(from_path, to_path).map_err(|e| e.to_string())?;
     Ok(to)
+}
+
+/// True when `a` and `b` name the same underlying file (same device +
+/// inode). Uses `symlink_metadata` so a symlink compares as the link
+/// entry itself rather than its target. This is what lets `fs_rename`
+/// distinguish a case-only rename on a case-insensitive volume from a
+/// genuine collision with a different file.
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+        _ => false,
+    }
+}
+
+/// Non-unix fallback: no inode identity available, so never claim two
+/// distinct paths are the same file (preserves the strict no-clobber
+/// behavior). The app only ships on macOS, so this is belt-and-braces.
+#[cfg(not(unix))]
+fn same_file(_a: &Path, _b: &Path) -> bool {
+    false
 }
 
 /// Permanently delete a file or directory. Powers the file tree's
@@ -853,6 +881,18 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
         assert_eq!(fs::read_to_string(&other).unwrap(), "keep");
+
+        // A case-only rename must not be mistaken for a collision on
+        // case-insensitive filesystems (the default on macOS).
+        let lower = dir.path().join("case-name.txt");
+        let upper = dir.path().join("CASE-NAME.txt");
+        fs::write(&lower, b"same file").unwrap();
+        fs_rename(
+            lower.to_string_lossy().into_owned(),
+            upper.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&upper).unwrap(), "same file");
     }
 
     #[test]

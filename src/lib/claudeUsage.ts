@@ -73,6 +73,14 @@ const CLAUDE_MARKERS = [
   "✻ welcome",
 ];
 
+/** Codex CLI's startup banner prints "OpenAI Codex (vX.Y.Z)". */
+const CODEX_MARKERS = ["openai codex"];
+
+/** Gemini CLI greets with a tips block under its ASCII-art banner. */
+const GEMINI_MARKERS = ["welcome to gemini", "tips for getting started"];
+
+export type AgentBannerCli = "claude" | "codex" | "gemini";
+
 /**
  * Returns true when `text` contains a confident marker that Claude is
  * running in this PTY. Used by BlockTerminal for UI-mode switching —
@@ -82,6 +90,22 @@ export function detectClaude(text: string): boolean {
   if (!text) return false;
   const lower = text.toLowerCase();
   return CLAUDE_MARKERS.some((m) => lower.includes(m));
+}
+
+/**
+ * Provider-agnostic banner sniff: classify which agent CLI's startup
+ * banner appears in `text`, or null when none does. Same contract as
+ * {@link detectClaude} but covers every agent in the roster, so a
+ * codex/gemini launched through a wrapper script (where the command
+ * line never says "codex") still flips the pane into agent mode.
+ */
+export function detectAgentBanner(text: string): AgentBannerCli | null {
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  if (CLAUDE_MARKERS.some((m) => lower.includes(m))) return "claude";
+  if (CODEX_MARKERS.some((m) => lower.includes(m))) return "codex";
+  if (GEMINI_MARKERS.some((m) => lower.includes(m))) return "gemini";
+  return null;
 }
 
 export interface ModelBreakdown {
