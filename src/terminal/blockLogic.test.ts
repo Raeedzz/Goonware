@@ -26,6 +26,7 @@ describe("isAgentInput — recognise TUI agents", () => {
     ["codex", true],
     ["aider", true],
     ["gemini", true],
+    ["copilot", true],
     ["ls -la", false],
     ["", false],
     ["git status", false],
@@ -41,6 +42,12 @@ describe("isAgentInput — recognise TUI agents", () => {
   test("resolves absolute-path wrappers (`/usr/local/bin/claude`)", () => {
     expect(isAgentInput("/usr/local/bin/claude")).toBe(true);
     expect(isAgentInput("~/.bun/bin/codex --json")).toBe(true);
+  });
+
+  test("recognises agents behind shell launch wrappers", () => {
+    expect(isAgentInput("env TOKEN=x codex")).toBe(true);
+    expect(isAgentInput("command gemini")).toBe(true);
+    expect(isAgentInput("exec copilot")).toBe(true);
   });
 });
 

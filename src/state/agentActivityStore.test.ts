@@ -365,7 +365,7 @@ describe("forceEvictForCwd — SIGKILL drops sessions definitively", () => {
   });
 });
 
-describe("resolveSessionForCwd — AgentChrome picks the right session", () => {
+describe("resolveSessionForCwd — session-detail lookup", () => {
   test("returns null for empty cwd", () => {
     expect(__internals.resolveSessionForCwd("")).toBeNull();
   });
