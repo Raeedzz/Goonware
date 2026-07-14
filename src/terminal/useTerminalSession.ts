@@ -86,8 +86,9 @@ interface SessionApi {
   /** Bell event counter — increments on every BEL. Frontend animates on diff. */
   bellTick: number;
   /**
-   * Submit a line + trailing \n. `wireText` may carry an integration-only CLI
-   * flag while `text` remains the value shown in block history.
+   * Submit a line + trailing \n. `wireText` may differ when Goonware needs an
+   * integration-only CLI flag while keeping the user's original command in
+   * block history.
    */
   sendLine: (text: string, wireText?: string) => Promise<void>;
   /** Send raw bytes (passthrough for ⌃C, alt-screen keystrokes, etc.). */
