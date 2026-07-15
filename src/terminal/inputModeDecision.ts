@@ -112,9 +112,10 @@ export function deriveInputMode(s: InputModeInput): InputModeDecision {
     !s.exited && (s.altScreen || s.foregroundIsAgent || inlineRawPrompt);
 
   const passthroughActive =
-    (s.foregroundIsAgent && !s.altScreen) ||
-    inlineRawPrompt ||
-    (s.altScreen && s.nativeSurface);
+    !s.exited &&
+    ((s.foregroundIsAgent && !s.altScreen) ||
+      inlineRawPrompt ||
+      (s.altScreen && s.nativeSurface));
 
   return { inlineRawPrompt, agentMode, passthroughActive };
 }

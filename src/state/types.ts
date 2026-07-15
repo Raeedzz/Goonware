@@ -148,8 +148,10 @@ export const DEFAULT_PROJECT_SETTINGS: ProjectSettings = {
  * Apply the user's branch-prefix setting to an auto-generated branch
  * name. Returns the bare name verbatim when the prefix can't be
  * resolved (no gh login resolved yet, or `custom` mode with an empty
- * prefix). Prefixes are slugified to be branch-name-legal — strips
- * leading `@`, collapses non-alnum into `-`, trims `-` from edges.
+ * prefix). Prefixes are slugified to a conservative branch-name-legal
+ * subset — strips leading `@`, collapses punctuation into `-`, and trims
+ * separators from the edges. In particular, dots are not retained because
+ * Git rejects leading-dot, dot-only, `..`, and `.lock` ref components.
  */
 export function applyBranchPrefix(
   base: string,
@@ -170,7 +172,7 @@ function sanitizeBranchPrefix(raw: string): string {
   return raw
     .trim()
     .replace(/^@+/, "")
-    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
     .replace(/^-+|-+$/g, "");
 }
 

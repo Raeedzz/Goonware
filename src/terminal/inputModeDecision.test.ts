@@ -146,8 +146,21 @@ describe("deriveInputMode", () => {
     });
     expect(d.inlineRawPrompt).toBe(false);
     expect(d.agentMode).toBe(false);
-    // passthroughActive ignores `exited` (it has no exited guard), but
-    // the JSX gates the whole input region elsewhere; agentMode is the
-    // authoritative "which chrome" flag and it's false here.
+    expect(d.passthroughActive).toBe(false);
+  });
+
+  test("after an inline agent exits, its stale foreground flag cannot keep passthrough mounted", () => {
+    const d = deriveInputMode({
+      ...idleShell,
+      exited: true,
+      commandRunning: false,
+      rawInput: false,
+      foregroundIsAgent: true,
+    });
+    expect(d).toEqual({
+      inlineRawPrompt: false,
+      agentMode: false,
+      passthroughActive: false,
+    });
   });
 });
