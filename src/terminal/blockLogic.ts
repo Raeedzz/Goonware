@@ -1,14 +1,12 @@
 import { parseAnsi } from "./parseAnsi";
 import type { BlockRow, Span } from "./types";
+import { detectAgentCommand } from "./agentCommand";
 
 /**
  * Pure helpers behind the closed-block render path. Lives in its own
  * file (separate from Block.tsx) so unit tests can import the logic
  * without dragging in CellRow + the rest of the React tree.
  */
-
-/** Agent binaries whose closed transcripts are unreadable as linear text. */
-const AGENT_NAMES = new Set(["claude", "codex", "aider", "gemini"]);
 
 /**
  * True when `input` invokes one of our known TUI agents. Strips leading
@@ -17,13 +15,7 @@ const AGENT_NAMES = new Set(["claude", "codex", "aider", "gemini"]);
  * two stay in lockstep.
  */
 export function isAgentInput(input: string): boolean {
-  const tokens = input.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  for (const t of tokens) {
-    if (/^[a-z_][a-z0-9_]*=/i.test(t)) continue;
-    const prog = t.split("/").pop() ?? t;
-    return AGENT_NAMES.has(prog);
-  }
-  return false;
+  return detectAgentCommand(input) !== null;
 }
 
 /**

@@ -2619,37 +2619,27 @@ pub fn term_input(
 /// instead (via `term_native_scroll`); this is the alt-screen path. Encoding
 /// follows the pty's current mode:
 ///   - mouse reporting on  → mouse-wheel buttons (SGR `\e[<64/65;c;rM`, else X10)
-///   - else alternate-scroll (DECSET 1007, alacritty's alt-screen default)
-///     → arrow keys (cursor-app-mode aware)
+///   - mouse reporting off + explicit page fallback → PageUp/PageDown
 /// `delta_lines` is signed wheel notches: negative = up/older, positive =
-/// down/newer. No-op when the app wants neither (nothing to scroll).
-#[tauri::command]
-pub fn term_native_wheel(
-    state: State<TerminalState>,
-    id: String,
+/// down/newer. When an alt-screen program did not request mouse reporting,
+/// `fallback_page_scroll` sends one PageUp/PageDown key per batch. The caller
+/// enables it only for an explicit wheel gesture, so no navigation is injected
+/// spontaneously.
+fn encode_native_wheel(
+    mode: TermMode,
     delta_lines: i32,
     col: u16,
     row: u16,
-) -> Result<(), String> {
-    let arc = {
-        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-        sessions.get(&id).cloned().ok_or("unknown term session")?
-    };
-    let mut s = arc.lock().map_err(|e| e.to_string())?;
-    let mode = s.term.mode();
+    max_cols: u16,
+    max_rows: u16,
+    fallback_page_scroll: bool,
+) -> Option<Vec<u8>> {
     let notches = (delta_lines.unsigned_abs() as usize).clamp(1, 8);
     let up = delta_lines < 0;
-    let c = col.clamp(1, s.cols.max(1));
-    let r = row.clamp(1, s.rows.max(1));
+    let c = col.clamp(1, max_cols.max(1));
+    let r = row.clamp(1, max_rows.max(1));
     let mut out: Vec<u8> = Vec::new();
-    // Send mouse-wheel events — a smooth, app-native scroll — to any TUI that is
-    // mouse/SGR aware (claude sets SGR mode 1006). We do NOT fall back to arrow
-    // keys: `ALTERNATE_SCROLL` is alacritty's *default*, not something the app
-    // opted into, so translating the wheel to arrows fires for every alt-screen
-    // app and an app like claude reads those arrows as input-cursor movement,
-    // not scroll — which is the "scroll sends arrows / doesn't scroll" report.
-    // An app that ignores mouse reports simply discards the CSI sequence (no
-    // stray characters), so this is safe even when only the SGR encoding is set.
+
     if mode.contains(TermMode::MOUSE_MODE) || mode.contains(TermMode::SGR_MOUSE) {
         // Wheel button codes: 64 = up, 65 = down.
         let btn: u32 = if up { 64 } else { 65 };
@@ -2667,11 +2657,54 @@ pub fn term_native_wheel(
                 ]);
             }
         }
-    } else {
-        // App isn't mouse-aware — forwarding anything (arrows included) would
-        // mis-drive it. No-op; a future enhancement can scroll native scrollback.
-        return Ok(());
+        return Some(out);
     }
+
+    if fallback_page_scroll {
+        // CSI 5~ / 6~ are the standard PageUp / PageDown terminal sequences.
+        // Emit once per coalesced frontend batch, not once per wheel notch, so
+        // a fast trackpad flick remains bounded and lets the agent redraw.
+        out.extend_from_slice(if up { b"\x1b[5~" } else { b"\x1b[6~" });
+        return Some(out);
+    }
+
+    None
+}
+
+#[tauri::command]
+pub fn term_native_wheel(
+    state: State<TerminalState>,
+    id: String,
+    delta_lines: i32,
+    col: u16,
+    row: u16,
+    fallback_page_scroll: Option<bool>,
+) -> Result<(), String> {
+    let arc = {
+        let sessions = state.sessions.lock().map_err(|e| e.to_string())?;
+        sessions.get(&id).cloned().ok_or("unknown term session")?
+    };
+    let mut s = arc.lock().map_err(|e| e.to_string())?;
+    let mode = s.term.mode();
+    // Send mouse-wheel events — a smooth, app-native scroll — to any TUI that is
+    // mouse/SGR aware (claude sets SGR mode 1006). We do NOT fall back to arrow
+    // keys: `ALTERNATE_SCROLL` is alacritty's *default*, not something the app
+    // opted into, so translating the wheel to arrows fires for every alt-screen
+    // app and an app like claude reads those arrows as input-cursor movement,
+    // not scroll — which is the "scroll sends arrows / doesn't scroll" report.
+    // The explicit fallback below uses PageUp/PageDown instead, so an
+    // unsupported agent/TUI still scrolls without reviving the arrow-key bug.
+    let Some(out) = encode_native_wheel(
+        *mode,
+        delta_lines,
+        col,
+        row,
+        s.cols,
+        s.rows,
+        fallback_page_scroll.unwrap_or(false),
+    ) else {
+        return Ok(());
+    };
     s.pty_writer.write_all(&out).map_err(|e| e.to_string())?;
     s.pty_writer.flush().map_err(|e| e.to_string())?;
     Ok(())
@@ -4122,6 +4155,55 @@ mod tests {
         assert_eq!(rows.len(), LINES);
         assert!(row_text(&rows[0]).starts_with("line-00000"));
         assert!(row_text(rows.last().unwrap()).starts_with("line-10049"));
+    }
+
+    /* ---------- native wheel delivery ---------- */
+
+    #[test]
+    fn native_wheel_uses_sgr_mouse_when_the_app_requested_it() {
+        let out = encode_native_wheel(
+            TermMode::SGR_MOUSE,
+            -2,
+            7,
+            9,
+            80,
+            24,
+            true,
+        )
+        .expect("mouse-aware app must receive wheel bytes");
+        assert_eq!(out, b"\x1b[<64;7;9M\x1b[<64;7;9M");
+    }
+
+    #[test]
+    fn native_wheel_page_fallback_is_explicitly_gated() {
+        assert_eq!(
+            encode_native_wheel(TermMode::empty(), -3, 1, 1, 80, 24, true),
+            Some(b"\x1b[5~".to_vec()),
+        );
+        assert_eq!(
+            encode_native_wheel(TermMode::empty(), 3, 1, 1, 80, 24, true),
+            Some(b"\x1b[6~".to_vec()),
+        );
+        assert_eq!(
+            encode_native_wheel(TermMode::empty(), -3, 1, 1, 80, 24, false),
+            None,
+            "callers that did not opt in must not receive navigation keys",
+        );
+    }
+
+    #[test]
+    fn native_wheel_clamps_mouse_coordinates_to_the_pty_grid() {
+        let out = encode_native_wheel(
+            TermMode::SGR_MOUSE,
+            1,
+            u16::MAX,
+            0,
+            80,
+            24,
+            false,
+        )
+        .expect("mouse-aware app must receive wheel bytes");
+        assert_eq!(out, b"\x1b[<65;80;1M");
     }
 
     /// `pty_in_raw_mode` is the mechanism behind routing direct input to

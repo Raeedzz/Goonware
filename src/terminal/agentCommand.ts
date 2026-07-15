@@ -54,36 +54,147 @@ function unquoteShellWord(word: string): string {
   return word;
 }
 
-/**
- * Make Codex use the terminal's normal buffer so its conversation participates
- * in Goonware's native transcript scrollback, just like Claude's output does.
- *
- * Codex defaults to the alternate screen. It does not enable mouse reporting,
- * so Goonware's safe alt-screen wheel bridge has nothing to forward and a wheel
- * gesture is a no-op. Codex's supported `--no-alt-screen` switch is the correct
- * integration point: output then enters alacritty scrollback and is handled by
- * the existing `term_native_scroll` path.
- */
-export function makeCodexScrollable(input: string): string {
+type LaunchWrapper = "command" | "exec" | "time" | "noglob";
+
+function isLaunchWrapper(word: string): word is LaunchWrapper {
+  return (
+    word === "command" ||
+    word === "exec" ||
+    word === "time" ||
+    word === "noglob"
+  );
+}
+
+function findExecutable(input: string): {
+  spans: Array<{ start: number; end: number }>;
+  executable?: { start: number; end: number };
+} {
   const spans = shellWordSpans(input);
-  let executable: { start: number; end: number } | undefined;
+  let insideEnv = false;
+  let skipEnvOptionValue = false;
+  let wrapper: LaunchWrapper | null = null;
+  let skipWrapperOptionValue = false;
 
   for (const span of spans) {
     const word = input.slice(span.start, span.end);
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) continue;
-    executable = span;
-    break;
+    const rawWord = unquoteShellWord(word);
+
+    if (insideEnv) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) continue;
+      if (skipEnvOptionValue) {
+        skipEnvOptionValue = false;
+        continue;
+      }
+      if (
+        ["-u", "--unset", "-C", "--chdir", "-S", "--split-string"].includes(
+          rawWord,
+        )
+      ) {
+        skipEnvOptionValue = true;
+        continue;
+      }
+      if (rawWord === "--" || rawWord.startsWith("-")) continue;
+      insideEnv = false;
+    } else if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
+      continue;
+    }
+
+    if (wrapper) {
+      if (skipWrapperOptionValue) {
+        skipWrapperOptionValue = false;
+        continue;
+      }
+      if (wrapper === "command") {
+        // `command -v/-V` inspects a name; it does not launch it.
+        if (rawWord === "-v" || rawWord === "-V") return { spans };
+        if (rawWord === "-p") continue;
+      } else if (wrapper === "exec") {
+        if (rawWord === "-a") {
+          skipWrapperOptionValue = true;
+          continue;
+        }
+        if (/^-[cl]+$/.test(rawWord)) continue;
+      } else if (wrapper === "time") {
+        if (["-o", "--output", "-f", "--format"].includes(rawWord)) {
+          skipWrapperOptionValue = true;
+          continue;
+        }
+        if (rawWord.startsWith("-")) continue;
+      }
+      if (rawWord === "--") {
+        wrapper = null;
+        continue;
+      }
+      if (rawWord.startsWith("-")) return { spans };
+      wrapper = null;
+    }
+
+    // Common shell launch wrappers are transparent for command detection.
+    if (isLaunchWrapper(rawWord)) {
+      wrapper = rawWord;
+      continue;
+    }
+    if (rawWord === "env") {
+      insideEnv = true;
+      continue;
+    }
+    return { spans, executable: span };
   }
+
+  return { spans };
+}
+
+export type DetectedAgentCommand =
+  | "claude"
+  | "codex"
+  | "gemini"
+  | "aider"
+  | "copilot";
+
+/**
+ * Codex already renders its own activity state inline, so duplicating it in
+ * pane chrome wastes space and can steal the wheel hit area. Other agents keep
+ * the existing status/permission strip; an unknown kind stays visible so the
+ * generic pending state does not regress while detection catches up.
+ */
+/** Detect the foreground agent behind env assignments and common shell wrappers. */
+export function detectAgentCommand(input: string): DetectedAgentCommand | null {
+  const { executable } = findExecutable(input);
+  if (!executable) return null;
+  const raw = unquoteShellWord(input.slice(executable.start, executable.end));
+  const basename = (raw.split("/").pop() ?? raw).split(/[?#]/)[0].toLowerCase();
+  if (basename === "claude" || basename === "claude-code") return "claude";
+  if (basename === "codex" || basename === "codex-cli") return "codex";
+  if (basename === "gemini" || basename === "gemini-cli") return "gemini";
+  if (basename === "aider" || basename.startsWith("aider-")) return "aider";
+  if (basename === "copilot" || basename === "github-copilot") return "copilot";
+  return null;
+}
+
+/**
+ * Make Codex use the terminal's normal buffer so its conversation participates
+ * in Goonware's native transcript scrollback.
+ *
+ * Codex defaults to the alternate screen. It does not enable mouse reporting,
+ * so the safe alt-screen wheel bridge has nothing to forward and a wheel
+ * gesture becomes a no-op. Codex's supported `--no-alt-screen` switch writes
+ * output into normal PTY scrollback, which the native transcript already owns.
+ */
+export function makeCodexScrollable(input: string): string {
+  const { spans, executable } = findExecutable(input);
   if (!executable) return input;
 
   const rawExecutable = unquoteShellWord(
     input.slice(executable.start, executable.end),
   );
-  const basename = rawExecutable.split("/").pop() ?? rawExecutable;
+  const basename = (
+    rawExecutable.split("/").pop() ?? rawExecutable
+  ).toLowerCase();
   if (basename !== "codex" && basename !== "codex-cli") return input;
 
   const alreadyInline = spans.some(
-    ({ start, end }) => input.slice(start, end) === "--no-alt-screen",
+    ({ start, end }) =>
+      unquoteShellWord(input.slice(start, end)) === "--no-alt-screen",
   );
   if (alreadyInline) return input;
 

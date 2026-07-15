@@ -42,19 +42,19 @@ import {
   deriveInputMode,
   nextRawLatch,
 } from "./inputModeDecision";
-import { makeCodexScrollable } from "./agentCommand";
-import { shouldPreserveTerminalSelection } from "./terminalClickFocus";
+import {
+  detectAgentCommand,
+  makeCodexScrollable,
+} from "./agentCommand";
+import {
+  focusTerminalInputLayer,
+  shouldPreserveTerminalSelection,
+} from "./terminalClickFocus";
+import { createNativeWheelBridge } from "./nativeWheelBridge";
 
 /** Command names that always run as an interactive TUI agent. */
 function isAgentCommand(command: string): boolean {
-  const c = command.toLowerCase();
-  return (
-    c === "claude" ||
-    c.includes("codex") ||
-    c.includes("aider") ||
-    c === "gemini" ||
-    c === "gemini-cli"
-  );
+  return detectAgentCommand(command) !== null;
 }
 
 export type DetectedAgentCli = "claude" | "codex" | "gemini" | null;
@@ -64,17 +64,8 @@ export type DetectedAgentCli = "claude" | "codex" | "gemini" | null;
  * and absolute-path wrappers. Returns null for non-agent commands.
  */
 function detectCliFromCommandLine(line: string): DetectedAgentCli {
-  const tokens = line.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  for (const t of tokens) {
-    if (/^[a-z_][a-z0-9_]*=/i.test(t)) continue;
-    const prog = (t.split("/").pop() ?? t).split(/[?#]/)[0];
-    if (prog === "claude" || prog === "claude-code") return "claude";
-    if (prog.startsWith("codex")) return "codex";
-    if (prog === "gemini" || prog === "gemini-cli") return "gemini";
-    if (prog.startsWith("aider")) return null; // aider isn't in the helper roster
-    return null;
-  }
-  return null;
+  const agent = detectAgentCommand(line);
+  return agent === "aider" || agent === "copilot" ? null : agent;
 }
 
 /**
@@ -83,7 +74,7 @@ function detectCliFromCommandLine(line: string): DetectedAgentCli {
  * from {@link detectCliFromCommandLine}.
  */
 function commandLineIsAgent(line: string): boolean {
-  return detectCliFromCommandLine(line) !== null;
+  return detectAgentCommand(line) !== null;
 }
 
 interface Props {
@@ -331,7 +322,6 @@ export function BlockTerminal({
     if (initialAgentRunning && initialAgentCli) return initialAgentCli;
     return "";
   });
-
   // Tell the parent (which dispatches into session state) every time
   // the foreground-agent flag flips. Done in an effect rather than
   // inside setForegroundIsAgent calls so we don't have to remember
@@ -354,7 +344,7 @@ export function BlockTerminal({
   // The registry is keyed by the stable tab id; the closure picks
   // PromptInput vs PtyPassthrough at the moment focus is requested.
   const foregroundIsAgentRef = useRef(foregroundIsAgent);
-  useEffect(() => {
+  useLayoutEffect(() => {
     foregroundIsAgentRef.current = foregroundIsAgent;
   }, [foregroundIsAgent]);
   // Same latest-value-without-re-registration trick for "is PtyPassthrough
@@ -365,15 +355,16 @@ export function BlockTerminal({
   // `passthroughActive` is computed.
   const passthroughActiveRef = useRef(false);
 
-  // One focus path for tab switches and pointer clicks. The refs let this
-  // always target whichever input layer is mounted right now, including raw
-  // inline prompts that use PtyPassthrough without setting agent mode.
+  // One focus path for tab switches and pointer clicks. The refs always target
+  // whichever input layer is mounted right now, including the brief alt-screen
+  // / raw-prompt transitions where agent detection can lag by one frame.
   const focusTerminalInput = useCallback(() => {
-    if (foregroundIsAgentRef.current || passthroughActiveRef.current) {
-      passthroughRef.current?.focus();
-    } else {
-      promptRef.current?.focus();
-    }
+    focusTerminalInputLayer({
+      passthroughPreferred:
+        foregroundIsAgentRef.current || passthroughActiveRef.current,
+      passthrough: passthroughRef.current,
+      prompt: promptRef.current,
+    });
   }, []);
 
   // Register a focus function for this terminal's tab id, so the
@@ -538,8 +529,8 @@ export function BlockTerminal({
 
   // Sustained anchor while stick-to-bottom is true: ANY growth of the
   // scroll container's content (BlockList row added, LiveBlock body
-  // tall canvas mid-bootstrap, etc.) re-snaps scrollTop to the new
-  // scrollHeight. Without
+  // tall canvas mid-bootstrap, async block hydration, etc.) re-snaps
+  // scrollTop to the new scrollHeight. Without
   // this, the user-reported "open a new claude and it glitches
   // halfway up the pane" bug fires whenever the LiveBlock fill mode
   // settles AFTER the layout-effect snap above has already run — the
@@ -667,7 +658,7 @@ export function BlockTerminal({
       if (!(target instanceof Element)) return false;
       return Boolean(
         target.closest(
-          "canvas, input, textarea, button, select, [contenteditable=true], [role='button']",
+          "canvas, input, textarea, button, select, [contenteditable], [role='button']",
         ),
       );
     };
@@ -819,7 +810,7 @@ export function BlockTerminal({
     foregroundIsAgent,
     nativeSurface,
   });
-  useEffect(() => {
+  useLayoutEffect(() => {
     passthroughActiveRef.current = passthroughActive;
   }, [passthroughActive]);
 
@@ -846,6 +837,27 @@ export function BlockTerminal({
   // (nativeSurface=false) keep CanvasGrid for both display and input.
   const nativeActive = nativeSurface;
 
+  // Latest routing snapshot for the stable pane-level wheel bridge. Layout
+  // synchronization closes the mode-transition window before the next paint,
+  // while the bridge snapshots each event so a later tab flip cannot reroute it.
+  const nativeWheelSnapshotRef = useRef({
+    altScreen,
+    // PageUp/PageDown is the universal fallback when an alt-screen program did
+    // not request mouse reporting. It fires only after an explicit wheel
+    // gesture; mouse-aware agents still receive their native SGR wheel packets.
+    fallbackPageScroll: true,
+    paneKey,
+    ptyId,
+  });
+  useLayoutEffect(() => {
+    nativeWheelSnapshotRef.current = {
+      altScreen,
+      fallbackPageScroll: true,
+      paneKey,
+      ptyId,
+    };
+  }, [altScreen, paneKey, ptyId]);
+
   // Autofocus the invisible PtyPassthrough whenever an inline agent engages on
   // the visible pane. With the native surface rendering the agent through a
   // transparent hole there's no visible element to click, so nothing would
@@ -863,144 +875,45 @@ export function BlockTerminal({
     return () => clearTimeout(t);
   }, [isVisible, passthroughActive]);
 
-  // Scroll-back wheel bridge. The native surface renders the shell transcript
-  // through a transparent hole; the embedded child window has
-  // `ignoresMouseEvents: YES`, so wheel events land on this (invisible) React
-  // scroll container instead. Forward the delta to the native
-  // `ClippedScrollable` via `term_native_scroll` and swallow it so the empty
-  // container doesn't also scroll. Only while the native surface owns the
-  // SHELL transcript: agent / alt-screen panes keep their own React scrolling
-  // (and the native render ignores the offset there anyway). A NON-passive
-  // listener is required — React's synthetic `onWheel` is passive, so
-  // `preventDefault` would no-op. `deltaY > 0` (scroll down) advances toward
-  // newer output; the Rust side drops stick-to-bottom and re-arms it when the
-  // user scrolls back down or the content fits.
-  useEffect(() => {
-    const el = scrollContainerRef.current;
-    // Active for the native transcript: the shell history AND inline agents
-    // (claude/codex in the NORMAL screen). An inline agent's conversation
-    // scrolls off into PTY scroll-back, which the native renderer mirrors into
-    // the transcript flow — so the wheel drives `term_native_scroll` to move
-    // through it, exactly like scrolling up in a real terminal. Only ALT-SCREEN
-    // apps (vim/htop, or an agent that took the alt screen) own their own
-    // scroll; those are handled by the agent-wheel bridge below, so bail here.
-    if (!el || !nativeActive || altScreen) return;
-    // Coalesce to ONE batched scroll per animation frame. Each invoke pokes a
-    // full native re-render of the transcript; one per wheel event (60–120/sec
-    // on a trackpad) floods the main thread and the scroll-back stutters.
-    // Accumulate the pixel delta and flush once per rAF (display refresh) so the
-    // transcript re-renders at most ~60fps with the summed delta — smooth.
-    let accumPx = 0;
-    let accumPxX = 0;
-    let raf = 0;
-    const flush = () => {
-      raf = 0;
-      // Vertical pan (always meaningful) and horizontal pan (only when the grid
-      // is wider than the pane — the native renderer builds the horizontal
-      // ClippedScrollable then; a no-op otherwise). Each axis is sent only when
-      // it actually moved, so a pure vertical scroll never fires an hscroll.
-      if (accumPx !== 0) {
-        const px = accumPx;
-        accumPx = 0;
-        invoke("term_native_scroll", { paneKey, deltaPx: px }).catch(() => {});
-      }
-      if (accumPxX !== 0) {
-        const px = accumPxX;
-        accumPxX = 0;
-        invoke("term_native_hscroll", { paneKey, deltaPx: px }).catch(() => {});
-      }
-    };
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      // Most devices report pixels (deltaMode 0); convert line/page deltas.
-      accumPx +=
-        e.deltaMode === 1
-          ? e.deltaY * 16
-          : e.deltaMode === 2
-            ? e.deltaY * (el.clientHeight || 400)
-            : e.deltaY;
-      accumPxX +=
-        e.deltaMode === 1
-          ? e.deltaX * 16
-          : e.deltaMode === 2
-            ? e.deltaX * (el.clientWidth || 400)
-            : e.deltaX;
-      if (!raf) raf = requestAnimationFrame(flush);
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => {
-      el.removeEventListener("wheel", onWheel);
-      if (raf) cancelAnimationFrame(raf);
-    };
-  }, [nativeActive, altScreen, paneKey]);
-
-  // Alt-screen wheel → forward to the PTY so a full-screen app (vim/htop, or an
-  // agent that took the ALT screen) scrolls ITS OWN view — exactly like a real
-  // terminal. ONLY alt-screen: an INLINE agent (claude/codex in the normal
-  // screen) has no internal scroll-back — its conversation scrolls into the PTY
-  // history, which the native renderer now mirrors into the transcript flow, so
-  // the shell-transcript bridge above drives `term_native_scroll` for it. Routing
-  // the inline-agent wheel to the PTY was the "can't scroll while claude runs"
-  // bug: the agent ignores it and nothing moves. term_native_wheel encodes
-  // SGR/X10 mouse-wheel bytes for mouse-aware apps and no-ops for the rest;
-  // pixel→notch conversion + the cell coords under the cursor (SF Mono 0.6em ×
-  // 1.3 line) are sent so apps scroll the right region.
+  // One listener covers the WHOLE native pane in every mode. The previous two
+  // listeners lived on different DOM nodes and were torn down/re-added whenever
+  // alt-screen changed, leaving real dead frames during agent startup/exit and
+  // leaving pane-edge chrome outside the scroll hit area.
   useEffect(() => {
     const el = containerRef.current;
-    if (!el || !nativeActive || !altScreen) return;
-    const CELL_W = 13 * 0.6;
-    const CELL_H = 13 * 1.3;
-    const LINE_PX = 16; // px of wheel travel per scroll line/notch
-    // Coalesce wheel input to ONE batched scroll per animation frame. A trackpad
-    // fires 60–120 wheel events/sec; sending an invoke + a full PTY redraw for
-    // each floods the round-trip and Claude scrolls in lurches ("low
-    // framerate"). Accumulating the delta and flushing once per rAF caps it to
-    // the display refresh, keeps sub-line precision (the remainder carries), and
-    // collapses a burst into a single proportional scroll — smooth + cheap.
-    const MAX_LINES_PER_FRAME = 6; // cap per frame so a fast flick stays smooth
-    let accumPx = 0;
-    let raf = 0;
-    let col = 1;
-    let row = 1;
-    const flush = () => {
-      raf = 0;
-      const want = Math.trunc(accumPx / LINE_PX);
-      if (want === 0) return;
-      const lines = Math.max(
-        -MAX_LINES_PER_FRAME,
-        Math.min(MAX_LINES_PER_FRAME, want),
-      );
-      accumPx -= lines * LINE_PX;
-      invoke("term_native_wheel", { id: ptyId, deltaLines: lines, col, row }).catch(
-        () => {},
-      );
-      // Any native selection stays glued to its text without our help: the Rust
-      // frame sink measures how far the app actually scrolled (content match)
-      // and shifts the selection anchors to match. We used to guess the distance
-      // here from `lines`, which drifted whenever the app scrolled ≠1 row/notch.
-      // Drain a fast flick across subsequent frames (momentum) rather than one
-      // big jump — smooth deceleration.
-      if (Math.abs(accumPx) >= LINE_PX) raf = requestAnimationFrame(flush);
+    if (!el || !nativeActive) return;
+    const bridge = createNativeWheelBridge({
+      getSnapshot: () => {
+        const rect = el.getBoundingClientRect();
+        return {
+          ...nativeWheelSnapshotRef.current,
+          left: rect.left,
+          top: rect.top,
+          width: el.clientWidth || rect.width || 400,
+          height: el.clientHeight || rect.height || 400,
+        };
+      },
+      invokeCommand: (command, payload) => invoke(command, payload),
+    });
+    const onWheel = (event: WheelEvent) => {
+      // Preserve native scrolling inside the visible shell textarea/editor.
+      // Agent passthrough inputs are off-screen and pointer-inert, so agent-pane
+      // wheel events always reach the bridge.
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest("textarea, input, select, [contenteditable]")
+      ) {
+        return;
+      }
+      bridge.handleWheel(event);
     };
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      accumPx +=
-        e.deltaMode === 1
-          ? e.deltaY * 16
-          : e.deltaMode === 2
-            ? e.deltaY * (el.clientHeight || 400)
-            : e.deltaY;
-      const rect = el.getBoundingClientRect();
-      col = Math.max(1, Math.floor((e.clientX - rect.left) / CELL_W) + 1);
-      row = Math.max(1, Math.floor((e.clientY - rect.top) / CELL_H) + 1);
-      if (!raf) raf = requestAnimationFrame(flush);
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
+    el.addEventListener("wheel", onWheel, { passive: false, capture: true });
     return () => {
-      el.removeEventListener("wheel", onWheel);
-      if (raf) cancelAnimationFrame(raf);
+      el.removeEventListener("wheel", onWheel, true);
+      bridge.dispose();
     };
-  }, [nativeActive, altScreen, ptyId, paneKey]);
+  }, [nativeActive]);
 
   // Selection mouse bridge. Same situation as the wheel bridge: the native
   // surface renders through a transparent hole and ignores mouse events, so
@@ -1124,9 +1037,13 @@ export function BlockTerminal({
           wheelAccumPx -= lines * DRAG_LINE_PX;
           const col = Math.max(1, Math.floor((lastX - r.left) / CELL_W) + 1);
           const row = Math.max(1, Math.floor((edgeY - r.top) / CELL_H) + 1);
-          invoke("term_native_wheel", { id: ptyId, deltaLines: lines, col, row }).catch(
-            () => {},
-          );
+          invoke("term_native_wheel", {
+            id: ptyId,
+            deltaLines: lines,
+            col,
+            row,
+            fallbackPageScroll: foregroundIsAgent,
+          }).catch(() => {});
         }
       } else {
         invoke("term_native_scroll", { paneKey, deltaPx: delta }).catch(() => {});
@@ -1209,6 +1126,11 @@ export function BlockTerminal({
     };
     const onDown = (e: globalThis.MouseEvent) => {
       if (e.button !== 0) return;
+      // Focus in the same capture-phase handler that owns native selection.
+      // Depending on a later React bubble handler leaves a WebKit-specific gap:
+      // preventDefault() below can preserve selection while the invisible
+      // passthrough textarea never becomes the keyboard target.
+      focusTerminalInput();
       e.preventDefault();
       dragging = true;
       startX = e.clientX;
@@ -1236,7 +1158,15 @@ export function BlockTerminal({
       window.removeEventListener("mouseup", onUp, true);
       if (autoRaf) cancelAnimationFrame(autoRaf);
     };
-  }, [nativeActive, agentMode, altScreen, foregroundIsAgent, paneKey, ptyId]);
+  }, [
+    nativeActive,
+    agentMode,
+    altScreen,
+    foregroundIsAgent,
+    paneKey,
+    ptyId,
+    focusTerminalInput,
+  ]);
 
   // Cmd+C copies the native selection (kept by warpui's SelectableArea, exposed
   // via term_native_selection_text) through the existing pbcopy path. Capture-
@@ -1330,10 +1260,9 @@ export function BlockTerminal({
 
   // Report this scroll container's region (top offset within the pane + height)
   // to the native surface, so native content pins to exactly it: the shell
-  // transcript sits just above the input bar, while an agent grid claims the
-  // full terminal viewport. The native surface still spans the whole pane; this
-  // only bounds the content. Covers shell AND agent and re-reports on resize or
-  // mode changes.
+  // transcript sits just above the input bar while an agent gets the full pane.
+  // The native surface still spans the whole pane; this only bounds the content.
+  // Covers shell and agent modes and re-reports when their layout changes.
   useEffect(() => {
     const el = scrollContainerRef.current;
     if (!el || !nativeActive) return;
@@ -1435,10 +1364,10 @@ export function BlockTerminal({
       // the terminal grid (38px + a 6px breathing strip = 44).
       const inputChrome = agentMode ? 44 : 80;
       const liveBlockChrome = 50;
-      // A NATIVE agent pane has no terminal chrome: the input bar is hidden and
-      // the live block is opacity:0. Reserving their heights would shrink the
-      // agent PTY below the pane the native surface actually fills and leave a
-      // black gap above it, so native agents reserve zero pixels here.
+      // Native agents have no extra webview chrome. The input bar is hidden and
+      // the live block is transparent, so reserving either height would shrink
+      // the PTY and leave a dead band above the agent. Non-native panes still
+      // reserve their real status and live-block chrome.
       const reserved =
         agentMode && nativeSurface
           ? 0
@@ -1614,7 +1543,13 @@ export function BlockTerminal({
       observer.disconnect();
       if (timerId !== null) window.clearTimeout(timerId);
     };
-  }, [resize, agentMode, foregroundIsAgent, allowHorizontalScroll, nativeSurface]);
+  }, [
+    resize,
+    agentMode,
+    foregroundIsAgent,
+    allowHorizontalScroll,
+    nativeSurface,
+  ]);
 
   // Sniff the live frame for the Claude banner so the 5h usage bar
   // attaches automatically AND we know to hide PromptInput in favor
@@ -1843,12 +1778,10 @@ export function BlockTerminal({
         sniffBufferRef.current = "";
         setForegroundIsAgent(true);
       }
-      // Codex defaults to the alternate screen but does not enable mouse
-      // reporting there, making wheel gestures a no-op. Its supported inline
-      // mode writes the conversation into normal PTY scrollback, which our
-      // native transcript already scrolls smoothly (the same path Claude uses).
-      // Keep `text` as the display/history value; only the bytes sent to the
-      // shell receive the integration flag.
+      // Codex's default alternate screen does not request mouse reporting, so
+      // wheel gestures have nothing safe to forward. Run it in its supported
+      // inline mode so output enters the native transcript's scrollback. Keep
+      // the user's original command as the visible block/history value.
       void sendLine(text, makeCodexScrollable(text));
       if (text.trim().length > 0) {
         setHistory((prev) => {
@@ -2104,11 +2037,9 @@ export function BlockTerminal({
     [history],
   );
 
-  // Don't steal focus from a text selection made in THIS terminal. A selection
-  // left behind in another pane must not block this terminal from taking focus;
-  // that was the intermittent "clicked main, still typing in the side pane"
-  // failure. Click into empty terminal space → focus the currently-mounted
-  // input layer so typing "just works".
+  // Don't steal focus from a selection made in THIS terminal. A stale
+  // selection in another pane must not block the main terminal from taking
+  // focus. Empty-space clicks focus whichever input layer is mounted now.
   const onContainerMouseUp = (e: MouseEvent<HTMLDivElement>) => {
     const sel = window.getSelection();
     const container = containerRef.current;
@@ -2136,9 +2067,27 @@ export function BlockTerminal({
   // Fires on every mousedown inside the container — including drag-
   // selections in closed blocks, which is exactly the path where focus
   // drifts to document.body and the textarea handlers stop firing.
-  const onContainerMouseDown = useCallback(() => {
-    markTerminalInteracted(id);
-  }, [id]);
+  const onContainerMouseDown = useCallback(
+    (e: MouseEvent<HTMLDivElement>) => {
+      markTerminalInteracted(id);
+      // The native child window is click-through and the selection bridge calls
+      // preventDefault on mousedown. Focus here, before waiting for mouseup, so
+      // neither behavior can leave an agent pane inert. Visible editable/control
+      // targets retain their own normal focus semantics.
+      if (!nativeActive || e.button !== 0) return;
+      const target = e.target;
+      if (
+        target instanceof Element &&
+        target.closest(
+          "textarea, input, button, select, [contenteditable], [role='button']",
+        )
+      ) {
+        return;
+      }
+      focusTerminalInput();
+    },
+    [id, nativeActive, focusTerminalInput],
+  );
 
   // Window-level Ctrl+C fallback — handles the "focus drifted to
   // document.body after a drag-selection" case. Encoding is pinned
