@@ -1,9 +1,23 @@
 import { describe, expect, test } from "bun:test";
 import {
+  classifyPromptSubmission,
   deriveInputMode,
   nextRawLatch,
   type InputModeInput,
 } from "./inputModeDecision";
+
+describe("classifyPromptSubmission", () => {
+  test("idle input is a new shell command", () => {
+    expect(classifyPromptSubmission(false)).toBe("shell-command");
+  });
+
+  test("a line entered for a running command is foreground stdin", () => {
+    // Canonical prompts such as `gh auth login` may ask for `Y` + Enter
+    // without putting the tty into raw mode. The answer must go to gh, not
+    // command history or the pending label for the next shell block.
+    expect(classifyPromptSubmission(true)).toBe("foreground-stdin");
+  });
+});
 
 // A bare interactive shell prompt: zsh's ZLE holds the tty in raw mode
 // (rawInput true) even though no command is running. This MUST stay in

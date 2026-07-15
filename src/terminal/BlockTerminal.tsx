@@ -37,7 +37,11 @@ import {
   agentScrollContainerStyle,
   shouldRenderBlockList,
 } from "./agentScrollLayout";
-import { deriveInputMode, nextRawLatch } from "./inputModeDecision";
+import {
+  classifyPromptSubmission,
+  deriveInputMode,
+  nextRawLatch,
+} from "./inputModeDecision";
 import { makeCodexScrollable } from "./agentCommand";
 import { shouldPreserveTerminalSelection } from "./terminalClickFocus";
 
@@ -185,6 +189,7 @@ interface Props {
 const DEFAULT_ROWS = 32;
 const DEFAULT_COLS = 100;
 const BELL_FLASH_MS = 480;
+const terminalEncoder = new TextEncoder();
 
 /**
  * Custom block-mode terminal backed by alacritty_terminal in Rust.
@@ -1796,6 +1801,17 @@ export function BlockTerminal({
 
   const onSubmit = useCallback(
     (text: string) => {
+      // PromptInput also serves canonical foreground prompts. A program such
+      // as `gh auth login` can ask for `Y` + Enter without switching the tty
+      // to raw mode, so the visible editor remains mounted. Send that answer
+      // straight to the existing foreground process and do NOT enqueue it as
+      // a new shell command; doing the latter mislabels the next OSC 133 block
+      // and pollutes command history with prompt answers (or secrets).
+      if (classifyPromptSubmission(commandRunning) === "foreground-stdin") {
+        onSendBytesVoid(terminalEncoder.encode(`${text}\n`));
+        return;
+      }
+
       // A new submission re-enables agent auto-detection that a prior
       // force-kill suppressed — so re-running `claude` foregrounds again.
       forceKilledRef.current = false;
@@ -1842,7 +1858,7 @@ export function BlockTerminal({
         });
       }
     },
-    [sendLine, id],
+    [commandRunning, onSendBytesVoid, sendLine, id],
   );
 
   // Click a past block's command line → lift it into the PromptInput

@@ -19,6 +19,7 @@
 //! `Container`, inverse/dim folded into colors), with a block cursor.
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use warpui::color::ColorU;
@@ -81,15 +82,6 @@ const BLOCK_PAD_X: f32 = 14.0;
 const BLOCK_PAD_Y: f32 = 8.0;
 /// Width (px) of the red left stripe on a failed block.
 const STRIPE_W: f32 = 2.0;
-/// How many of the newest closed blocks the scroll-back can page through.
-/// Matches the persistence restore window (`HISTORY_LOAD_WINDOW = 500`), so the
-/// user can scroll through their entire restored history. This is NO LONGER a
-/// performance bound — transcript virtualization makes each frame O(viewport)
-/// regardless of depth, and each block's height is cached (`NativeBlock.height`)
-/// so the per-frame height sweep is O(blocks), not O(rows). Older history beyond
-/// this stays on disk and would need a deeper load window to surface.
-const BLOCK_RENDER_CAP: usize = 500;
-
 /* ------------------------------------------------------------------
    Assets — warpui loads fonts from the OS, so the embedded surface
    needs no bundled assets. Surface a clear error if it asks for one.
@@ -113,6 +105,9 @@ impl warpui::AssetProvider for TermAssets {
 /// per-block grid snapshot (`block_rows` from term.rs) plus header metadata.
 /// Stacked above the live grid by `render`, oldest first — the Warp transcript.
 struct NativeBlock {
+    /// Stable per-PTY identity. Used to merge a background SQLite hydration
+    /// with blocks that may have closed while that read was in flight.
+    block_id: u64,
     command: String,
     rows: Vec<RowSnapshot>,
     /// The block's raw output transcript (bytes, with ANSI + hard newlines).
@@ -135,6 +130,7 @@ struct NativeBlock {
 
 impl NativeBlock {
     fn new(
+        block_id: u64,
         command: String,
         rows: Vec<RowSnapshot>,
         transcript: String,
@@ -143,6 +139,7 @@ impl NativeBlock {
         exit_code: Option<i32>,
     ) -> Self {
         let mut b = Self {
+            block_id,
             command,
             rows,
             transcript,
@@ -188,6 +185,11 @@ struct TermGrid {
     /// into the `ClippedScrollStateHandle` each render. Only meaningful while
     /// `stick_bottom` is false.
     scroll_px: f32,
+    /// Canonical maximum vertical offset computed from transcript height minus
+    /// viewport height during render. Wheel input uses this instead of reading
+    /// `ClippedScrollStateHandle`, whose temporary 1e9 bottom sentinel can be
+    /// observed before layout clamps it and make an upward gesture snap back.
+    max_scroll_px: f32,
     /// When true (the default), the transcript auto-follows new output: render
     /// hands the scroll handle a huge sentinel offset that `after_layout` clamps
     /// to the true bottom, so the newest line is always pinned to the viewport
@@ -196,6 +198,15 @@ struct TermGrid {
     stick_bottom: bool,
     /// Frames applied since attach — diagnostic only.
     frames: u64,
+    /// Whether persisted closed blocks have been hydrated for this PTY. Live
+    /// frames can create a hidden snapshot before its history is loaded; the
+    /// attach path paints that snapshot immediately and hydrates history off
+    /// the interaction path.
+    history_loaded: bool,
+    /// Direct-launched agents have no OSC 133 block id. Preserve their normal-
+    /// screen scrollback while hidden once the visible pane has identified the
+    /// session as an agent.
+    retain_unscoped_scrollback: bool,
 }
 
 impl TermGrid {
@@ -213,15 +224,18 @@ impl TermGrid {
             scrollback: Vec::new(),
             live_block_id: 0,
             scroll_px: 0.0,
+            max_scroll_px: 0.0,
             stick_bottom: true,
             frames: 0,
+            history_loaded: false,
+            retain_unscoped_scrollback: false,
         }
     }
 
     /// Apply a sparse frame: resize to the frame's grid height, overwrite the
     /// dirty rows, and track cursor + dims + the live-grid gate flags. Cheap —
     /// clones only changed rows.
-    fn apply_frame(&mut self, f: &RenderFrame) {
+    fn apply_frame(&mut self, f: &RenderFrame, retain_unscoped_scrollback: bool) {
         if self.n_rows != f.rows {
             self.rows
                 .resize(f.rows as usize, RowSnapshot { spans: Vec::new() });
@@ -255,13 +269,17 @@ impl TermGrid {
         //   - a new `block_id` (new prompt/command, or the block closing to 0) →
         //      drop, since a closed command's output is rendered from its own
         //      closed-block transcript and would otherwise appear twice.
-        // We only retain while a block is live (`block_id != 0`); idle-shell
-        // scroll deltas are dropped (closed blocks carry that history).
+        // We normally retain while a shell block is live (`block_id != 0`);
+        // idle-shell scroll deltas are dropped because closed blocks carry that
+        // history. A directly-launched agent has no shell OSC 133 lifecycle,
+        // however, so every frame has block_id=0. The pane's explicit agent-mode
+        // bit keeps that session's normal-screen history instead of silently
+        // limiting it to the visible grid.
         if f.scrollback_reset || f.block_id != self.live_block_id {
             self.scrollback.clear();
         }
         self.live_block_id = f.block_id;
-        if f.block_id != 0 && !f.alt_screen {
+        if (f.block_id != 0 || retain_unscoped_scrollback) && !f.alt_screen {
             self.scrollback.reserve(f.scrollback_appended.len());
             for d in &f.scrollback_appended {
                 self.scrollback.push(RowSnapshot {
@@ -273,22 +291,37 @@ impl TermGrid {
         self.frames = self.frames.wrapping_add(1);
     }
 
+    /// Apply one vertical scroll delta against canonical transcript geometry.
+    /// Positive moves toward newer output; negative reveals older output.
+    fn scroll_by(&mut self, delta_px: f32) {
+        if self.max_scroll_px <= 0.0 {
+            self.scroll_px = 0.0;
+            self.stick_bottom = true;
+            return;
+        }
+        let current = if self.stick_bottom {
+            self.max_scroll_px
+        } else {
+            self.scroll_px
+        };
+        self.scroll_px = (current + delta_px).clamp(0.0, self.max_scroll_px);
+        self.stick_bottom = false;
+    }
+
     /// Re-wrap every stored closed block to `cols`, recomputing each cached
     /// height. This is the Warp reflow: a block keeps its raw `transcript`
     /// (bytes + hard newlines), so replaying it through the VT at the new width
     /// re-soft-wraps the text while real line breaks stay put — identical in
-    /// effect to Warp rebuilding its soft-wrap index. Bounded to the most-recent
-    /// `BLOCK_RENDER_CAP` (only those can be painted) and only invoked when the
-    /// width actually changes (the React resize is debounced), so it costs a
-    /// handful of replays per drag, not one per frame. Runs on the pty reader
-    /// thread (the frame sink), off the render thread.
+    /// effect to Warp rebuilding its soft-wrap index. Only invoked when the
+    /// width actually changes (the React resize is debounced). Runs on the pty
+    /// reader thread (the frame sink), off the render thread. Every retained
+    /// block is rewrapped because every retained block is scroll-reachable.
     fn rewrap_blocks(&mut self, cols: u16) {
         if cols == 0 {
             return;
         }
         let rows = self.n_rows.max(1);
-        let start = self.blocks.len().saturating_sub(BLOCK_RENDER_CAP);
-        for b in &mut self.blocks[start..] {
+        for b in &mut self.blocks {
             if b.transcript.is_empty() {
                 continue;
             }
@@ -308,8 +341,7 @@ struct Pane {
     /// Retained grid the frame sink patches and `build_pane_column` paints from.
     grid: Arc<Mutex<TermGrid>>,
     /// Scroll-back handle for this pane's `ClippedScrollable` (survives the
-    /// per-frame element rebuild; render mirrors scroll_px/stick_bottom in,
-    /// `term_native_scroll` reads the clamped offset back out).
+    /// per-frame element rebuild; render mirrors scroll_px/stick_bottom in).
     scroll: ClippedScrollStateHandle,
     /// Horizontal scroll-back handle for the panes whose PTY grid is wider than
     /// their on-screen width (the narrow right-panel side terminal pins a wide
@@ -391,6 +423,141 @@ fn pane(key: &str) -> &'static Pane {
 /// The pane currently mirroring `pty_id`, if any (frame/block sink routing).
 fn pane_for_pty(pty_id: &str) -> Option<&'static Pane> {
     panes().iter().find(|p| p.pty_id() == pty_id)
+}
+
+/// Retained native models for PTYs that are not currently assigned to a pane.
+/// A worktree switch moves the model between a pane and this map; it does not
+/// rebuild the model from SQLite. Hidden frame/block events keep these entries
+/// current at the backend's already-throttled hidden cadence.
+static HIDDEN_GRIDS: OnceLock<Mutex<HashMap<String, TermGrid>>> = OnceLock::new();
+static HISTORY_LOADS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Serializes the tiny ownership handoff between pane grids and hidden grids.
+/// Frame delivery, attach/detach, and background hydration can run on different
+/// threads; without one routing critical section, a completed history read
+/// could merge into a pane just after that pane switched to a different PTY.
+static GRID_ROUTING: Mutex<()> = Mutex::new(());
+
+fn hidden_grids() -> &'static Mutex<HashMap<String, TermGrid>> {
+    HIDDEN_GRIDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn history_loads() -> &'static Mutex<HashSet<String>> {
+    HISTORY_LOADS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn grid_has_retained_state(g: &TermGrid) -> bool {
+    g.history_loaded
+        || g.frames > 0
+        || !g.rows.is_empty()
+        || !g.blocks.is_empty()
+        || !g.scrollback.is_empty()
+}
+
+fn stash_pane_grid(pty_id: &str, p: &'static Pane) {
+    if pty_id.is_empty() {
+        return;
+    }
+    let old = {
+        let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut *g, TermGrid::empty())
+    };
+    // During a split-pane swap the destination steals the source grid before
+    // that source receives its own attach call. Do not overwrite the stolen,
+    // current cache entry with the empty placeholder left behind.
+    if grid_has_retained_state(&old) {
+        hidden_grids()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(pty_id.to_string(), old);
+    }
+}
+
+fn take_retained_grid(pty_id: &str, destination: &'static Pane) -> TermGrid {
+    // Split-pane swaps briefly ask one pane to display the PTY still owned by
+    // its sibling. Move that exact model instead of falling through to disk.
+    for source in panes() {
+        if std::ptr::eq(source, destination) || source.pty_id() != pty_id {
+            continue;
+        }
+        let mut g = source.grid.lock().unwrap_or_else(|e| e.into_inner());
+        return std::mem::replace(&mut *g, TermGrid::empty());
+    }
+    hidden_grids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(pty_id)
+        .unwrap_or_else(TermGrid::empty)
+}
+
+fn native_block_from_saved(sb: crate::persistence::SavedBlock) -> NativeBlock {
+    NativeBlock::new(
+        sb.block_id.max(0) as u64,
+        sb.input,
+        serde_json::from_value(sb.block_rows_json).unwrap_or_default(),
+        sb.transcript,
+        sb.cwd,
+        sb.duration_ms.map(|d| d.max(0) as u64),
+        sb.exit_code,
+    )
+}
+
+fn merge_saved_history(g: &mut TermGrid, saved: Vec<crate::persistence::SavedBlock>) {
+    let mut merged: Vec<NativeBlock> = saved.into_iter().map(native_block_from_saved).collect();
+    let mut ids: HashSet<u64> = merged.iter().map(|b| b.block_id).collect();
+    for block in std::mem::take(&mut g.blocks) {
+        if ids.insert(block.block_id) {
+            merged.push(block);
+        }
+    }
+    merged.sort_by_key(|b| b.block_id);
+    g.blocks = merged;
+    g.history_loaded = true;
+}
+
+/// Hydrate persisted history away from the instance-switch command. The pane
+/// paints its retained live model immediately; deep history joins it when the
+/// read finishes. `HISTORY_LOADS` deduplicates StrictMode/effect races.
+fn hydrate_history_in_background(pty_id: String) {
+    let should_start = history_loads()
+        .lock()
+        .map(|mut loads| loads.insert(pty_id.clone()))
+        .unwrap_or(false);
+    if !should_start {
+        return;
+    }
+    let Some(app) = APP_HANDLE.get().cloned() else {
+        if let Ok(mut loads) = history_loads().lock() {
+            loads.remove(&pty_id);
+        }
+        return;
+    };
+    std::thread::spawn(move || {
+        use tauri::Manager as _;
+        let saved = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| e.to_string())
+            .and_then(|dir| crate::persistence::load_blocks(&dir.join("goonware.db"), &pty_id));
+        let mut visible = false;
+        if let Ok(saved) = saved {
+            let _routing = GRID_ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(p) = pane_for_pty(&pty_id) {
+                let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
+                merge_saved_history(&mut g, saved);
+                visible = true;
+            } else {
+                let mut cache = hidden_grids().lock().unwrap_or_else(|e| e.into_inner());
+                let g = cache.entry(pty_id.clone()).or_insert_with(TermGrid::empty);
+                merge_saved_history(g, saved);
+            }
+        }
+        if let Ok(mut loads) = history_loads().lock() {
+            loads.remove(&pty_id);
+        }
+        if visible {
+            let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
+        }
+    });
 }
 
 /// Combined surface rect (window-content CSS px) = bounding box of the placed
@@ -1240,7 +1407,6 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
     let cursor_on = g.cursor_visible && g.cursor_row >= 0;
     let cursor_row = g.cursor_row.max(0) as usize;
     let cursor_col = g.cursor_col;
-    let n_blocks = g.blocks.len();
     // Reset hyperlink hit-zones each render; the active branch repopulates them
     // for the agent grid (shell mode leaves them empty — the Cmd-hover cursor is
     // an agent affordance, and shell links still Cmd-click via warpui).
@@ -1344,8 +1510,8 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
         // building everything (each spacer == `est_block_height`, which now
         // matches a block's true laid-out height) — but layout + paint drop to
         // O(viewport).
-        let start = n_blocks.saturating_sub(BLOCK_RENDER_CAP);
-        let mut heights: Vec<f32> = Vec::with_capacity(g.blocks.len() - start);
+        let start = 0;
+        let mut heights: Vec<f32> = Vec::with_capacity(g.blocks.len());
         let mut content_est = 0.0f32;
         for block in &g.blocks[start..] {
             content_est += block.height;
@@ -1423,6 +1589,7 @@ fn build_pane_column(p: &'static Pane, mono: FamilyId) -> Box<dyn Element> {
             // every scroll straight back to the bottom ("can't scroll").
             let fit_spacer = (content_vp - content_est).max(0.0);
             let max_scroll = (content_est - content_vp).max(0.0);
+            g.max_scroll_px = max_scroll;
             if content_est <= content_vp {
                 // Everything fits — nothing to scroll, pin to bottom.
                 g.stick_bottom = true;
@@ -1712,8 +1879,9 @@ pub fn attach(app: &tauri::AppHandle) {
     // thread: patch the shared grid, then poke a redraw on the main thread.
     let app_for_sink = app.clone();
     crate::term::set_native_frame_sink(Box::new(move |pty_id: &str, frame: &RenderFrame| {
+        let routing = GRID_ROUTING.lock().unwrap_or_else(|e| e.into_inner());
         // Route the frame to whichever pane mirrors this pty (main or side).
-        if let Some(p) = pane_for_pty(pty_id) {
+        let visible = if let Some(p) = pane_for_pty(pty_id) {
             let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
             // Alt-screen scroll-glue: an alt-screen app (git log / less / man /
             // vim / htop) repaints its grid in place when it scrolls, so a
@@ -1728,17 +1896,34 @@ pub fn attach(app: &tauri::AppHandle) {
             // selection with the content), so we must NOT double-shift it here.
             let detect = frame.alt_screen && p.sel.has_selection();
             let old_rows = if detect { g.rows.clone() } else { Vec::new() };
-            g.apply_frame(frame);
+            let retain_unscoped_scrollback = g.retain_unscoped_scrollback
+                || p.agent_mode.load(std::sync::atomic::Ordering::Relaxed);
+            g.apply_frame(frame, retain_unscoped_scrollback);
             if detect {
                 let k = detect_scroll_shift(&old_rows, &g.rows);
                 if k != 0 {
                     p.sel.shift_relative_y(-(k as f32) * LINE_PX);
                 }
             }
+            true
+        } else {
+            // Hidden PTYs update only their retained Rust model. No AppKit
+            // redraw is scheduled, so the 4 Hz hidden cadence does not create
+            // main-thread work; it simply makes the next switch warm.
+            let mut cache = hidden_grids().lock().unwrap_or_else(|e| e.into_inner());
+            let g = cache
+                .entry(pty_id.to_string())
+                .or_insert_with(TermGrid::empty);
+            let retain_unscoped_scrollback = g.retain_unscoped_scrollback;
+            g.apply_frame(frame, retain_unscoped_scrollback);
+            false
+        };
+        drop(routing);
+        if visible {
+            let _ = app_for_sink.run_on_main_thread(|| {
+                warpui::platform::poke_embedded_redraw();
+            });
         }
-        let _ = app_for_sink.run_on_main_thread(|| {
-            warpui::platform::poke_embedded_redraw();
-        });
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1747,7 +1932,10 @@ pub fn attach(app: &tauri::AppHandle) {
         // leaving it on injects a periodic multi-ms hitch during output bursts —
         // bad for the 120fps / smooth-throughput budget. Set WARP_CAPTURE=1 to
         // re-enable for render debugging.
-        if (n == 4 || n == 12 || (n > 0 && n % 60 == 0)) && std::env::var("WARP_CAPTURE").is_ok() {
+        if visible
+            && (n == 4 || n == 12 || (n > 0 && n % 60 == 0))
+            && std::env::var("WARP_CAPTURE").is_ok()
+        {
             if let Some(wid) = CAPTURE_WID.lock().ok().and_then(|g| *g) {
                 let _ = app_for_sink.run_on_main_thread(move || {
                     warpui::platform::capture_embedded(
@@ -1763,9 +1951,11 @@ pub fn attach(app: &tauri::AppHandle) {
     // poke a redraw. Runs on the PTY reader thread, like the frame sink.
     let app_for_block = app.clone();
     crate::term::set_native_block_sink(Box::new(move |pty_id: &str, block: &ClosedBlock| {
-        if let Some(p) = pane_for_pty(pty_id) {
+        let routing = GRID_ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+        let visible = if let Some(p) = pane_for_pty(pty_id) {
             let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
             g.blocks.push(NativeBlock::new(
+                block.block_id,
                 block.input.clone(),
                 block.block_rows.clone(),
                 block.transcript.clone(),
@@ -1773,10 +1963,31 @@ pub fn attach(app: &tauri::AppHandle) {
                 block.duration_ms,
                 block.exit_code,
             ));
+            true
+        } else {
+            let mut cache = hidden_grids().lock().unwrap_or_else(|e| e.into_inner());
+            let g = cache
+                .entry(pty_id.to_string())
+                .or_insert_with(TermGrid::empty);
+            if !g.blocks.iter().any(|b| b.block_id == block.block_id) {
+                g.blocks.push(NativeBlock::new(
+                    block.block_id,
+                    block.input.clone(),
+                    block.block_rows.clone(),
+                    block.transcript.clone(),
+                    block.cwd.clone(),
+                    block.duration_ms,
+                    block.exit_code,
+                ));
+            }
+            false
+        };
+        drop(routing);
+        if visible {
+            let _ = app_for_block.run_on_main_thread(|| {
+                warpui::platform::poke_embedded_redraw();
+            });
         }
-        let _ = app_for_block.run_on_main_thread(|| {
-            warpui::platform::poke_embedded_redraw();
-        });
     }));
 
     let parent = app
@@ -1946,18 +2157,46 @@ pub fn term_surface_set_rect(pane_key: String, x: f64, y: f64, width: f64, heigh
 }
 
 /// Tauri command: point the native surface at `id`'s pty (the active terminal
-/// tab). Clears the retained grid so the prior pty's content can't bleed
-/// through before the new pty's first frame / `term_start` re-emit arrives.
+/// tab). The retained model moves with the PTY, making a warm instance switch
+/// an in-memory state swap rather than a synchronous full-history SQLite read.
 #[tauri::command]
 pub fn term_native_attach(
     pane_key: String,
     id: String,
     state: tauri::State<crate::term::TerminalState>,
 ) {
-    use tauri::Manager as _;
+    let routing = GRID_ROUTING.lock().unwrap_or_else(|e| e.into_inner());
     let p = pane(&pane_key);
-    // Stop mirroring this pane's previous pty, then mirror the new one.
     let prev = p.pty_id();
+
+    // React effects can legitimately republish the same attachment. Keep this
+    // path fully idempotent: clearing/rebuilding an already-visible Codex grid
+    // is both unnecessary and conspicuously slow with deep scrollback.
+    if prev == id {
+        crate::term::set_native_pty(&id);
+        drop(routing);
+        crate::term::reemit_native(&state, &id);
+        if let Some(app) = APP_HANDLE.get() {
+            let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
+        }
+        return;
+    }
+
+    // Grab the incoming model before changing pane ownership. During a split
+    // swap it may still live in the sibling pane; otherwise it comes from the
+    // hidden cache (or starts empty on the first visit).
+    let next_grid = take_retained_grid(&id, p);
+    let needs_history = !next_grid.history_loaded;
+
+    // Preserve the outgoing model, including live Codex scrollback and scroll
+    // position, then publish the new pane owner.
+    stash_pane_grid(&prev, p);
+    // Attach may reuse a pane that was previously showing an agent. Clear the
+    // old mode before the first re-emit so a new shell cannot inherit the prior
+    // PTY's unscoped-scrollback policy; BlockTerminal immediately publishes the
+    // correct mode for the newly attached target.
+    p.agent_mode
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut g) = p.pty.lock() {
         g.clear();
         g.push_str(&id);
@@ -1967,48 +2206,23 @@ pub fn term_native_attach(
     // land back-to-back, and the second pane's "previous" pty is exactly
     // the one the first pane just claimed — clearing it unconditionally
     // froze that pane (frames stopped reaching the sink).
-    if !prev.is_empty()
-        && prev != id
-        && panes().iter().all(|q| q.pty_id() != prev)
-    {
+    if !prev.is_empty() && prev != id && panes().iter().all(|q| q.pty_id() != prev) {
         crate::term::clear_native_pty(&prev);
     }
     crate::term::set_native_pty(&id);
     {
         let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
-        *g = TermGrid::empty();
+        *g = next_grid;
     }
-    // Rehydrate saved closed blocks so history survives tab switches and
-    // restarts (Warp-parity: terminal history is never cut off). `load_blocks`
-    // windows to the most-recent; older blocks page in on scroll-back (M2.4).
-    // Best-effort — a missing DB or brand-new pty just yields an empty grid.
-    if let Some(app) = APP_HANDLE.get() {
-        if let Ok(dir) = app.path().app_data_dir() {
-            if let Ok(saved) = crate::persistence::load_blocks(&dir.join("goonware.db"), &id) {
-                if !saved.is_empty() {
-                    let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
-                    g.blocks = saved
-                        .into_iter()
-                        .map(|sb| {
-                            NativeBlock::new(
-                                sb.input,
-                                serde_json::from_value(sb.block_rows_json).unwrap_or_default(),
-                                sb.transcript,
-                                sb.cwd,
-                                sb.duration_ms.map(|d| d.max(0) as u64),
-                                sb.exit_code,
-                            )
-                        })
-                        .collect();
-                }
-            }
-        }
-    }
+    drop(routing);
     // Repaint immediately from the pty's current grid (no-op if it hasn't
     // started yet — the first `term_start` frame fills the surface then).
     crate::term::reemit_native(&state, &id);
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
+    }
+    if needs_history {
+        hydrate_history_in_background(id);
     }
 }
 
@@ -2021,8 +2235,10 @@ pub fn term_native_attach(
 /// right panel should shrink the surface).
 #[tauri::command]
 pub fn term_native_detach(pane_key: String) {
+    let routing = GRID_ROUTING.lock().unwrap_or_else(|e| e.into_inner());
     let p = pane(&pane_key);
     let prev = p.pty_id();
+    stash_pane_grid(&prev, p);
     if let Ok(mut g) = p.pty.lock() {
         g.clear();
     }
@@ -2037,9 +2253,7 @@ pub fn term_native_detach(pane_key: String) {
             *r = (0.0, 0.0, 0.0, 0.0);
         }
     }
-    if let Ok(mut g) = p.grid.lock() {
-        *g = TermGrid::empty();
-    }
+    drop(routing);
     reposition_surface();
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
@@ -2051,10 +2265,31 @@ pub fn term_native_detach(pane_key: String) {
 /// grid painting across the agent-exit debounce so a killed agent's shell
 /// prompt stays visible — see `AGENT_MODE`.
 #[tauri::command]
-pub fn term_native_set_agent_mode(pane_key: String, active: bool) {
-    pane(&pane_key)
+pub fn term_native_set_agent_mode(
+    pane_key: String,
+    active: bool,
+    state: tauri::State<crate::term::TerminalState>,
+) {
+    let routing = GRID_ROUTING.lock().unwrap_or_else(|e| e.into_inner());
+    let p = pane(&pane_key);
+    let was_active = p
         .agent_mode
-        .store(active, std::sync::atomic::Ordering::Relaxed);
+        .swap(active, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain_unscoped_scrollback = active;
+    }
+    let id = p.pty_id();
+    drop(routing);
+    // A directly-launched agent has no parent shell and therefore no OSC 133
+    // block id. Frames that arrived before this mode bit was set could only
+    // retain the visible grid. Re-emit the complete PTY snapshot on the false →
+    // true edge so all pre-existing normal-screen history becomes scrollable.
+    if active && !was_active {
+        if !id.is_empty() {
+            crate::term::reemit_native_unscoped_agent(&state, &id);
+        }
+    }
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
     }
@@ -2063,19 +2298,17 @@ pub fn term_native_set_agent_mode(pane_key: String, active: bool) {
 /// Tauri command: forward a wheel delta (CSS px, +down/newer) from the React
 /// overlay to the native shell-transcript scroll-back. The embedded child window
 /// has `ignoresMouseEvents: YES`, so the webview captures the wheel and relays it
-/// here. We read the post-layout-clamped offset back out of the scroll handle
-/// (so scrolling up from the bottom starts at the true bottom), apply the delta,
-/// and drop stick-to-bottom; render re-arms stick once scrolled back down or when
-/// the content fits. No-op effect in alt-screen / agent mode (render ignores the
-/// offset there).
+/// here. The delta is applied to `TermGrid`'s canonical offset/range rather than
+/// the renderer handle: while pinned, that handle briefly carries a 1e9 sentinel
+/// until layout clamps it, and reading it during that window made upward wheel
+/// gestures snap straight back to the bottom. Render re-arms follow mode once
+/// scrolled back down or when the content fits.
 #[tauri::command]
 pub fn term_native_scroll(pane_key: String, delta_px: f64) {
     let p = pane(&pane_key);
     {
         let mut g = p.grid.lock().unwrap_or_else(|e| e.into_inner());
-        let cur = p.scroll.scroll_start().as_f32();
-        g.scroll_px = (cur + delta_px as f32).max(0.0);
-        g.stick_bottom = false;
+        g.scroll_by(delta_px as f32);
     }
     if let Some(app) = APP_HANDLE.get() {
         let _ = app.run_on_main_thread(|| warpui::platform::poke_embedded_redraw());
@@ -2231,6 +2464,82 @@ mod scroll_shift_tests {
             .collect()
     }
 
+    fn scrollback_frame(text: &str, reset: bool) -> RenderFrame {
+        RenderFrame {
+            seq: 1,
+            block_id: 0,
+            cols: 80,
+            rows: 24,
+            cursor_row: 0,
+            cursor_col: 0,
+            alt_screen: false,
+            command_running: false,
+            app_cursor: false,
+            bracketed_paste: false,
+            cursor_visible: true,
+            raw_input: true,
+            dirty: Vec::new(),
+            scrollback_appended: vec![crate::term::DirtyRow {
+                row: 0,
+                spans: vec![plain_span(text)],
+            }],
+            scrollback_reset: reset,
+        }
+    }
+
+    #[test]
+    fn direct_agent_retains_scrollback_without_shell_block_id() {
+        let mut grid = TermGrid::empty();
+        let first = scrollback_frame("oldest", true);
+
+        // An idle shell has the same block_id=0 shape, but its closed blocks
+        // already own history, so it must not duplicate raw PTY scrollback.
+        grid.apply_frame(&first, false);
+        assert!(grid.scrollback.is_empty());
+
+        // Explicit agent mode distinguishes a direct-launched Codex/Claude
+        // session and retains the exact same unscoped frame.
+        grid.apply_frame(&first, true);
+        grid.apply_frame(&scrollback_frame("newer", false), true);
+        assert_eq!(grid.scrollback.len(), 2);
+        assert_eq!(grid.scrollback[0].spans[0].text, "oldest");
+        assert_eq!(grid.scrollback[1].spans[0].text, "newer");
+    }
+
+    #[test]
+    fn upward_scroll_from_pinned_bottom_uses_real_range_not_render_sentinel() {
+        let mut grid = TermGrid::empty();
+        // Render has established an 800px scroll range. While stick_bottom is
+        // true, the renderer handle itself may still contain its temporary 1e9
+        // sentinel; scroll_by must be independent of that handle.
+        grid.max_scroll_px = 800.0;
+        grid.scroll_px = 0.0;
+        grid.stick_bottom = true;
+
+        grid.scroll_by(-120.0);
+
+        assert_eq!(grid.scroll_px, 680.0);
+        assert!(!grid.stick_bottom);
+    }
+
+    #[test]
+    fn scroll_delta_clamps_to_transcript_bounds() {
+        let mut grid = TermGrid::empty();
+        grid.max_scroll_px = 500.0;
+        grid.scroll_px = 200.0;
+        grid.stick_bottom = false;
+
+        grid.scroll_by(-1_000.0);
+        assert_eq!(grid.scroll_px, 0.0);
+        grid.scroll_by(1_000.0);
+        assert_eq!(grid.scroll_px, 500.0);
+
+        grid.max_scroll_px = 0.0;
+        grid.scroll_by(-100.0);
+        assert_eq!(grid.scroll_px, 0.0);
+        assert!(grid.stick_bottom);
+    }
+
     #[test]
     fn scroll_down_shifts_content_up() {
         // Ten distinct rows; the app scrolls DOWN by 3 (content moves up 3, three
@@ -2320,6 +2629,58 @@ mod scroll_shift_tests {
         let old = rows(&["a", "b", "c"]);
         let new = rows(&["b", "c", "d"]);
         assert_eq!(detect_scroll_shift(&old, &new), 0);
+    }
+}
+
+#[cfg(test)]
+mod instance_switch_tests {
+    use super::*;
+
+    fn saved(block_id: i64, input: &str) -> crate::persistence::SavedBlock {
+        crate::persistence::SavedBlock {
+            block_id,
+            input: input.to_string(),
+            transcript: format!("output-{block_id}"),
+            block_rows_json: serde_json::json!([]),
+            exit_code: Some(0),
+            cwd: Some("/tmp/project".into()),
+            duration_ms: Some(1),
+        }
+    }
+
+    #[test]
+    fn background_history_merge_preserves_blocks_closed_during_read() {
+        let mut grid = TermGrid::empty();
+        // Block 2 appears in both the DB result and the live cache (the writer
+        // committed while hydration was in flight); block 3 exists only in the
+        // live cache. The merge must dedupe 2 without losing 3.
+        grid.blocks.push(native_block_from_saved(saved(2, "cached-two")));
+        grid.blocks.push(native_block_from_saved(saved(3, "cached-three")));
+
+        merge_saved_history(&mut grid, vec![saved(1, "saved-one"), saved(2, "saved-two")]);
+
+        assert_eq!(
+            grid.blocks.iter().map(|b| b.block_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(grid.history_loaded);
+    }
+
+    #[test]
+    fn attach_never_reads_sqlite_on_the_instance_switch_path() {
+        let source = include_str!("warp_term.rs");
+        let attach = source
+            .split("pub fn term_native_attach")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn term_native_detach").next())
+            .expect("term_native_attach source");
+
+        assert!(attach.contains("take_retained_grid"));
+        assert!(attach.contains("hydrate_history_in_background"));
+        assert!(
+            !attach.contains("load_blocks"),
+            "instance switching must never synchronously rebuild history from SQLite"
+        );
     }
 }
 

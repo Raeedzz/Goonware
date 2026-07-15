@@ -72,12 +72,11 @@ export interface RenderFrame {
    */
   cursor_visible: boolean;
   /**
-   * True when the PTY's line discipline has left canonical mode
-   * (`ICANON` cleared via `tcsetattr`) — the universal signal that the
-   * foreground program is reading keystrokes raw and doing its own line
-   * editing / key handling. Interactive prompts (inquirer / `prompts` /
-   * clack), `fzf`, password readers, and full TUIs all clear it, even
-   * the ones that never emit `app_cursor` / `bracketed_paste`.
+   * True when the PTY requires direct keystroke passthrough: its line
+   * discipline has either left canonical mode (`ICANON` cleared) or disabled
+   * echo (`ECHO` cleared). Interactive menus and TUIs generally do the former;
+   * password/token readers may do only the latter while retaining canonical
+   * line buffering. Both must bypass the visible block editor.
    *
    * Consumers MUST gate on `command_running` before acting: the shell's
    * own line editor (zsh ZLE, bash readline) also runs the tty raw at an
