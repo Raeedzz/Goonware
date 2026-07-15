@@ -37,7 +37,7 @@ export interface InputModeInput {
   altScreen: boolean;
   /** A foreground command is producing output (OSC 133 C↔D). */
   commandRunning: boolean;
-  /** Frame's `raw_input`: tty left canonical mode (ICANON cleared). */
+  /** Frame's `raw_input`: tty left canonical mode or disabled local echo. */
   rawInput: boolean;
   /** A known interactive agent (claude/codex/…) is foregrounded. */
   foregroundIsAgent: boolean;
@@ -46,7 +46,7 @@ export interface InputModeInput {
 }
 
 export interface InputModeDecision {
-  /** A child has the tty raw while running, rendered inline. */
+  /** A child needs direct input while running, rendered inline. */
   inlineRawPrompt: boolean;
   /**
    * Hide PromptInput + the editable status bar; the running program's
@@ -58,6 +58,25 @@ export interface InputModeDecision {
    * JSX mount condition and the autofocus effect can't drift apart.
    */
   passthroughActive: boolean;
+}
+
+export type PromptSubmissionKind = "shell-command" | "foreground-stdin";
+
+/**
+ * Decide what Enter in the visible PromptInput means.
+ *
+ * While the shell is idle, the line is a new command and belongs in command
+ * history / the pending block-label queue. While a foreground child is still
+ * running, the exact same UI is serving a canonical interactive prompt (for
+ * example `gh auth login` asking for `Y` + Enter). In that case the line is
+ * stdin for the existing process and must not be mistaken for another shell
+ * command. Raw/no-echo prompts never reach this path because PtyPassthrough is
+ * mounted for them instead.
+ */
+export function classifyPromptSubmission(
+  commandRunning: boolean,
+): PromptSubmissionKind {
+  return commandRunning ? "foreground-stdin" : "shell-command";
 }
 
 /**
@@ -93,9 +112,10 @@ export function deriveInputMode(s: InputModeInput): InputModeDecision {
     !s.exited && (s.altScreen || s.foregroundIsAgent || inlineRawPrompt);
 
   const passthroughActive =
-    (s.foregroundIsAgent && !s.altScreen) ||
-    inlineRawPrompt ||
-    (s.altScreen && s.nativeSurface);
+    !s.exited &&
+    ((s.foregroundIsAgent && !s.altScreen) ||
+      inlineRawPrompt ||
+      (s.altScreen && s.nativeSurface));
 
   return { inlineRawPrompt, agentMode, passthroughActive };
 }

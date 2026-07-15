@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { INITIAL_STATE, reducer } from "./reducer";
-import type { AppState, CommitTab, MarkdownTab, Tab, Worktree } from "./types";
+import type {
+  AppState,
+  CommitTab,
+  MarkdownTab,
+  Project,
+  Tab,
+  Worktree,
+} from "./types";
 
 const worktree = (id: string, projectId: string): Worktree => ({
   id,
@@ -58,6 +65,67 @@ const markdownTab = (
 
 const open = (state: AppState, tab: Tab) =>
   reducer(state, { type: "open-tab", tab });
+
+const project = (id: string, path: string): Project => ({
+  id,
+  path,
+  name: path.split("/").filter(Boolean).pop() ?? path,
+  glyph: "P",
+  faviconDataUri: null,
+  pinned: false,
+  expanded: true,
+});
+
+describe("add-project dedup", () => {
+  test("opening an existing folder focuses it instead of creating a duplicate", () => {
+    const existing = project("p1", "/tmp/repo");
+    const s: AppState = {
+      ...INITIAL_STATE,
+      projects: { p1: existing },
+      projectOrder: ["p1"],
+    };
+
+    const next = reducer(s, {
+      type: "add-project",
+      project: project("p2", "/tmp/repo"),
+    });
+
+    expect(next.projectOrder).toEqual(["p1"]);
+    expect(next.projects).toEqual({ p1: existing });
+    expect(next.activeProjectId).toBe("p1");
+  });
+
+  test("trailing separators do not bypass folder deduplication", () => {
+    const existing = project("p1", "/tmp/repo/");
+    const s: AppState = {
+      ...INITIAL_STATE,
+      projects: { p1: existing },
+      projectOrder: ["p1"],
+    };
+
+    const next = reducer(s, {
+      type: "add-project",
+      project: project("p2", "/tmp/repo///"),
+    });
+
+    expect(next.projectOrder).toEqual(["p1"]);
+    expect(next.activeProjectId).toBe("p1");
+  });
+
+  test("stale project customization actions cannot recreate a removed project", () => {
+    const actions = [
+      { type: "set-project-expanded", id: "gone", expanded: false },
+      { type: "set-project-color", id: "gone", color: "slate" },
+      { type: "set-project-icon", id: "gone", iconName: "Folder01" },
+    ] as const;
+
+    for (const action of actions) {
+      const next = reducer(INITIAL_STATE, action);
+      expect(next).toBe(INITIAL_STATE);
+      expect(next.projects.gone).toBeUndefined();
+    }
+  });
+});
 
 describe("open-tab dedup", () => {
   test("re-opening the same commit focuses the existing tab", () => {

@@ -72,10 +72,9 @@ pub struct SavedBlockPayload {
 }
 
 // Block history is retained in full on disk — Warp-parity: terminal
-// history is never cut off across restarts. The read path
-// (`load_blocks` in `mod.rs`) windows the most-recent rows so restore
-// stays fast no matter how large the history grows; older blocks page
-// in on scroll-back.
+// history is never cut off across restarts. The read path restores the
+// full source of truth; renderers virtualize deep transcripts so paint
+// work stays bounded to the viewport.
 
 /// Public handle to the writer. Cloneable so multiple Tauri commands
 /// can hold a sender without coordinating.
@@ -279,8 +278,8 @@ fn apply(
                 ],
             )?;
             // Warp-parity: never evict by count. Full block history is
-            // retained on disk so it's never cut off; `load_blocks`
-            // windows the most-recent rows for fast restore.
+            // retained on disk and restored in full; the native painter
+            // virtualizes deep transcripts.
             tx.commit()?;
         }
         Event::ForgetPty(pty_id) => {

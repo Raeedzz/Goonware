@@ -591,16 +591,13 @@ pub struct RenderFrame {
     /// "█ in the middle of 'Switch between Clau█'" symptom users
     /// reported.
     pub cursor_visible: bool,
-    /// True iff the PTY's line discipline has left canonical mode
-    /// (`ICANON` cleared via `tcsetattr`). This is the universal signal
-    /// that the foreground program is reading keystrokes raw and doing
-    /// its own line editing / key handling — interactive prompts
-    /// (inquirer / `prompts` / clack / enquirer), `fzf`, password
-    /// readers, and full TUIs all clear it. Unlike `app_cursor` /
-    /// `bracketed_paste` (which a prompt library may never emit), raw
-    /// mode is set by *every* program that does its own keystroke
-    /// reading, so it's the reliable trigger for routing arrows + every
-    /// other key straight to the PTY.
+    /// True iff the PTY requires direct keystroke passthrough: either
+    /// canonical input is off (`ICANON` cleared) or local echo is off
+    /// (`ECHO` cleared). Interactive menus and full TUIs generally clear
+    /// ICANON; password/token readers can retain canonical buffering while
+    /// clearing only ECHO. Unlike `app_cursor` / `bracketed_paste` (which a
+    /// prompt library may never emit), these line-discipline flags reliably
+    /// tell us that PromptInput must get out of the way.
     ///
     /// The frontend gates this on `command_running` before acting on it:
     /// the interactive shell's OWN line editor (zsh ZLE, bash readline)
@@ -684,17 +681,14 @@ pub fn clear_native_pty(id: &str) {
     }
 }
 
-/// Hand a freshly-built frame to the native sink iff `id` is a mirrored pty.
+/// Hand a freshly-built frame to the native sink. The native renderer keeps a
+/// lightweight retained snapshot for hidden PTYs as well as the pane currently
+/// on screen, so switching instances never has to rebuild a long transcript on
+/// the interaction path. Hidden sessions already arrive at the 4 Hz cadence.
 #[inline]
 fn emit_native_frame(id: &str, frame: &RenderFrame) {
-    let is_target = NATIVE_PTYS
-        .lock()
-        .map(|g| g.iter().any(|p| p == id))
-        .unwrap_or(false);
-    if is_target {
-        if let Some(sink) = NATIVE_SINK.get() {
-            sink(id, frame);
-        }
+    if let Some(sink) = NATIVE_SINK.get() {
+        sink(id, frame);
     }
 }
 
@@ -710,10 +704,12 @@ pub fn set_native_block_sink(sink: NativeBlockSink) {
     let _ = NATIVE_BLOCK_SINK.set(sink);
 }
 
-/// Hand a finished block to the native sink iff `id` is a mirrored pty.
-/// True iff the PTY's line discipline has left canonical mode (`ICANON`
-/// cleared). See `RenderFrame::raw_input` for the full rationale — this
-/// is the per-frame probe that fills that field.
+/// True iff the PTY needs direct keystroke passthrough: canonical mode is off
+/// (`ICANON` cleared) OR local echo is off (`ECHO` cleared). The first covers
+/// interactive menus/TUIs; the second covers password and token readers that
+/// retain canonical line buffering but must not expose input in PromptInput.
+/// See `RenderFrame::raw_input` for the full rationale — this is the per-frame
+/// probe that fills that legacy-named field.
 ///
 /// Reads termios off the master fd: on a PTY the master and slave share
 /// one line-discipline state, so this reflects whatever the foreground
@@ -732,29 +728,35 @@ fn pty_in_raw_mode(master: &dyn MasterPty) -> bool {
         return false;
     }
     let tio = unsafe { tio.assume_init() };
-    (tio.c_lflag & libc::ICANON) == 0
+    (tio.c_lflag & (libc::ICANON | libc::ECHO)) != (libc::ICANON | libc::ECHO)
 }
 
+/// Hand a finished block to the native sink. Hidden PTYs are retained too so
+/// their closed-block history is already current when they become visible.
 #[inline]
 fn emit_native_block(id: &str, block: &ClosedBlock) {
-    let is_target = NATIVE_PTYS
-        .lock()
-        .map(|g| g.iter().any(|p| p == id))
-        .unwrap_or(false);
-    if !is_target {
-        return;
-    }
     if let Some(sink) = NATIVE_BLOCK_SINK.get() {
         sink(id, block);
     }
 }
 
-/// Push a full-grid frame for `id` straight to the native sink (no IPC, no
-/// scrollback). Called when the native surface (re)attaches to a pty so it
-/// repaints immediately from current state instead of waiting for the pty's
-/// next output. No-op if the session isn't alive yet — then the first real
-/// frame from `term_start` fills the surface.
+/// Push a full-grid frame for `id` straight to the native sink (no IPC). Called
+/// on attach and resize so the surface repaints immediately without disturbing
+/// the live block's separately accumulated scrollback.
 pub fn reemit_native(state: &TerminalState, id: &str) {
+    reemit_native_impl(state, id, false);
+}
+
+/// Re-emit a directly-launched agent and include its full PTY scrollback. A
+/// direct agent has no shell OSC 133 block id, so native retention may have
+/// engaged after its first output frames. Shell-launched agents already have a
+/// scoped live block and must not receive the whole session history here (that
+/// would duplicate their closed blocks), hence the block-id guard below.
+pub fn reemit_native_unscoped_agent(state: &TerminalState, id: &str) {
+    reemit_native_impl(state, id, true);
+}
+
+fn reemit_native_impl(state: &TerminalState, id: &str, include_unscoped_scrollback: bool) {
     let sess = {
         let Ok(sessions) = state.sessions.lock() else {
             return;
@@ -777,9 +779,16 @@ pub fn reemit_native(state: &TerminalState, id: &str) {
         .collect();
     let seq = s.next_frame_seq;
     s.next_frame_seq = s.next_frame_seq.saturating_add(1);
+    let block_id = s.segmenter.current_block_id();
+    let include_scrollback = include_unscoped_scrollback && block_id == 0;
+    let scrollback_appended = if include_scrollback {
+        sample_scrollback_rows(&s.term, s.term.grid().history_size())
+    } else {
+        Vec::new()
+    };
     let frame = RenderFrame {
         seq,
-        block_id: s.segmenter.current_block_id(),
+        block_id,
         cols: s.cols,
         rows: s.rows,
         cursor_row: cursor.line.0,
@@ -791,8 +800,8 @@ pub fn reemit_native(state: &TerminalState, id: &str) {
         cursor_visible: s.term.mode().contains(TermMode::SHOW_CURSOR),
         raw_input: pty_in_raw_mode(s.pty_master.as_ref()),
         dirty,
-        scrollback_appended: Vec::new(),
-        scrollback_reset: false,
+        scrollback_appended,
+        scrollback_reset: include_scrollback,
     };
     emit_native_frame(id, &frame);
 }
@@ -2192,6 +2201,25 @@ pub struct StartArgs {
     pub session_id: Option<String>,
 }
 
+/// Direct-launched Codex must use its normal-screen mode so output enters the
+/// PTY's scrollback buffer. Shell-launched Codex is rewritten by
+/// `makeCodexScrollable` in the frontend; this covers callers that start a pane
+/// with `command = codex` and therefore never submit a shell command line.
+fn scrollback_safe_args(command: &str, args: &[String]) -> Vec<String> {
+    let basename = std::path::Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command)
+        .to_ascii_lowercase();
+    let mut out = args.to_vec();
+    if matches!(basename.as_str(), "codex" | "codex-cli")
+        && !out.iter().any(|arg| arg == "--no-alt-screen")
+    {
+        out.insert(0, "--no-alt-screen".to_string());
+    }
+    out
+}
+
 #[tauri::command]
 pub fn term_start(
     app: AppHandle<Wry>,
@@ -2274,8 +2302,13 @@ pub fn term_start(
         })
         .map_err(|e| format!("openpty: {e}"))?;
 
+    let command_basename = std::path::Path::new(&args.command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&args.command);
+    let command_args = scrollback_safe_args(&args.command, &args.args);
     let mut cmd = CommandBuilder::new(&args.command);
-    cmd.args(&args.args);
+    cmd.args(&command_args);
     if let Some(cwd) = args.cwd.as_deref() {
         cmd.cwd(cwd);
     }
@@ -2320,10 +2353,6 @@ pub fn term_start(
     // Shells we don't recognise (fish, pwsh, plain `sh`, custom
     // shells) launch unmodified — the user just doesn't get block
     // segmentation in that PTY. Future work: fish + pwsh bootstrap.
-    let command_basename = std::path::Path::new(&args.command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&args.command);
     if command_basename == "zsh" {
         if let Ok(dir) = ensure_zsh_integration_dir(&app) {
             // Stash the user's existing ZDOTDIR (if any) so the
@@ -2338,8 +2367,7 @@ pub fn term_start(
             // Only inject the flags when the caller didn't already
             // supply their own — respecting any explicit override
             // they passed in args.args.
-            let already_set = args
-                .args
+            let already_set = command_args
                 .iter()
                 .any(|a| a == "--rcfile" || a == "--noprofile" || a == "-i");
             if !already_set {
@@ -3949,6 +3977,21 @@ mod tests {
         assert!(msg.contains("claude"));
     }
 
+    #[test]
+    fn direct_codex_launch_uses_normal_screen_scrollback() {
+        let args = vec!["resume".to_string(), "--last".to_string()];
+        assert_eq!(
+            scrollback_safe_args("/opt/homebrew/bin/codex", &args),
+            vec!["--no-alt-screen", "resume", "--last"],
+        );
+
+        let explicit = vec!["--no-alt-screen".to_string(), "resume".to_string()];
+        assert_eq!(scrollback_safe_args("codex-cli", &explicit), explicit);
+
+        let claude = vec!["--model".to_string(), "opus".to_string()];
+        assert_eq!(scrollback_safe_args("claude", &claude), claude);
+    }
+
     /* ---------- Color → CSS ---------- */
 
     #[test]
@@ -4095,6 +4138,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_history_exceeds_alacritty_default_without_truncation() {
+        use std::fmt::Write as _;
+
+        // Alacritty's default history cap is 10,000 rows. Cross it so a
+        // future accidental TermConfig::default() regression cannot silently
+        // restore the exact cutoff users reported for long agent sessions.
+        const LINES: usize = 10_050;
+        let mut transcript = String::with_capacity(LINES * 14);
+        for i in 0..LINES {
+            writeln!(&mut transcript, "line-{i:05}\r").unwrap();
+        }
+
+        let rows = snapshot_transcript(&transcript, 32, 4);
+        assert_eq!(rows.len(), LINES);
+        assert!(row_text(&rows[0]).starts_with("line-00000"));
+        assert!(row_text(rows.last().unwrap()).starts_with("line-10049"));
+    }
+
     /* ---------- native wheel delivery ---------- */
 
     #[test]
@@ -4144,10 +4206,10 @@ mod tests {
         assert_eq!(out, b"\x1b[<65;80;1M");
     }
 
-    /// `pty_in_raw_mode` is the whole mechanism behind routing arrow
-    /// keys / Enter to interactive prompts (inquirer / `prompts` / fzf):
-    /// when the foreground child clears `ICANON`, the frontend swaps the
-    /// block editor for raw passthrough. This pins two things that are
+    /// `pty_in_raw_mode` is the mechanism behind routing direct input to
+    /// interactive prompts (inquirer / `prompts` / fzf / password readers):
+    /// when the foreground child clears `ICANON` or `ECHO`, the frontend swaps
+    /// the block editor for raw passthrough. This pins two things that are
     /// easy to get wrong and platform-specific:
     ///   1. `tcgetattr` works on the PTY *master* fd (the Session drops
     ///      the slave after spawn, so the master is all we have). On
@@ -4155,7 +4217,7 @@ mod tests {
     ///   2. The master fd reflects the slave's termios — so a child
     ///      flipping raw mode is observable from our side.
     #[test]
-    fn pty_in_raw_mode_tracks_canonical_flag() {
+    fn pty_in_raw_mode_tracks_canonical_and_echo_flags() {
         use std::os::fd::RawFd;
 
         let pair = native_pty_system()
@@ -4187,6 +4249,18 @@ mod tests {
         assert!(
             pty_in_raw_mode(pair.master.as_ref()),
             "after ICANON is cleared the PTY must report raw mode",
+        );
+
+        // Password/token readers often keep canonical line buffering and
+        // disable only local echo. That must also engage passthrough so the
+        // secret is neither painted nor stored in the block editor/history.
+        tio.c_lflag |= libc::ICANON;
+        tio.c_lflag &= !libc::ECHO;
+        assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &tio) }, 0);
+
+        assert!(
+            pty_in_raw_mode(pair.master.as_ref()),
+            "after ECHO is cleared the PTY must require passthrough",
         );
     }
 }

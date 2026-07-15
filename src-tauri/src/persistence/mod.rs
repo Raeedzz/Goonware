@@ -37,9 +37,9 @@
 //!   blob).
 //! - **Block history persistence (Warp-parity).** Closed blocks are
 //!   persisted in full and never evicted by count, so terminal history
-//!   is never cut off across restarts. `load_blocks` windows the
-//!   most-recent rows for fast restore; older blocks page in on
-//!   scroll-back.
+//!   is never cut off across restarts. `load_blocks` restores the full
+//!   transcript; the native renderer virtualizes painting so deep
+//!   history does not make each frame proportional to its row count.
 //! - **No graceful shutdown.** The writer thread relies on macOS
 //!   tearing it down at app exit; WAL recovers any half-finished
 //!   transaction on next launch. If we add long-running async writes
@@ -115,16 +115,14 @@ pub struct SavedBlock {
     pub duration_ms: Option<i64>,
 }
 
-/// How many of the most-recent blocks `load_blocks` returns on restore.
-/// History is retained in full on disk (Warp-parity — never cut off);
-/// the renderer pages in older blocks on scroll-back. Kept in sync with
-/// the front-end's `MAX_BLOCKS` in `sessionMemory.ts`.
-const HISTORY_LOAD_WINDOW: i64 = 500;
-
-/// Return the most-recent `HISTORY_LOAD_WINDOW` persisted blocks for a
-/// pty_id in insertion order (oldest first), matching how the
-/// frontend's `sessionMemory.blocks` array is ordered. Older blocks
-/// stay on disk for scroll-back. Returns an empty vec for unknown
+/// Return every persisted block for a pty_id in insertion order
+/// (oldest first), matching how the frontend's `sessionMemory.blocks`
+/// array is ordered. There used to be a 500-block read window here with
+/// a promise that older rows would page in on scroll-back, but no paging
+/// path existed; the 501st-oldest block was therefore permanently
+/// unreachable after a restart. The render path already virtualizes
+/// deep transcripts, so restoring the source of truth in full is both
+/// correct and bounded at paint time. Returns an empty vec for unknown
 /// pty_ids — no error.
 pub fn load_blocks(
     db_path: &std::path::Path,
@@ -134,19 +132,13 @@ pub fn load_blocks(
         .map_err(|e| format!("open RO at {}: {e}", db_path.display()))?;
     let mut stmt = conn
         .prepare(
-            // Window to the most-recent rows (newest-first inner, then
-            // re-sorted oldest-first). Restore stays fast even when a
-            // pty has accumulated huge history; older blocks remain on
-            // disk and page in on scroll-back.
             "SELECT block_id, input, transcript, block_rows, \
-                    exit_code, cwd, duration_ms FROM (\
-                 SELECT * FROM blocks WHERE pty_id = ?1 \
-                 ORDER BY id DESC LIMIT ?2\
-             ) ORDER BY id ASC",
+                    exit_code, cwd, duration_ms \
+             FROM blocks WHERE pty_id = ?1 ORDER BY id ASC",
         )
         .map_err(|e| format!("prepare load_blocks: {e}"))?;
     let rows = stmt
-        .query_map(rusqlite::params![pty_id, HISTORY_LOAD_WINDOW], |row| {
+        .query_map(rusqlite::params![pty_id], |row| {
             let rows_text: String = row.get(3)?;
             // Stored as a known-shape JSON literal we wrote ourselves
             // last save — parse failures here are real corruption and
@@ -391,14 +383,14 @@ mod tests {
     }
 
     #[test]
-    fn history_is_retained_in_full_and_load_is_windowed() {
+    fn history_is_retained_and_restored_in_full() {
         let (_dir, path) = fresh_db();
         let conn = db::open_rw(&path).unwrap();
         let w = writer::start(conn, path.clone());
 
-        // Insert past the load window. Warp-parity: nothing is evicted
-        // on save — the read path windows instead, so older history is
-        // never cut off on disk.
+        // Insert past the old 500-block load window. Both storage and
+        // restore must remain complete: keeping old rows in SQLite is
+        // not useful if the UI can never load or scroll to them.
         const WINDOW: i64 = 500;
         for i in 1..=(WINDOW + 5) {
             w.save_block(mk_block(i, &format!("cmd-{i}")));
@@ -420,10 +412,10 @@ mod tests {
             .unwrap();
         assert_eq!(total, WINDOW + 5, "history must be retained in full");
 
-        // ...but load_blocks returns only the most-recent WINDOW, oldest-first.
+        // load_blocks returns the entire transcript, oldest-first.
         let blocks = load_blocks(&path, "pty-A").unwrap();
-        assert_eq!(blocks.len(), WINDOW as usize);
-        assert_eq!(blocks[0].block_id, 6); // 1..=5 fall outside the window
+        assert_eq!(blocks.len(), (WINDOW + 5) as usize);
+        assert_eq!(blocks[0].block_id, 1);
         assert_eq!(blocks.last().unwrap().block_id, WINDOW + 5);
     }
 
