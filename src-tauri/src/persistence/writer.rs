@@ -78,10 +78,9 @@ pub struct SavedBlockPayload {
 }
 
 // Block history is retained in full on disk — Warp-parity: terminal
-// history is never cut off across restarts. The read path
-// (`load_blocks` in `mod.rs`) windows the most-recent rows so restore
-// stays fast no matter how large the history grows; older blocks page
-// in on scroll-back.
+// history is never cut off across restarts. The read path restores the
+// full source of truth; renderers virtualize deep transcripts so paint
+// work stays bounded to the viewport.
 
 /// Public handle to the writer. Cloneable so multiple Tauri commands
 /// can hold a sender without coordinating.

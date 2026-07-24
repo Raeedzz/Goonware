@@ -26,7 +26,12 @@ function trimTrailingPunct(raw: string): { url: string; tail: string } {
     if (!TRIM_TAIL.has(last)) break;
     // Don't strip a closing paren if the URL itself contains an opening one
     // (Wikipedia-style links).
-    if (last === ")" && (url.match(/\(/g)?.length ?? 0) > (url.match(/\)/g)?.length ?? 0)) break;
+    if (
+      last === ")" &&
+      (url.match(/\(/g)?.length ?? 0) >= (url.match(/\)/g)?.length ?? 0)
+    ) {
+      break;
+    }
     url = url.slice(0, -1);
     tail = last + tail;
   }

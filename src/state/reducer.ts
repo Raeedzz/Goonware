@@ -63,6 +63,14 @@ export function reducer(state: AppState, action: AppAction): AppState {
       if (state.projects[action.project.id]) {
         return { ...state, activeProjectId: action.project.id };
       }
+      const incomingPath = normalizeProjectPath(action.project.path);
+      const existing = Object.values(state.projects).find(
+        (project) => normalizeProjectPath(project.path) === incomingPath,
+      );
+      if (existing) {
+        if (state.activeProjectId === existing.id) return state;
+        return { ...state, activeProjectId: existing.id };
+      }
       return {
         ...state,
         projects: { ...state.projects, [action.project.id]: action.project },
@@ -107,6 +115,7 @@ export function reducer(state: AppState, action: AppAction): AppState {
       return { ...state, projectOrder: action.ids };
 
     case "set-project-expanded":
+      if (!state.projects[action.id]) return state;
       return {
         ...state,
         projects: {
@@ -116,6 +125,7 @@ export function reducer(state: AppState, action: AppAction): AppState {
       };
 
     case "set-project-color":
+      if (!state.projects[action.id]) return state;
       return {
         ...state,
         projects: {
@@ -125,6 +135,7 @@ export function reducer(state: AppState, action: AppAction): AppState {
       };
 
     case "set-project-icon":
+      if (!state.projects[action.id]) return state;
       return {
         ...state,
         projects: {
@@ -670,6 +681,11 @@ export function reducer(state: AppState, action: AppAction): AppState {
   }
 }
 
+/** Treat cosmetic trailing separators as the same project folder. */
+function normalizeProjectPath(path: string): string {
+  return path.replace(/\/+$/, "") || "/";
+}
+
 /**
  * Whether two tab payloads address the same underlying thing — the
  * dedup test `open-tab` runs so re-opening a file/diff/commit focuses
@@ -708,4 +724,3 @@ function updateWorktree(
     worktrees: { ...state.worktrees, [id]: { ...cur, ...patch(cur) } },
   };
 }
-

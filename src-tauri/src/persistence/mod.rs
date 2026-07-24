@@ -392,14 +392,15 @@ mod tests {
     }
 
     #[test]
-    fn history_is_retained_in_full_and_load_is_windowed() {
+    fn history_is_retained_on_disk_and_load_is_windowed() {
         let (_dir, path) = fresh_db();
         let conn = db::open_rw(&path).unwrap();
         let w = writer::start(conn, path.clone());
 
-        // Insert past the load window. Warp-parity: nothing is evicted
-        // on save — the read path windows instead, so older history is
-        // never cut off on disk.
+        // Insert past the load window but under the disk cap
+        // (`BLOCK_DISK_CAP` = 1000). Nothing is evicted on save yet — the
+        // read path windows instead, so restore stays fast while recent
+        // history remains complete on disk.
         const WINDOW: i64 = 500;
         for i in 1..=(WINDOW + 5) {
             w.save_block(mk_block(i, &format!("cmd-{i}")));
@@ -410,7 +411,7 @@ mod tests {
                 .unwrap_or(false)
         });
 
-        // Every row is retained on disk — history is never cut off.
+        // All 505 rows are still on disk (below the 1000-row disk cap).
         let total: i64 = db::open_ro(&path)
             .unwrap()
             .query_row(
@@ -419,7 +420,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(total, WINDOW + 5, "history must be retained in full");
+        assert_eq!(total, WINDOW + 5, "recent history must be retained on disk");
 
         // ...but load_blocks returns only the most-recent WINDOW, oldest-first.
         let blocks = load_blocks(&path, "pty-A").unwrap();
