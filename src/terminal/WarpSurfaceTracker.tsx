@@ -121,16 +121,40 @@ export function WarpSurfaceTracker({
     // layout flip like split↔full racing a heavy commit has been seen
     // to leave the native rect stale — terminal stuck at half width,
     // the rest of the hole showing the black host window). Re-checking
-    // on a slow interval costs one getBoundingClientRect and sends
-    // nothing while the rect is unchanged, but guarantees the native
-    // surface converges to the real DOM box within ~300ms.
-    const poll = window.setInterval(() => report(), 300);
+    // on a slow interval costs one getBoundingClientRect (a forced
+    // layout read, so keep it infrequent) and sends nothing while the
+    // rect is unchanged, but guarantees the native surface converges
+    // to the real DOM box within ~1s. RO + window-resize cover every
+    // normal path instantly; this only catches the rare dropped
+    // report. Not started at all while this pane reports the zero
+    // rect (hidden, no reportWhenHidden) or the window is hidden —
+    // there's nothing to converge to, and per-pane wakeups while
+    // backgrounded are exactly what drains the battery with many
+    // panes mounted. The visibilitychange hook re-checks immediately
+    // on un-hide, which also covers rAF having been paused.
+    let poll: number | null = null;
+    const syncPoll = () => {
+      const wantPoll = (visible || reportWhenHidden) && !document.hidden;
+      if (wantPoll && poll === null) {
+        poll = window.setInterval(() => report(), 1000);
+      } else if (!wantPoll && poll !== null) {
+        window.clearInterval(poll);
+        poll = null;
+      }
+    };
+    const onVisibilityChange = () => {
+      if (!document.hidden) report();
+      syncPoll();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    syncPoll();
 
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
       window.removeEventListener("resize", schedule);
-      window.clearInterval(poll);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (poll !== null) window.clearInterval(poll);
     };
   }, [visible, paneKey, reportWhenHidden]);
 

@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -17,7 +18,11 @@ import { PromptInput, type PromptInputHandle } from "./PromptInput";
 import { PtyPassthrough, type PtyPassthroughHandle } from "./PtyPassthrough";
 import { TerminalStatusBar } from "./TerminalStatusBar";
 import { useTerminalSession } from "./useTerminalSession";
-import { getHistory, setHistory as memSetHistory } from "./sessionMemory";
+import {
+  getHistory,
+  setHistory as memSetHistory,
+  MAX_HISTORY,
+} from "./sessionMemory";
 import {
   getLastInteractedTerminal,
   markTerminalInteracted,
@@ -196,8 +201,15 @@ const terminalEncoder = new TextEncoder();
  * When the running shell pushes alt-screen (vim/htop/claude TUI), we
  * swap the BlockList + PromptInput stack for a FullGrid that mirrors
  * the entire grid and forwards every keystroke.
+ *
+ * Memoized (see the `BlockTerminal` export at the bottom of this
+ * file): the keepalive layer keeps every terminal tab of the 3 MRU
+ * worktrees mounted, so without memo every app-state dispatch re-ran
+ * this 2,500-line component body once per mounted pane. Parents must
+ * pass referentially stable callbacks for the memo to hold — see
+ * TerminalTabContent in MainColumn.
  */
-export function BlockTerminal({
+function BlockTerminalInner({
   id,
   command,
   args,
@@ -217,6 +229,12 @@ export function BlockTerminal({
   paneKey = "main",
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Ref mirror of the `isVisible` prop so long-lived intervals (the
+  // activity-summary poll below) can check current visibility without
+  // listing it as an effect dep — restarting those effects on every
+  // tab switch would refetch state the pane deliberately keeps.
+  const isVisibleRef = useRef(isVisible);
+  isVisibleRef.current = isVisible;
   /**
    * Scroll container for the closed blocks + live block area. Manually
    * managed instead of relying on column-reverse auto-scroll, because
@@ -403,6 +421,12 @@ export function BlockTerminal({
     if (!cli) return;
     let cancelled = false;
     const tick = async () => {
+      // Hidden panes (kept alive across worktree switches) and a
+      // hidden window skip the IPC entirely — with N agents running
+      // this poll otherwise costs N invokes every 4s around the
+      // clock. The summary refreshes on the first tick after the
+      // pane becomes visible again.
+      if (document.hidden || !isVisibleRef.current) return;
       try {
         const summary = await invoke<string | null>("claude_activity_summary", {
           projectCwd: cwd,
@@ -1786,6 +1810,8 @@ export function BlockTerminal({
       if (text.trim().length > 0) {
         setHistory((prev) => {
           const next = [text, ...prev];
+          // Newest-first ring: drop the oldest entries past the cap.
+          if (next.length > MAX_HISTORY) next.length = MAX_HISTORY;
           memSetHistory(id, next);
           return next;
         });
@@ -2513,3 +2539,12 @@ export function BlockTerminal({
     </div>
   );
 }
+
+/**
+ * Memoized export: with the keepalive layer holding N panes mounted,
+ * shallow-equal props MUST short-circuit the render — otherwise every
+ * dispatch anywhere in the app re-runs every pane. All props are
+ * primitives or parent-stabilized callbacks, so React.memo's default
+ * shallow compare is sufficient.
+ */
+export const BlockTerminal = memo(BlockTerminalInner);

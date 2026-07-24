@@ -19,6 +19,9 @@ import {
   setLiveFrame as memSetLiveFrame,
   setRows as memSetRows,
   setScrollback as memSetScrollback,
+  MAX_BLOCKS,
+  MAX_SCROLLBACK_ROWS,
+  SCROLLBACK_TRIM_CHUNK,
 } from "./sessionMemory";
 import type {
   Block,
@@ -27,6 +30,14 @@ import type {
   RenderFrame,
   Span,
 } from "./types";
+
+/**
+ * Monotonic suffix for synthetic block React keys. `prev.length` was
+ * the old suffix, which stops being unique once the MAX_BLOCKS cap
+ * pins the list length — two blocks closing in the same millisecond
+ * would then collide as duplicate React keys.
+ */
+let nextBlockSeq = 0;
 
 interface Args {
   /** Stable PTY session id — must be unique per running PTY. */
@@ -317,7 +328,8 @@ export function useTerminalSession(opts: Args): SessionApi {
           // and its resolve), merge instead of clobber. Historical
           // rows go first to preserve chronology.
           setBlocks((prev) => {
-            const merged = prev.length > 0 ? [...hydrated, ...prev] : hydrated;
+            let merged = prev.length > 0 ? [...hydrated, ...prev] : hydrated;
+            if (merged.length > MAX_BLOCKS) merged = merged.slice(-MAX_BLOCKS);
             memSetBlocks(opts.id, merged);
             return merged;
           });
@@ -425,11 +437,30 @@ export function useTerminalSession(opts: Args): SessionApi {
       // rows interleaved with the fresh sync.
       const appended = frame.scrollback_appended ?? [];
       if (frame.scrollback_reset) {
-        scrollbackRowsRef.current = appended.map((dr) => dr.spans);
+        // The reset re-sync ships the backend's FULL history (which
+        // is unbounded Rust-side), so the cap must apply here too —
+        // otherwise one term_start re-attach of a long-running agent
+        // rebuilds the entire mirror the cap exists to bound.
+        const synced = appended.map((dr) => dr.spans);
+        scrollbackRowsRef.current =
+          synced.length > MAX_SCROLLBACK_ROWS
+            ? synced.slice(synced.length - MAX_SCROLLBACK_ROWS)
+            : synced;
       } else if (appended.length > 0) {
-        const next = scrollbackRowsRef.current.slice();
-        for (const dr of appended) next.push(dr.spans);
-        scrollbackRowsRef.current = next;
+        // In-place append. This used to `.slice()` the whole mirror
+        // per frame "for React identity" — but nothing reads this
+        // array's identity: flushFrame re-wraps it into fresh
+        // DirtyRow[] on every commit, and the inner Span[] rows are
+        // immutable once appended. The copy was O(scrollback depth)
+        // of allocation + GC churn per frame, at its worst exactly
+        // when a terminal streams hardest.
+        const sb = scrollbackRowsRef.current;
+        for (const dr of appended) sb.push(dr.spans);
+        // Bound the mirror (oldest rows drop first). Trimmed in
+        // chunks so the front-splice cost amortizes to ~zero.
+        if (sb.length > MAX_SCROLLBACK_ROWS + SCROLLBACK_TRIM_CHUNK) {
+          sb.splice(0, sb.length - MAX_SCROLLBACK_ROWS);
+        }
       }
       // Latest frame wins. If multiple events arrive before the next
       // paint, the rAF flush sees only the most recent metadata
@@ -458,10 +489,15 @@ export function useTerminalSession(opts: Args): SessionApi {
       // guaranteed by the order in which the user pressed Enter.
       const stamped = pendingInputsRef.current.shift() ?? b.input;
       setBlocks((prev) => {
+        // Cap the in-memory block list to the restore window — the
+        // oldest block drops here but stays in SQLite, exactly like
+        // a block that was never re-loaded after restart.
+        const capped =
+          prev.length >= MAX_BLOCKS ? prev.slice(prev.length - MAX_BLOCKS + 1) : prev;
         const next = [
-          ...prev,
+          ...capped,
           {
-            id: `b_${Date.now().toString(36)}_${prev.length}`,
+            id: `b_${Date.now().toString(36)}_${nextBlockSeq++}`,
             block_id: b.block_id,
             input: stamped,
             transcript: b.transcript,

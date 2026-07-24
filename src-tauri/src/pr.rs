@@ -92,11 +92,28 @@ pub async fn pr_draft(
         return Err(format!("cwd does not exist: {cwd}"));
     }
 
-    // Gather context: staged + unstaged diff (truncated) and the last
-    // few commit subjects.
+    // The PR describes EVERYTHING that will land on the base branch —
+    // not just what's dirty in the working tree right now. A branch
+    // whose work is already committed (and pushed) has an empty
+    // `git diff`, so relying on that alone made the agent conclude
+    // "nothing changed" and draft an empty description. Gather the full
+    // set of commits this branch adds over its base, plus any staged /
+    // unstaged work not yet committed.
+    let base = default_base_branch(&cwd).await;
+    let (branch_log, branch_diff) = branch_context(&cwd, &base).await;
     let staged_diff = run_git(&cwd, &["diff", "--staged", "--no-color"]).await?;
     let working_diff = run_git(&cwd, &["diff", "--no-color"]).await?;
-    let log = run_git(&cwd, &["log", "-n", "10", "--pretty=format:%s"]).await?;
+
+    let has_any_content = [&branch_diff, &staged_diff, &working_diff]
+        .iter()
+        .any(|d| !d.trim().is_empty())
+        || !branch_log.trim().is_empty();
+    if !has_any_content {
+        return Err(format!(
+            "Nothing to describe — this branch has no commits beyond `{base}` and no \
+             uncommitted changes. Commit your work first, then draft the PR."
+        ));
+    }
 
     let mut prompt = String::new();
     if let Some(extras) = extras.as_deref() {
@@ -107,12 +124,33 @@ pub async fn pr_draft(
             prompt.push_str("\n\n");
         }
     }
-    prompt.push_str("Recent commit subjects:\n");
-    prompt.push_str(&log);
-    prompt.push_str("\n\nStaged diff:\n");
-    prompt.push_str(&truncate(&staged_diff, 4000));
-    prompt.push_str("\n\nWorking-tree diff:\n");
-    prompt.push_str(&truncate(&working_diff, 4000));
+    prompt.push_str(&format!(
+        "You are describing a pull request that merges this branch into `{base}`. \
+         Summarize ALL of the changes below as one cohesive PR.\n\n"
+    ));
+    if !branch_log.trim().is_empty() {
+        prompt.push_str(&format!(
+            "Commits on this branch (these all go into the PR):\n{}\n\n",
+            branch_log.trim()
+        ));
+    }
+    if !branch_diff.trim().is_empty() {
+        prompt.push_str(&format!(
+            "Full diff of this branch vs `{base}` (committed changes — the bulk of the PR):\n"
+        ));
+        prompt.push_str(&truncate(&branch_diff, 10000));
+        prompt.push_str("\n\n");
+    }
+    if !staged_diff.trim().is_empty() {
+        prompt.push_str("Staged but not-yet-committed diff:\n");
+        prompt.push_str(&truncate(&staged_diff, 3000));
+        prompt.push_str("\n\n");
+    }
+    if !working_diff.trim().is_empty() {
+        prompt.push_str("Unstaged working-tree diff:\n");
+        prompt.push_str(&truncate(&working_diff, 3000));
+        prompt.push_str("\n\n");
+    }
 
     let raw =
         run_inline(&cwd, &cli, HelperMode::PrDescription, &prompt, model.as_deref()).await?;
@@ -496,6 +534,81 @@ async fn is_default_branch(cwd: &str, branch: &str) -> bool {
         }
     }
     branch == "main" || branch == "master"
+}
+
+/// Resolve the branch a PR would target. Prefers `origin/HEAD` (the
+/// remote's published default), falls back to a local `main`/`master`,
+/// and finally to `"main"` so callers always get a usable name.
+async fn default_base_branch(cwd: &str) -> String {
+    if let Ok(raw) =
+        run_git_checked(cwd, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).await
+    {
+        if let Some(default) = raw.trim().strip_prefix("origin/") {
+            if !default.is_empty() {
+                return default.to_string();
+            }
+        }
+    }
+    for candidate in ["main", "master"] {
+        if run_git_checked(cwd, &["rev-parse", "--verify", &format!("refs/heads/{candidate}")])
+            .await
+            .is_ok()
+        {
+            return candidate.to_string();
+        }
+    }
+    "main".to_string()
+}
+
+/// Gather the commits and cumulative diff this branch adds over `base`
+/// — i.e. what the PR will actually contain, committed and pushed
+/// included. Returns `(log, diff)` where `log` is the per-commit
+/// subject+body list (oldest first) and `diff` is the full patch from
+/// the merge-base to HEAD.
+///
+/// Best-effort: returns empty strings when HEAD already equals the base
+/// (nothing ahead) or when no merge-base can be found (unrelated
+/// histories, a base ref that doesn't exist). The caller still has the
+/// working-tree/staged diffs to fall back on in that case.
+async fn branch_context(cwd: &str, base: &str) -> (String, String) {
+    // The current branch might BE the base (making a PR from an
+    // uncommitted change on main). Nothing is "ahead" of base then.
+    let current = run_git(cwd, &["symbolic-ref", "--short", "HEAD"])
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !current.is_empty() && current == base {
+        return (String::new(), String::new());
+    }
+
+    // Prefer the remote-tracking base (what the PR merges into on the
+    // server); fall back to the local base ref when origin/<base> is
+    // absent (offline clone, never-fetched).
+    let merge_base = {
+        let origin_base = format!("origin/{base}");
+        match run_git_checked(cwd, &["merge-base", &origin_base, "HEAD"]).await {
+            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => match run_git_checked(cwd, &["merge-base", base, "HEAD"]).await {
+                Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+                _ => return (String::new(), String::new()),
+            },
+        }
+    };
+
+    let range = format!("{merge_base}..HEAD");
+    // `%s` subject, `%b` body, blank line between commits. Oldest first
+    // so the narrative reads in the order the work happened.
+    let log = run_git(
+        cwd,
+        &["log", "--reverse", "--pretty=format:- %s%n%b", &range],
+    )
+    .await
+    .unwrap_or_default();
+    let diff = run_git(cwd, &["diff", "--no-color", &format!("{merge_base}..HEAD")])
+        .await
+        .unwrap_or_default();
+    (log, diff)
 }
 
 /// Env vars that keep network-touching git from blocking on credential
@@ -1357,6 +1470,68 @@ mod tests {
         );
         assert!(ok && stdout.trim() == "brand_new.txt",
             "brand_new.txt should be tracked in HEAD; got ok={ok} stdout={stdout:?}");
+    }
+
+    // ---- branch_context / default_base_branch --------------------------
+
+    #[tokio::test]
+    async fn branch_context_sees_committed_and_pushed_work() {
+        // The regression: once work is committed AND pushed, the working
+        // tree is clean, so the old "git diff only" gather saw nothing.
+        // branch_context must still surface the commits + their diff.
+        let (clone, _bare) = build_repo_with_bare_remote("feature/shipped");
+        std::fs::write(clone.path().join("feature.txt"), "new feature\n").unwrap();
+        run_sync(clone.path(), &["add", "feature.txt"]);
+        run_sync(clone.path(), &["commit", "-m", "Add the feature"]);
+        run_sync(clone.path(), &["push", "-u", "origin", "feature/shipped"]);
+
+        // Clean tree — nothing dirty, everything pushed.
+        let porcelain = run_sync(clone.path(), &["status", "--porcelain"]);
+        assert!(porcelain.trim().is_empty(), "precondition: clean tree");
+
+        let cwd = clone.path().to_str().unwrap();
+        let base = default_base_branch(cwd).await;
+        assert_eq!(base, "main");
+        let (log, diff) = branch_context(cwd, &base).await;
+        assert!(log.contains("Add the feature"), "commit subject missing: {log:?}");
+        assert!(diff.contains("new feature"), "committed diff missing: {diff:?}");
+        assert!(diff.contains("feature.txt"), "changed file missing: {diff:?}");
+    }
+
+    #[tokio::test]
+    async fn branch_context_empty_when_on_base_branch() {
+        // A PR-from-main scenario: HEAD == base, nothing is "ahead", so
+        // there's no branch diff (the caller falls back to working-tree).
+        let (clone, _bare) = build_repo_with_bare_remote("feature/unused");
+        run_sync(clone.path(), &["checkout", "main"]);
+
+        let cwd = clone.path().to_str().unwrap();
+        let base = default_base_branch(cwd).await;
+        assert_eq!(base, "main");
+        let (log, diff) = branch_context(cwd, &base).await;
+        assert!(log.trim().is_empty(), "no commits should be ahead of base: {log:?}");
+        assert!(diff.trim().is_empty(), "no diff should be ahead of base: {diff:?}");
+    }
+
+    #[tokio::test]
+    async fn branch_context_multiple_commits_all_included() {
+        // "everything I pushed should all go into one PR" — every commit
+        // on the branch beyond base must appear, not just the latest.
+        let (clone, _bare) = build_repo_with_bare_remote("feature/multi");
+        for (name, msg) in [("a.txt", "first commit"), ("b.txt", "second commit")] {
+            std::fs::write(clone.path().join(name), "x\n").unwrap();
+            run_sync(clone.path(), &["add", name]);
+            run_sync(clone.path(), &["commit", "-m", msg]);
+        }
+        run_sync(clone.path(), &["push", "-u", "origin", "feature/multi"]);
+
+        let cwd = clone.path().to_str().unwrap();
+        let base = default_base_branch(cwd).await;
+        let (log, diff) = branch_context(cwd, &base).await;
+        assert!(log.contains("first commit"), "first commit missing: {log:?}");
+        assert!(log.contains("second commit"), "second commit missing: {log:?}");
+        assert!(diff.contains("a.txt") && diff.contains("b.txt"),
+            "both files should be in the cumulative diff: {diff:?}");
     }
 
     // ---- ssh_url_to_https ----------------------------------------------

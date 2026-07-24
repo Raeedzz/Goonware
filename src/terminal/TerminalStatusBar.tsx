@@ -1,6 +1,6 @@
 import { AnimatePresence } from "motion/react";
-import { useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
-import { git } from "@/lib/git";
+import { useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { refreshGitStatus, useSharedGitStatus } from "@/state/gitStatusStore";
 import { BranchSwitcher } from "@/shell/BranchSwitcher";
 import { useClaudeUsage } from "@/lib/claudeUsage";
 import { useAppState } from "@/state/AppState";
@@ -28,8 +28,6 @@ interface GitInfo {
   removed: number;
   modified: number;
 }
-
-const POLL_MS = 4000;
 
 /**
  * Pill-badge breadcrumb at the BOTTOM of the terminal pane, Warp-style:
@@ -222,80 +220,38 @@ function useGitInfo(cwd: string): {
   info: GitInfo;
   refresh: () => Promise<void>;
 } {
-  // Track the cwd alongside the info so we can blank stale data the
-  // moment the prop changes — otherwise the previous worktree's branch
-  // (typically "main") flashes for up to a poll cycle when the user
-  // clicks a different worktree in the sidebar.
-  const [state, setState] = useState<{ cwd: string; info: GitInfo }>({
-    cwd,
-    info: EMPTY_GIT_INFO,
-  });
-  const [trigger, setTrigger] = useState(0);
-
-  // Synchronous reset on cwd change. This runs during render, before
-  // the post-commit useEffect, so the pill never shows the old branch.
-  if (state.cwd !== cwd) {
-    setState({ cwd, info: EMPTY_GIT_INFO });
-  }
-
-  useEffect(() => {
-    if (!cwd) return;
-    let cancelled = false;
-    const pull = async () => {
-      try {
-        const status = await git.status(cwd);
-        if (cancelled) return;
-        let added = 0;
-        let removed = 0;
-        let modified = 0;
-        for (const e of status.entries) {
-          if (e.kind === "added" || e.kind === "untracked") added++;
-          else if (e.kind === "deleted") removed++;
-          else if (e.kind === "modified" || e.kind === "renamed") modified++;
-        }
-        setState({
-          cwd,
-          info: {
-            branch: status.branch,
-            ahead: status.ahead,
-            behind: status.behind,
-            added,
-            removed,
-            modified,
-          },
-        });
-      } catch {
-        if (!cancelled) {
-          setState((prev) =>
-            prev.cwd === cwd
-              ? { cwd, info: { ...EMPTY_GIT_INFO } }
-              : prev,
-          );
-        }
-      }
+  // Backed by the shared per-cwd git-status store: every status bar
+  // (and the file tree) polling the same cwd shares ONE `git status`
+  // subprocess every 4s instead of one per mounted pane, and the poll
+  // pauses while the window is hidden. Because the snapshot is keyed
+  // by the current cwd, a cwd change can never show the previous
+  // worktree's branch — the store returns null until the new cwd's
+  // first result lands, which renders as the empty pill state.
+  const status = useSharedGitStatus(cwd || null);
+  const info = useMemo<GitInfo>(() => {
+    if (!status) return EMPTY_GIT_INFO;
+    let added = 0;
+    let removed = 0;
+    let modified = 0;
+    for (const e of status.entries) {
+      if (e.kind === "added" || e.kind === "untracked") added++;
+      else if (e.kind === "deleted") removed++;
+      else if (e.kind === "modified" || e.kind === "renamed") modified++;
+    }
+    return {
+      branch: status.branch,
+      ahead: status.ahead,
+      behind: status.behind,
+      added,
+      removed,
+      modified,
     };
-    void pull();
-    const id = window.setInterval(pull, POLL_MS);
-    // External nudges (commit+push, merge) so the pill state lands
-    // immediately instead of lagging the next poll cycle.
-    const onRefresh = (e: Event) => {
-      const detail = (e as CustomEvent<{ cwd?: string }>).detail;
-      if (!detail?.cwd || detail.cwd === cwd) void pull();
-    };
-    window.addEventListener("goonware-git-refresh", onRefresh);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-      window.removeEventListener("goonware-git-refresh", onRefresh);
-    };
-  }, [cwd, trigger]);
-
-  const info = state.info;
+  }, [status]);
 
   return {
     info,
     refresh: async () => {
-      setTrigger((t) => t + 1);
+      refreshGitStatus(cwd);
     },
   };
 }

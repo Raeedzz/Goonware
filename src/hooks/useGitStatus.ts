@@ -1,56 +1,35 @@
-import { useEffect, useState } from "react";
-import { git, type StatusEntry } from "../lib/git";
+import { useMemo } from "react";
+import { type StatusEntry } from "../lib/git";
+import { useSharedGitStatus } from "../state/gitStatusStore";
 
 export type GitStatusMap = Map<string, StatusEntry>;
 
+const EMPTY_MAP: GitStatusMap = new Map();
+
 /**
- * Polls `git status` for the given project root and returns a path →
- * status entry map. Path keys are absolute (joined with the project
- * root) so the file tree can do an O(1) lookup per row.
+ * `git status` for the given project root as a path → status entry
+ * map. Path keys are absolute (joined with the project root) so the
+ * file tree can do an O(1) lookup per row.
  *
- * Polls at a relaxed cadence — git status reads are fast but not free,
- * and the file tree doesn't need sub-second freshness.
+ * Backed by the shared per-cwd git-status store, so the file tree and
+ * every terminal status bar polling the same repo share one 4s poll
+ * (paused while the window is hidden) instead of each running their
+ * own subprocess-spawning interval.
  */
 export function useGitStatus(projectPath: string | null): GitStatusMap {
-  const [map, setMap] = useState<GitStatusMap>(() => new Map());
-
-  useEffect(() => {
-    if (!projectPath) {
-      setMap(new Map());
-      return;
-    }
-
-    let cancelled = false;
+  const status = useSharedGitStatus(projectPath);
+  return useMemo(() => {
+    if (!projectPath || !status) return EMPTY_MAP;
     const root = projectPath.replace(/\/$/, "");
-
-    const refresh = async () => {
-      try {
-        const status = await git.status(projectPath);
-        if (cancelled) return;
-        const next: GitStatusMap = new Map();
-        for (const e of status.entries) {
-          // Git emits paths relative to the repo root. Normalize to
-          // the absolute paths the file tree uses.
-          const abs = `${root}/${e.path}`;
-          next.set(abs, e);
-        }
-        setMap(next);
-      } catch {
-        // Project might not be a git repo — leave the map empty
-        // rather than spamming errors.
-        if (!cancelled) setMap(new Map());
-      }
-    };
-
-    void refresh();
-    const id = window.setInterval(refresh, 4000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [projectPath]);
-
-  return map;
+    const next: GitStatusMap = new Map();
+    for (const e of status.entries) {
+      // Git emits paths relative to the repo root. Normalize to
+      // the absolute paths the file tree uses.
+      const abs = `${root}/${e.path}`;
+      next.set(abs, e);
+    }
+    return next;
+  }, [projectPath, status]);
 }
 
 /* ------------------------------------------------------------------

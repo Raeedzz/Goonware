@@ -272,6 +272,10 @@ fn take_top_row(grid: &mut ActiveGrid) -> Vec<Cell> {
     grid.cells[grid.scroll_top].clone()
 }
 
+/// Scrollback row cap for FlatTerm's primary-grid history. Finite by
+/// design — see the comment in `FlatTerm::new`.
+const SCROLLBACK_CAP_ROWS: usize = 100_000;
+
 /// FlatTerm — the full terminal model. Owns:
 ///   - `primary` active grid (the default screen)
 ///   - `alt` active grid (swapped in on DECSET 1049)
@@ -315,18 +319,22 @@ impl FlatTerm {
         Self {
             primary: ActiveGrid::new(cols, rows),
             alt: ActiveGrid::new(cols, rows),
-            // Unbounded scrollback — every row the agent ever produces
-            // stays accessible. FlatStorage::with_capacity is safe with
-            // usize::MAX because it decouples the cap from the initial
-            // Vec allocation; storage grows dynamically as rows arrive.
-            scrollback: FlatStorage::with_capacity(usize::MAX),
+            // Bounded scrollback. FlatStorage::with_capacity decouples
+            // the cap from the initial Vec allocation, so a large cap
+            // costs nothing until rows actually arrive — but the cap
+            // must be FINITE before FlatTerm replaces alacritty:
+            // usize::MAX here meant every agent pane retained every
+            // row it ever produced for the app's lifetime. 100k rows
+            // is days of continuous agent output; older rows live in
+            // the persisted block history, not the live grid.
+            scrollback: FlatStorage::with_capacity(SCROLLBACK_CAP_ROWS),
             use_alt: false,
             app_cursor: false,
             bracketed_paste: false,
             line_wrap: true,
             saved_cursor_for_swap: None,
             tab_stops,
-            scrollback_cap: usize::MAX,
+            scrollback_cap: SCROLLBACK_CAP_ROWS,
         }
     }
 

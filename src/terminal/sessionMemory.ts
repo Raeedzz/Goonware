@@ -16,13 +16,33 @@
  * when the session is permanently deleted, via forgetSession (which
  * fires term_close for each matching ptyId).
  *
- * Caps: none. Block scrollback and typed-input history grow without
- * bound — the user wants to see every row of every agent that ever
- * ran in this session. Memory is bounded in practice by how much an
- * actual session produces.
+ * Caps: generous but finite (see MAX_BLOCKS / MAX_SCROLLBACK_ROWS /
+ * MAX_HISTORY below, enforced at the growth sites in
+ * useTerminalSession / BlockTerminal). This store used to be
+ * explicitly unbounded; with many long-running agents each pane
+ * accumulated an ever-growing second copy of its entire output as JS
+ * Span objects (far heavier per row than the Rust grid), which never
+ * shrank for the lifetime of the page. Everything older than the caps
+ * is still on disk (SQLite blocks table) — the caps only bound what
+ * stays resident in the webview heap.
  */
 import { invoke } from "@tauri-apps/api/core";
+import { clearTerminalRunning } from "./terminalActivityStore";
 import type { Block, RenderFrame, Span } from "./types";
+
+/** Max closed blocks kept in memory per pty. Matches the restore
+ *  window (`HISTORY_LOAD_WINDOW = 500` in Rust persistence) — the UI
+ *  never pages further back than this without a deeper disk load. */
+export const MAX_BLOCKS = 500;
+/** Max live-block scrollback rows mirrored per pty. Rows past this
+ *  scroll out of reach mid-command; the closed block re-renders from
+ *  its full transcript when the command finishes. */
+export const MAX_SCROLLBACK_ROWS = 10_000;
+/** Hysteresis for scrollback trimming so the O(n) front-splice runs
+ *  once per ~1k rows instead of per appended row. */
+export const SCROLLBACK_TRIM_CHUNK = 1024;
+/** Max typed-command history entries per pty. */
+export const MAX_HISTORY = 1000;
 
 interface Memory {
   blocks: Block[];
@@ -171,6 +191,9 @@ export function forgetPtys(ptyIds: string[]): void {
   for (const id of ptyIds) {
     if (!id) continue;
     store.delete(id);
+    // Companion store: drop the per-pty running flag so the activity
+    // map doesn't accumulate an entry for every pty ever opened.
+    clearTerminalRunning(id);
     void invoke("term_close", { id }).catch(() => {});
     void invoke("term_history_forget", { id }).catch(() => {});
   }

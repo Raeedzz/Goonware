@@ -14,7 +14,7 @@
  * because the banner just appeared"). That's a separate concern from
  * usage budgeting.
  */
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 /** Anthropic's published rolling-window length. Kept here only for
@@ -203,6 +203,62 @@ function getStoreStatus(): ClaudeUsageStatus | null {
   return storeStatus;
 }
 
+// ── Shared 1Hz clock ─────────────────────────────────────────────
+// One interval for ALL pills. Each ClaudeUsagePillInner used to run
+// its own setInterval(…, 1000) — N agent panes meant N wakeups + N
+// re-renders per second, including for panes hidden behind other
+// tabs. The shared clock ticks once, only while at least one pill is
+// mounted, and pauses while the document is hidden (the label snaps
+// to the correct value on the first tick after re-show since it's
+// derived from Date.now()).
+let sharedNow = Date.now();
+let nowTimer: number | null = null;
+let nowVisibilityHooked = false;
+const nowListeners = new Set<() => void>();
+
+function startNowTicker() {
+  if (nowTimer !== null || document.hidden || nowListeners.size === 0) return;
+  // Snap the clock forward on (re)start — it's frozen while no pill
+  // is mounted, and a stale value would render a wrong remaining-time
+  // label for up to a second on first mount.
+  sharedNow = Date.now();
+  nowTimer = window.setInterval(() => {
+    sharedNow = Date.now();
+    nowListeners.forEach((fn) => fn());
+  }, 1000);
+}
+
+function stopNowTicker() {
+  if (nowTimer === null) return;
+  window.clearInterval(nowTimer);
+  nowTimer = null;
+}
+
+function subscribeNow(notify: () => void): () => void {
+  if (!nowVisibilityHooked) {
+    nowVisibilityHooked = true;
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        stopNowTicker();
+      } else {
+        sharedNow = Date.now();
+        nowListeners.forEach((fn) => fn());
+        startNowTicker();
+      }
+    });
+  }
+  nowListeners.add(notify);
+  startNowTicker();
+  return () => {
+    nowListeners.delete(notify);
+    if (nowListeners.size === 0) stopNowTicker();
+  };
+}
+
+function getSharedNow(): number {
+  return sharedNow;
+}
+
 /**
  * Subscribes to the singleton polling store. `status` only changes
  * when the underlying Tauri response changes; consumers get the
@@ -220,11 +276,7 @@ export function useClaudeUsage(): {
     getStoreStatus,
     getStoreStatus,
   );
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
+  const now = useSyncExternalStore(subscribeNow, getSharedNow, getSharedNow);
   return {
     status,
     derived: status ? deriveStatus(status, now) : null,

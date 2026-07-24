@@ -178,41 +178,46 @@ export function LiveBlock({
   const hasBody = displayedRows.length > 0;
   const cwdLabel = formatCwd(cwd);
 
-  // Live duration counter — same look as closed blocks but updated
-  // every animation frame so the user sees the command time accumulate
-  // smoothly. The label is written directly into a ref-bound <span>
-  // via `textContent`, never via React state. This avoids ~10
-  // unnecessary commits per second per running command — at 20 active
-  // panes that's ~200 component-level rerenders/s, all on the React
-  // critical path. rAF + DOM write puts the work on the compositor
-  // instead and frees the main thread for actual user input.
+  // Live duration counter — same look as closed blocks. The label is
+  // written directly into a ref-bound <span> via `textContent`, never
+  // via React state, so React never commits these updates. The label
+  // only changes once per second, so a 1s interval is enough — a rAF
+  // loop here would wake the CPU 60×/s per running command × N panes
+  // (including panes hidden via visibility:hidden, which still get
+  // animation frames). Hidden panes skip the DOM write entirely; the
+  // label is derived from startRef so it snaps to the right value on
+  // the first tick after becoming visible again.
   const startRef = useRef<number>(Date.now());
   const durationRef = useRef<HTMLSpanElement | null>(null);
   useEffect(() => {
     startRef.current = Date.now();
-    let cancelled = false;
-    let raf = 0;
     let lastLabel = "";
     const paint = () => {
-      if (cancelled) return;
+      const node = durationRef.current;
+      if (!node) return;
+      // visibilityProperty matters: the keepalive layers hide panes
+      // with `visibility: hidden` (NOT display:none — that would kill
+      // the WebGPU surface), and argless checkVisibility() does not
+      // look at the visibility property.
+      const visible = node.checkVisibility?.({
+        visibilityProperty: true,
+        contentVisibilityAuto: true,
+      });
+      if (document.hidden || visible === false) return;
       const label = formatDuration(Date.now() - startRef.current);
       if (label !== lastLabel) {
         lastLabel = label;
-        const node = durationRef.current;
-        if (node) node.textContent = `(${label})`;
+        node.textContent = `(${label})`;
       }
-      raf = requestAnimationFrame(paint);
     };
     // Prime once synchronously so the first paint already shows a
-    // sensible duration; rAF takes over after that.
+    // sensible duration; the interval takes over after that.
     paint();
-    return () => {
-      cancelled = true;
-      if (raf) cancelAnimationFrame(raf);
-    };
+    const id = window.setInterval(paint, 1000);
+    return () => window.clearInterval(id);
   }, [command]);
   // Initial label at first render. Subsequent updates are written
-  // directly into `durationRef.current` by the rAF loop — React never
+  // directly into `durationRef.current` by the interval — React never
   // commits them.
   const initialElapsedLabel = formatDuration(Date.now() - startRef.current);
 

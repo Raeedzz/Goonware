@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -576,8 +576,16 @@ function useWorktreeStatus(
     let cancelled = false;
     const tick = async () => {
       if (cancelled) return;
+      // Skip the subprocess-spawning git status while the window is
+      // hidden; the visibilitychange listener below reconciles
+      // immediately when the user comes back.
+      if (document.hidden) return;
       await refresh();
     };
+    const onVisible = () => {
+      if (!document.hidden) void tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     // Seed from the last-known status for this worktree so a switch
     // paints real data immediately (refreshed in the background by
     // the tick below) instead of flashing an empty pane. Worktrees
@@ -601,6 +609,7 @@ function useWorktreeStatus(
       cancelled = true;
       window.clearInterval(t);
       window.removeEventListener("goonware-git-refresh", onRefresh);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [worktreeId, worktreePath, refresh, skip]);
 
@@ -633,6 +642,13 @@ function ChangesView({
   const toast = useToast();
   const [message, setMessage] = useState<string>("");
   const [busy, setBusy] = useState<null | "stage" | "unstage" | "commit" | "push" | "draft">(null);
+  // The commit textarea. We focus it explicitly after an AI draft lands
+  // — the helper spawns a CLI in the worktree, and the terminal can
+  // reclaim focus while it runs, so without this the drafted text sits
+  // in a box the user isn't typing into (their next keystrokes go to
+  // the terminal instead). Focusing here guarantees the message lands
+  // in — and stays editable in — the commit box.
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   const stagedCount = useMemo(
     () => entries.filter((e) => e.staged).length,
@@ -695,7 +711,18 @@ function ChangesView({
         model,
         extras || undefined,
       );
-      setMessage(text.trim());
+      const drafted = text.trim();
+      setMessage(drafted);
+      // Land focus in the commit box with the caret at the end so the
+      // user can immediately edit and then Tab/click away. Deferred a
+      // frame so it wins any focus the finishing helper CLI grabbed.
+      requestAnimationFrame(() => {
+        const ta = composerRef.current;
+        if (!ta) return;
+        ta.focus();
+        const end = drafted.length;
+        ta.setSelectionRange(end, end);
+      });
     } catch (e) {
       toast.show({ message: `AI draft failed: ${e}` });
     } finally {
@@ -860,6 +887,7 @@ function ChangesView({
     >
       <div style={{ flexShrink: 0 }}>
         <CommitComposer
+          textareaRef={composerRef}
           message={message}
           onChange={setMessage}
           onDraft={draftMessage}
@@ -1170,6 +1198,7 @@ function ChangeRow({
  * the branch is ahead. Disabled state when there's nothing to do.
  */
 function CommitComposer({
+  textareaRef,
   message,
   onChange,
   onDraft,
@@ -1180,6 +1209,7 @@ function CommitComposer({
   stagedCount,
   ahead,
 }: {
+  textareaRef?: RefObject<HTMLTextAreaElement | null>;
   message: string;
   onChange: (s: string) => void;
   onDraft: () => void;
@@ -1236,6 +1266,7 @@ function CommitComposer({
       }}
     >
       <textarea
+        ref={textareaRef}
         value={message}
         onChange={(e) => onChange(e.target.value)}
         placeholder={

@@ -34,6 +34,12 @@ use rusqlite::Connection;
 /// queue."
 const CAPACITY: usize = 1024;
 
+/// Per-pty on-disk block cap: 2× the restore window
+/// (`HISTORY_LOAD_WINDOW = 500` in `super::mod`), so restore always
+/// has a full window even mid-eviction, while the table stops growing
+/// without bound. Applied on every SaveBlock insert.
+const BLOCK_DISK_CAP: i64 = 1000;
+
 /// Messages the writer thread can process.
 #[derive(Debug)]
 enum Event {
@@ -277,9 +283,21 @@ fn apply(
                     now,
                 ],
             )?;
-            // Warp-parity: never evict by count. Full block history is
-            // retained on disk and restored in full; the native painter
-            // virtualizes deep transcripts.
+            // Per-pty eviction: keep the newest BLOCK_DISK_CAP rows.
+            // Restore only ever reads the most-recent
+            // HISTORY_LOAD_WINDOW (500) blocks per pty, so rows past
+            // 2× that window are unreachable by any code path — they
+            // only grew the DB file forever (full transcript + JSON
+            // grid per block, per pty, across restarts). The
+            // `blocks_by_pty (pty_id, id)` index makes both the
+            // subquery and the delete cheap.
+            tx.execute(
+                "DELETE FROM blocks WHERE pty_id = ?1 AND id NOT IN (\
+                     SELECT id FROM blocks WHERE pty_id = ?1 \
+                     ORDER BY id DESC LIMIT ?2\
+                 )",
+                rusqlite::params![p.pty_id, BLOCK_DISK_CAP],
+            )?;
             tx.commit()?;
         }
         Event::ForgetPty(pty_id) => {
