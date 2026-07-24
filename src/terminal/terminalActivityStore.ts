@@ -107,10 +107,15 @@ function snapshotByKey(key: string, ptyIds: readonly string[]): boolean {
  * happening" tempo while keeping the IPC volume well below the
  * frame-emit budget. The Rust side is O(N) over open sessions and
  * a few microseconds in practice, so this is cheap.
+ *
+ * The poll pauses entirely while the window is hidden (nobody can
+ * see the spinner) and reconciles immediately on the visibilitychange
+ * back to visible, so no stale state survives un-hiding.
  */
 const POLL_INTERVAL_MS = 500;
 let pollHandle: number | null = null;
 let pollSubscribers = 0;
+let visibilityHooked = false;
 
 async function pollRunningSessions() {
   try {
@@ -139,6 +144,21 @@ async function pollRunningSessions() {
 }
 
 function ensurePoll() {
+  if (!visibilityHooked) {
+    visibilityHooked = true;
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        stopPoll();
+      } else if (pollSubscribers > 0) {
+        startPoll();
+      }
+    });
+  }
+  if (document.hidden) return;
+  startPoll();
+}
+
+function startPoll() {
   if (pollHandle !== null) return;
   void pollRunningSessions();
   pollHandle = window.setInterval(

@@ -576,8 +576,16 @@ function useWorktreeStatus(
     let cancelled = false;
     const tick = async () => {
       if (cancelled) return;
+      // Skip the subprocess-spawning git status while the window is
+      // hidden; the visibilitychange listener below reconciles
+      // immediately when the user comes back.
+      if (document.hidden) return;
       await refresh();
     };
+    const onVisible = () => {
+      if (!document.hidden) void tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     // Seed from the last-known status for this worktree so a switch
     // paints real data immediately (refreshed in the background by
     // the tick below) instead of flashing an empty pane. Worktrees
@@ -601,6 +609,7 @@ function useWorktreeStatus(
       cancelled = true;
       window.clearInterval(t);
       window.removeEventListener("goonware-git-refresh", onRefresh);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [worktreeId, worktreePath, refresh, skip]);
 

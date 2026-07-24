@@ -89,6 +89,22 @@ const STRIPE_W: f32 = 2.0;
 /// so the per-frame height sweep is O(blocks), not O(rows). Older history beyond
 /// this stays on disk and would need a deeper load window to surface.
 const BLOCK_RENDER_CAP: usize = 500;
+/// Storage cap for `TermGrid::blocks`. Everything past the render cap
+/// is unpaintable (render always windows to the newest
+/// `BLOCK_RENDER_CAP`), so retaining more in memory only duplicated
+/// what SQLite already persists — each NativeBlock holds a full
+/// transcript String + row snapshots, which added up fast across
+/// long sessions. Evicting the front keeps the rendered window
+/// byte-identical.
+const BLOCK_STORE_CAP: usize = BLOCK_RENDER_CAP;
+/// Max rows retained in `TermGrid::scrollback` for the live
+/// (in-progress) block. 10k rows is far more than a user will ever
+/// scrub through mid-command; a finished block re-renders from its
+/// own transcript, so nothing is lost at block close.
+const LIVE_SCROLLBACK_CAP: usize = 10_000;
+/// Eviction hysteresis: only drain once we're this many rows past the
+/// cap so the O(n) front-drain amortizes instead of running per row.
+const SCROLLBACK_EVICT_CHUNK: usize = 1024;
 
 /* ------------------------------------------------------------------
    Assets — warpui loads fonts from the OS, so the embedded surface
@@ -267,6 +283,15 @@ impl TermGrid {
                 self.scrollback.push(RowSnapshot {
                     spans: d.spans.clone(),
                 });
+            }
+            // Bound the live block's scrolled-off mirror. A chatty agent
+            // that streams for hours would otherwise grow this without
+            // limit — and it's the THIRD copy of that output (alacritty
+            // grid + JS mirror hold the others). Evict oldest in chunks
+            // so the O(n) drain amortizes to ~zero per appended row.
+            if self.scrollback.len() > LIVE_SCROLLBACK_CAP + SCROLLBACK_EVICT_CHUNK {
+                let excess = self.scrollback.len() - LIVE_SCROLLBACK_CAP;
+                self.scrollback.drain(..excess);
             }
         }
 
@@ -1701,6 +1726,39 @@ fn load_mono(cx: &mut ViewContext<TerminalRootView>) -> FamilyId {
    Attach + commands.
    ------------------------------------------------------------------ */
 
+/// True while a redraw poke is queued for the main thread but hasn't
+/// run yet. The frame/block sinks run on PTY reader threads — with N
+/// streaming panes each flushing up to 60 Hz, dispatching one GCD
+/// main-thread hop per frame produced hundreds of queued closures per
+/// second that all collapsed into the same `setNeedsDisplay`. One
+/// pending poke is enough: AppKit coalesces the actual draw anyway,
+/// and any frame applied before the poke runs is picked up by that
+/// same display pass.
+static REDRAW_POKE_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Coalesced `poke_embedded_redraw`: skips the main-thread dispatch
+/// entirely when one is already queued. Safe ordering: the flag is
+/// cleared on the main thread BEFORE the poke, so a frame that lands
+/// after the clear either sees pending=false and queues a fresh poke,
+/// or was already applied and is covered by the in-flight one.
+fn schedule_embedded_redraw(app: &tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    if REDRAW_POKE_PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let dispatched = app.run_on_main_thread(|| {
+        REDRAW_POKE_PENDING.store(false, Ordering::Release);
+        warpui::platform::poke_embedded_redraw();
+    });
+    // If the dispatch itself failed (event loop tearing down), clear
+    // the flag ourselves — otherwise every future poke is silently
+    // swallowed and the surface freezes for the rest of the session.
+    if dispatched.is_err() {
+        REDRAW_POKE_PENDING.store(false, Ordering::Release);
+    }
+}
+
 /// Stand up the embedded warpui surface and wire the in-process frame path.
 /// Call once from the Tauri `.setup()` on the main thread.
 pub fn attach(app: &tauri::AppHandle) {
@@ -1736,9 +1794,7 @@ pub fn attach(app: &tauri::AppHandle) {
                 }
             }
         }
-        let _ = app_for_sink.run_on_main_thread(|| {
-            warpui::platform::poke_embedded_redraw();
-        });
+        schedule_embedded_redraw(&app_for_sink);
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1773,10 +1829,15 @@ pub fn attach(app: &tauri::AppHandle) {
                 block.duration_ms,
                 block.exit_code,
             ));
+            // Render only ever windows to the newest BLOCK_RENDER_CAP
+            // blocks, so anything older is dead weight (SQLite keeps
+            // the full history). Drop the front to keep memory flat.
+            if g.blocks.len() > BLOCK_STORE_CAP {
+                let excess = g.blocks.len() - BLOCK_STORE_CAP;
+                g.blocks.drain(..excess);
+            }
         }
-        let _ = app_for_block.run_on_main_thread(|| {
-            warpui::platform::poke_embedded_redraw();
-        });
+        schedule_embedded_redraw(&app_for_block);
     }));
 
     let parent = app

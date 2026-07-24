@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import {
   IconPlus,
@@ -21,7 +21,10 @@ import { forgetPtys } from "@/terminal/sessionMemory";
 import { useToast } from "@/primitives/Toast";
 import { ArrowsOutSimpleIcon, FolderDashedIcon } from "@phosphor-icons/react";
 import { ErrorBoundary } from "./ErrorBoundary";
-import { BlockTerminal } from "@/terminal/BlockTerminal";
+import {
+  BlockTerminal,
+  type DetectedAgentCli,
+} from "@/terminal/BlockTerminal";
 import { WarpSurfaceTracker } from "@/terminal/WarpSurfaceTracker";
 import { DiffView } from "@/git/DiffView";
 import { AllChangesView } from "@/git/AllChangesView";
@@ -1189,6 +1192,89 @@ function TerminalTabContent({
 }) {
   const dispatch = useAppDispatch();
   const { settings } = useAppState();
+  // Latest-value refs so the callbacks below can stay referentially
+  // stable (empty useCallback deps) while still reading current tab /
+  // worktree / settings state. BlockTerminal is memo'd — a fresh
+  // callback identity per render would defeat the memo and re-run the
+  // whole 2,500-line pane body on every app-state dispatch, once per
+  // mounted pane.
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+  const worktreeRef = useRef(worktree);
+  worktreeRef.current = worktree;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
+  const onAgentRunningChange = useCallback(
+    (running: boolean, cli: DetectedAgentCli) => {
+      const tab = tabRef.current;
+      const worktree = worktreeRef.current;
+      const settings = settingsRef.current;
+      dispatch({
+        type: "update-tab",
+        id: tab.id,
+        patch: {
+          agentStatus: running ? "running" : "idle",
+          detectedCli: cli ?? null,
+        },
+      });
+      dispatch({
+        type: "set-agent-status",
+        worktreeId: worktree.id,
+        status: running ? "running" : "idle",
+        cli: cli ?? worktree.agentCli,
+      });
+      // Settings-driven side effects on running→idle transition.
+      if (!running && tab.agentStatus === "running") {
+        if (settings.notifyOnIdle) {
+          void notifyAgentFinished(worktree.name, tab.title);
+        }
+        if (settings.completionSound !== "none") {
+          playCompletionSound(settings.completionSound);
+        }
+      }
+    },
+    [dispatch],
+  );
+
+  const onActivitySummaryChange = useCallback(
+    (summary: string) => {
+      if (!summary) return;
+      const tab = tabRef.current;
+      dispatch({ type: "set-tab-summary", id: tab.id, summary });
+      const isPlaceholder =
+        tab.title === "Untitled" || tab.title === "main" || tab.title === "";
+      if (isPlaceholder) {
+        const derived = summary
+          .replace(/\s+/g, " ")
+          .trim()
+          .split(" ")
+          .slice(0, 5)
+          .join(" ")
+          .slice(0, 40);
+        // Skip the bare-launch-command case: when the activity
+        // source is just "claude" / "codex" / "gemini" (the user
+        // typed the agent's name and the AI summarizer hasn't
+        // produced a real activity line yet), promoting that into
+        // tab.title pollutes the title with the agent's name. The
+        // tab strip already shows the CLI badge via tabLabel while
+        // the agent runs, so we don't need it duplicated in the
+        // underlying title — and once the agent exits we'd be
+        // stuck with "claude" as the persistent title forever.
+        const looksLikeBareCli =
+          /^(claude(-code)?|codex(-cli)?|gemini(-cli)?|aider)$/i.test(derived);
+        if (derived && !looksLikeBareCli) {
+          dispatch({
+            type: "update-tab",
+            id: tab.id,
+            patch: { title: derived },
+          });
+        }
+      }
+    },
+    [dispatch],
+  );
+
   return (
     <BlockTerminal
       id={tab.ptyId}
@@ -1208,64 +1294,8 @@ function TerminalTabContent({
       // back to the tab.
       initialAgentRunning={tab.agentStatus === "running"}
       initialAgentCli={tab.detectedCli}
-      onAgentRunningChange={(running, cli) => {
-        dispatch({
-          type: "update-tab",
-          id: tab.id,
-          patch: {
-            agentStatus: running ? "running" : "idle",
-            detectedCli: cli ?? null,
-          },
-        });
-        dispatch({
-          type: "set-agent-status",
-          worktreeId: worktree.id,
-          status: running ? "running" : "idle",
-          cli: cli ?? worktree.agentCli,
-        });
-        // Settings-driven side effects on running→idle transition.
-        if (!running && tab.agentStatus === "running") {
-          if (settings.notifyOnIdle) {
-            void notifyAgentFinished(worktree.name, tab.title);
-          }
-          if (settings.completionSound !== "none") {
-            playCompletionSound(settings.completionSound);
-          }
-        }
-      }}
-      onActivitySummaryChange={(summary) => {
-        if (!summary) return;
-        dispatch({ type: "set-tab-summary", id: tab.id, summary });
-        const isPlaceholder =
-          tab.title === "Untitled" || tab.title === "main" || tab.title === "";
-        if (isPlaceholder) {
-          const derived = summary
-            .replace(/\s+/g, " ")
-            .trim()
-            .split(" ")
-            .slice(0, 5)
-            .join(" ")
-            .slice(0, 40);
-          // Skip the bare-launch-command case: when the activity
-          // source is just "claude" / "codex" / "gemini" (the user
-          // typed the agent's name and the AI summarizer hasn't
-          // produced a real activity line yet), promoting that into
-          // tab.title pollutes the title with the agent's name. The
-          // tab strip already shows the CLI badge via tabLabel while
-          // the agent runs, so we don't need it duplicated in the
-          // underlying title — and once the agent exits we'd be
-          // stuck with "claude" as the persistent title forever.
-          const looksLikeBareCli =
-            /^(claude(-code)?|codex(-cli)?|gemini(-cli)?|aider)$/i.test(derived);
-          if (derived && !looksLikeBareCli) {
-            dispatch({
-              type: "update-tab",
-              id: tab.id,
-              patch: { title: derived },
-            });
-          }
-        }
-      }}
+      onAgentRunningChange={onAgentRunningChange}
+      onActivitySummaryChange={onActivitySummaryChange}
     />
   );
 }

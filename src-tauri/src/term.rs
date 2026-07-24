@@ -55,6 +55,16 @@ use tauri::{AppHandle, Emitter, Manager, State, Wry};
 /// session will ever reach. alacritty initializes scrollback rows
 /// dynamically, so a sky-high cap doesn't pre-allocate memory — rows
 /// are only stored when the user actually scrolls into them.
+///
+/// CAUTION — this cannot be capped without reworking scrollback
+/// mirroring: `maybe_flush` derives the rows-scrolled-out delta from
+/// `grid().history_size()` growth. A finite cap saturates that
+/// counter (evicting the oldest row keeps the size constant), the
+/// delta reads as 0, and the frontend mirror silently stops receiving
+/// scrollback while output keeps flowing. Bounding resident memory
+/// per pane is instead handled where it's safe: the JS mirror drops
+/// its oldest rows past a cap, and the FlatTerm scaffold (the planned
+/// alacritty replacement) carries its own eviction design.
 const SCROLLBACK_LIMIT: usize = usize::MAX / 2;
 
 /// `alacritty_terminal::term::Config` with our unbounded scrollback
@@ -69,22 +79,27 @@ fn term_config() -> TermConfig {
     }
 }
 /// Frame throttle while the session is visible to the user AND the
-/// Goonware window has focus. 8 ms ≈ one frame at 120 Hz, matching the
-/// MacBook Pro / Pro Display XDR ProMotion refresh rate. On non-
-/// ProMotion 60 Hz displays the compositor coalesces back to 60 fps
-/// automatically, so the higher cap is free for those users —
-/// they get the same 60 fps perception with marginally more headroom
-/// for sudden burst output to land in fewer coalesced frames.
-const FRAME_THROTTLE_VISIBLE: Duration = Duration::from_millis(8);
+/// Goonware window has focus. 16 ms ≈ one frame at 60 Hz. Every flush
+/// pays a full `snapshot_grid` walk + row diff + serde IPC per visible
+/// pane, so the previous 8 ms (125 Hz, aimed at ProMotion) doubled all
+/// of that for zero perceptible gain on streaming text — terminal
+/// output is not an animation the eye tracks between 60 and 120 Hz,
+/// and with several visible panes the extra flushes were pure heat.
+const FRAME_THROTTLE_VISIBLE: Duration = Duration::from_millis(16);
 /// Frame throttle while the session is currently NOT shown anywhere
-/// in the UI but the Goonware window is otherwise focused. Kept close to
-/// the visible cadence (32 ms ≈ 30 Hz) so that a worktree-switch
-/// race between the user starting to type and `term_set_visible_set`
-/// landing on the backend doesn't introduce a perceptible delay
-/// before the freshly-active terminal starts echoing keystrokes.
-/// The previous 250 ms value visibly stalled the first 1–2 frames
-/// after every switch.
-const FRAME_THROTTLE_HIDDEN: Duration = Duration::from_millis(32);
+/// in the UI but the Goonware window is otherwise focused. Hidden
+/// panes only need frames at all so the JS scrollback mirror and
+/// block segmentation stay warm — nobody sees the paints. 100 ms
+/// keeps 20 hidden streaming agents down to ~200 flushes/sec total
+/// (vs ~600 at the old 32 ms) while staying comfortably under the
+/// perception threshold for the one race this cadence protects:
+/// keystrokes echoing into a freshly-activated terminal before
+/// `term_set_visible_set` lands on the backend. (A 250 ms value was
+/// tried historically and visibly stalled that first echo; 32 ms was
+/// the overcorrection.) Visibility transitions also force an
+/// immediate catch-up flush in `term_set_visible_set`, so switch
+/// latency does not depend on this constant.
+const FRAME_THROTTLE_HIDDEN: Duration = Duration::from_millis(100);
 /// Frame throttle while the Goonware window is BACKGROUNDED (user is on
 /// another app). The webview's JS context is suspended by macOS, so
 /// every event we emit just queues in V8's message buffer until the
@@ -151,9 +166,9 @@ pub fn flush_all_sessions(app: &AppHandle<Wry>, state: &TerminalState) {
 /// Called from the frontend whenever the active worktree, active tab,
 /// or secondary terminal selection changes. The set is small — usually
 /// 1 to 2 PTYs — but the impact is large: every session NOT in the
-/// set drops to `FRAME_THROTTLE_HIDDEN` (4 Hz), so 20 streaming agents
-/// with only 1 visible at a time generates ~120 events/sec total
-/// instead of the previous ~1200.
+/// set drops to `FRAME_THROTTLE_HIDDEN` (10 Hz), so 20 streaming agents
+/// with only 1 visible at a time generate ~260 events/sec total
+/// instead of the ~2500 an unthrottled set would produce.
 ///
 /// Transitions: any session that just became visible immediately
 /// gets one catch-up frame so the user sees current state on switch,

@@ -41,6 +41,14 @@ function normalize(raw: string): string {
 
 export function splitUrls(input: string): UrlFragment[] {
   if (!input) return [];
+  // Fast path for the overwhelmingly common case: this runs per span
+  // per changed row in the terminal render path (up to 60 Hz on a
+  // streaming pane), and almost no spans contain a URL. Both accepted
+  // shapes require "http" or "localhost:", so one indexOf pair skips
+  // the matchAll + iterator allocation entirely for plain text.
+  if (!input.includes("http") && !input.includes("localhost:")) {
+    return [{ kind: "text", text: input }];
+  }
   const out: UrlFragment[] = [];
   let cursor = 0;
   for (const match of input.matchAll(URL_RE)) {

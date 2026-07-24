@@ -35,11 +35,12 @@
 //!   the next slice (add a v2 migration + a new `Event::Snapshot`
 //!   variant that fills those tables in a transaction, then drop the
 //!   blob).
-//! - **Block history persistence (Warp-parity).** Closed blocks are
-//!   persisted in full and never evicted by count, so terminal history
-//!   is never cut off across restarts. `load_blocks` windows the
-//!   most-recent rows for fast restore; older blocks page in on
-//!   scroll-back.
+//! - **Block history persistence.** Closed blocks persist across
+//!   restarts, capped per pty at `BLOCK_DISK_CAP` (writer.rs, 2× the
+//!   restore window) — rows past the cap were unreachable by any code
+//!   path (`load_blocks` is the table's only reader) and just grew the
+//!   DB file forever. `load_blocks` windows the most-recent rows for
+//!   fast restore.
 //! - **No graceful shutdown.** The writer thread relies on macOS
 //!   tearing it down at app exit; WAL recovers any half-finished
 //!   transaction on next launch. If we add long-running async writes
@@ -116,9 +117,9 @@ pub struct SavedBlock {
 }
 
 /// How many of the most-recent blocks `load_blocks` returns on restore.
-/// History is retained in full on disk (Warp-parity — never cut off);
-/// the renderer pages in older blocks on scroll-back. Kept in sync with
-/// the front-end's `MAX_BLOCKS` in `sessionMemory.ts`.
+/// Disk retains up to `BLOCK_DISK_CAP` (2× this) per pty — see
+/// writer.rs. Kept in sync with the front-end's `MAX_BLOCKS` in
+/// `sessionMemory.ts`.
 const HISTORY_LOAD_WINDOW: i64 = 500;
 
 /// Return the most-recent `HISTORY_LOAD_WINDOW` persisted blocks for a
